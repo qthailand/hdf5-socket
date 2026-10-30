@@ -1,0 +1,18 @@
+{
+  "reference_row_y": 552,
+  "coordinate_convention": "zero-based pixel coordinates",
+  "model": "lambda_nm = m * x_px + c",
+  "m_nm_per_px": 0.2920349837184692,
+  "c_nm": 402.8940165100514,
+  "r_squared": 0.9999841995429026,
+  "fit_method": "Subpixel parabolic interpolation of local maxima on the reference row",
+  "standards": [
+    {"wavelength_nm": 546.08, "x_px": 489.416667},
+    {"wavelength_nm": 576.96, "x_px": 597.564719},
+    {"wavelength_nm": 579.07, "x_px": 602.481581},
+    {"wavelength_nm": 696.54, "x_px": 1006.552091},
+    {"wavelength_nm": 706.72, "x_px": 1040.674050},
+    {"wavelength_nm": 738.40, "x_px": 1147.677425}
+  ],
+  "note": "This wavelength fit is separate from the Smile remap model. Validate peak identities and absolute wavelength accuracy before production use."
+}

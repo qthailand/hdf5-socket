@@ -1,0 +1,52 @@
+{
+  "source": {
+    "path": "data",
+    "pattern": "*.h5",
+    "stage": "auto",
+    "envi_scan_axis": "samples",
+    "dataset": "spectrogram",
+    "cache": "disk",
+    "cache_dir": null
+  },
+  "camera": {
+    "fps": 500,
+    "overrun": "drop",
+    "buffer_frames": 256,
+    "loop": true,
+    "belt_speed_m_s": 24.0
+  },
+  "acquisition": {
+    "use_file_metadata": true,
+    "camera_backend": "poa",
+    "camera_bin": 2,
+    "raw_inverted": false,
+    "m_nm_per_px_bin1": 0.2903,
+    "c_nm": 399.791,
+    "resolution_nm": 2.0,
+    "wavelength_profile": null,
+    "exposure_ms": null,
+    "gain": null,
+    "temperature_c": null
+  },
+  "corrections": {
+    "enabled": true,
+    "backend": "auto",
+    "dark": "none",
+    "hot_pixel": true,
+    "smile": "none"
+  },
+  "processing": {
+    "workers": 4,
+    "profile_every_s": 5.0
+  },
+  "display": {
+    "gui_hz": 30,
+    "canvas_width": 1024,
+    "canvas_line_stride": 2,
+    "theme": "dark"
+  },
+  "model": {
+    "path": "rf_coco_model.joblib",
+    "band_tolerance_nm": 0.5
+  }
+}

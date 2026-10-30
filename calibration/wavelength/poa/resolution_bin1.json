@@ -1,0 +1,163 @@
+{
+  "statistic": "median of the lines' median FWHM",
+  "fwhm_nm_min": 1.1837644437346813,
+  "fwhm_nm_max": 1.5414085448968597,
+  "fwhm_px_median": 4.371460810659461,
+  "n_lines_valid": 10,
+  "n_lines": 15,
+  "profile": "lorentzian",
+  "baseline": "none",
+  "smile_corrected": true,
+  "wavelength_profile": "C:\\ClassificationPipeLine\\hsi\\calibration\\wavelength\\poa\\wavelength_bin1.json",
+  "lines": [
+    {
+      "wavelength_nm": 542.5435904168319,
+      "pixel": 487.4232301656593,
+      "fwhm_nm_median": 1.230394345197851,
+      "fwhm_px_median": 4.1416723506632644,
+      "n_valid": 69,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 696.543,
+      "pixel": 1006.7017543859649,
+      "fwhm_nm_median": 1.3319593340285776,
+      "fwhm_px_median": 4.483553722011734,
+      "n_valid": 69,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 706.722,
+      "pixel": 1040.5,
+      "fwhm_nm_median": null,
+      "fwhm_px_median": null,
+      "n_valid": 0,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 727.294,
+      "pixel": 1108.9,
+      "fwhm_nm_median": null,
+      "fwhm_px_median": null,
+      "n_valid": 0,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 738.398,
+      "pixel": 1147.7307692307693,
+      "fwhm_nm_median": null,
+      "fwhm_px_median": null,
+      "n_valid": 0,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 750.387,
+      "pixel": 1188.5566037735848,
+      "fwhm_nm_median": 1.5258125114506882,
+      "fwhm_px_median": 5.136089511168235,
+      "n_valid": 69,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 763.511,
+      "pixel": 1230.3275862068965,
+      "fwhm_nm_median": 1.1837644437346813,
+      "fwhm_px_median": 3.984709849691182,
+      "n_valid": 69,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 772.376,
+      "pixel": 1260.2333333333333,
+      "fwhm_nm_median": 1.2947399464864064,
+      "fwhm_px_median": 4.358268272762336,
+      "n_valid": 50,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 794.818,
+      "pixel": 1335.5,
+      "fwhm_nm_median": null,
+      "fwhm_px_median": null,
+      "n_valid": 0,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 800.616,
+      "pixel": 1357.1944444444443,
+      "fwhm_nm_median": 1.3645638686821164,
+      "fwhm_px_median": 4.59330495762806,
+      "n_valid": 10,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 811.531,
+      "pixel": 1391.223404255319,
+      "fwhm_nm_median": 1.5414085448968597,
+      "fwhm_px_median": 5.188587851034744,
+      "n_valid": 68,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 826.452,
+      "pixel": 1443.6190476190477,
+      "fwhm_nm_median": 1.2484622444003677,
+      "fwhm_px_median": 4.20249132212042,
+      "n_valid": 41,
+      "n_blocks": 69,
+      "flag": "ok"
+    },
+    {
+      "wavelength_nm": 840.821,
+      "pixel": 1492.85,
+      "fwhm_nm_median": null,
+      "fwhm_px_median": null,
+      "n_valid": 0,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 842.465,
+      "pixel": 1497.6818181818182,
+      "fwhm_nm_median": 1.2572663400032216,
+      "fwhm_px_median": 4.232127088469031,
+      "n_valid": 6,
+      "n_blocks": 69,
+      "flag": "low_snr"
+    },
+    {
+      "wavelength_nm": 852.144,
+      "pixel": 1527.8061224489795,
+      "fwhm_nm_median": 1.3025783376738849,
+      "fwhm_px_median": 4.384653348556586,
+      "n_valid": 68,
+      "n_blocks": 69,
+      "flag": "ok"
+    }
+  ],
+  "format_version": 1,
+  "units": "nm",
+  "fwhm_nm": 1.2986591420801457,
+  "camera_setting": {
+    "camera_backend": "poa",
+    "camera_index": 0,
+    "camera_bin": 1,
+    "raw_inverted": true,
+    "frame_shape": [
+      1104,
+      1608
+    ]
+  },
+  "saved_at": "2026-10-21T15:17:44"
+}

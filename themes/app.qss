@@ -1,0 +1,136 @@
+/*
+ * Application stylesheet. Colours and fonts are tokens (@name) from the theme JSON
+ * (themes/dark.json, themes/light.json); edit those to recolour, edit this file to restyle.
+ * Widgets are addressed by objectName (#name) and the dynamic property [state="..."];
+ * Python code sets only names/properties, never colours.
+ */
+
+/* ---------------------------------------------------------------- base --- */
+
+QWidget {
+    background-color: @bg;
+    color: @text;
+    font-family: "@font_family";
+    font-size: 12px;
+    selection-background-color: @selection;
+}
+
+QToolTip {
+    background-color: @surface_alt;
+    color: @text;
+    border: 1px solid @border_strong;
+    padding: 4px 6px;
+}
+
+QPushButton {
+    background-color: @surface_alt;
+    color: @text;
+    border: 1px solid @border;
+    border-radius: 6px;
+    padding: 4px 10px;
+}
+QPushButton:hover { background-color: @surface_hover; border-color: @border_strong; }
+QPushButton:pressed { background-color: @border; }
+
+QComboBox {
+    background-color: @surface_alt;
+    color: @text;
+    border: 1px solid @border;
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+QComboBox QAbstractItemView {
+    background-color: @surface;
+    color: @text;
+    border: 1px solid @border_strong;
+    selection-background-color: @selection;
+}
+
+QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
+
+QScrollBar:vertical { background: @bg; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: @border_strong; border-radius: 5px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: @text_faint; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+
+/* ------------------------------------------------- panel + accent stripe --- */
+/*
+ * Reusable on any QFrame/QLabel (and subclasses), no object name needed:
+ *     themes.make_panel(widget, accent='ok')      # surface + border + rounded corners + stripe
+ *     themes.set_accent(widget, 'warn')           # change the stripe later (ok|warn|error|info|neutral)
+ *     themes.set_accent_color(widget, (r, g, b))  # stripe in a data colour, e.g. a class colour
+ * Accent rules come after the panel rule (same specificity), so the stripe wins on the left.
+ * Rules for a named widget (#name) must not set its border/background, or the stripe is lost.
+ */
+
+QFrame[panel="true"] {
+    background-color: @surface;
+    border: 1px solid @border;
+    border-radius: 6px;
+}
+QFrame[panel="alt"] {
+    background-color: @surface_alt;
+    border: 1px solid @border;
+    border-radius: 8px;
+}
+QFrame[accent="ok"]      { border-left: 3px solid @success; }
+QFrame[accent="warn"]    { border-left: 3px solid @warning; }
+QFrame[accent="error"]   { border-left: 3px solid @danger; }
+QFrame[accent="info"]    { border-left: 3px solid @accent; }
+QFrame[accent="neutral"] { border-left: 3px solid @border_strong; }
+
+/* ---------------------------------------------------------- main window --- */
+
+QLabel#imagePanel {
+    background-color: @image_bg;
+    color: @text_faint;
+    border: 1px solid @border;
+    border-radius: 6px;
+}
+
+QLabel#statusLabel { padding: 6px 8px; font-size: 13px; font-weight: 600; color: @text; }
+QLabel#statusLabel[accent="warn"]  { color: @warning; }
+QLabel#statusLabel[accent="error"] { color: @danger; }
+
+QLabel#backendLabel { padding: 4px 8px; font-size: 12px; color: @text_muted; }
+QLabel#backendLabel[accent="warn"] { color: @warning; }
+
+QLabel#infoLabel { padding: 6px 8px; font-family: "@mono_family"; font-size: 11px; color: @text_muted; }
+
+/* --------------------------------------------------------- class legend --- */
+
+QLabel#panelTitle { font-size: 16px; font-weight: 700; color: @text; }
+
+QPushButton#dangerButton {
+    background-color: @danger;
+    color: @on_accent;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 11px;
+    padding: 4px 10px;
+}
+QPushButton#dangerButton:hover { background-color: @danger_hover; }
+
+QLabel#caption { background: transparent; color: @text_faint; font-size: 10px; font-weight: 700; }
+QLabel#bigValue { background: transparent; color: @text; font-size: 20px; font-weight: 700; }
+
+/* Class cards: panel + a stripe in the class colour (set by the legend). */
+QFrame#classCard { border-radius: 8px; }
+QFrame#classCard:hover { border-top-color: @accent; border-right-color: @accent; border-bottom-color: @accent; }
+
+QLabel#className { background: transparent; font-size: 13px; font-weight: 700; color: @text; }
+QLabel#metricCaption { background: transparent; font-size: 11px; color: @text_faint; }
+QLabel#metricRealtime { background: transparent; font-size: 13px; font-weight: 700; color: @accent_hover; }
+QLabel#metricTotal { background: transparent; font-size: 13px; font-weight: 700; color: @success; }
+
+/* Badge and bar colours are the class colours, set per widget by the legend. */
+QPushButton#classBadge { border: 1px solid @border_strong; border-radius: 4px; padding: 0; }
+QPushButton#classBadge:hover { border: 2px solid @accent_hover; }
+
+QProgressBar#classBar {
+    background-color: @surface_alt;
+    border: none;
+    border-radius: 2px;
+}

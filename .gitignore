@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Decoded frame caches (rebuilt automatically from the recordings)
+.cache/
+
+# Recordings and large data (keep them outside git; dataset headers/annotations stay)
+data/
+dataset/*.bip
+*.h5
+*.hdf5
+
+# Archives and generated reports
+*.zip
+gpu_report.json
