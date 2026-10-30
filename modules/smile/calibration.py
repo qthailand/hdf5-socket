@@ -437,6 +437,10 @@ class SmileCalibration:
         n_lines_total: Number of lines detected.
         created: Timestamp string.
         notes: Free-form annotation.
+        camera_setting: The camera configuration the model was measured at
+            (``modules.contracts.CameraSetting.to_dict()``: backend, index, bin,
+            orientation, frame size), or ``None`` for a model saved without it (older
+            files).  The HSI app refuses a model whose setting differs from the camera's.
     """
 
     map_x: np.ndarray
@@ -458,6 +462,7 @@ class SmileCalibration:
     notes: str = ""
     backend: str = "auto" 
     y_ref: Optional[float] = None
+    camera_setting: Optional[dict] = None
     _map_y: Optional[np.ndarray] = field(
         default=None, init=False, repr=False
     )
@@ -677,6 +682,7 @@ def _cal_to_meta(cal: SmileCalibration, format_version: int) -> dict:
         "created": cal.created,
         "notes": cal.notes,
         "y_ref": cal.y_ref,
+        **({"camera_setting": dict(cal.camera_setting)} if cal.camera_setting else {}),
     }
 
 
@@ -712,6 +718,7 @@ def _meta_to_cal(meta: dict, map_x: np.ndarray) -> SmileCalibration:
         created=meta["created"],
         notes=meta.get("notes", ""),
         y_ref=(float(meta["y_ref"]) if meta.get("y_ref") is not None else None),
+        camera_setting=(dict(meta["camera_setting"]) if meta.get("camera_setting") else None),
     )
     cal._get_engine()   # ★ pre-build engine (map_y + fixed-point maps)
     return cal

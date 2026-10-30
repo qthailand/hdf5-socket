@@ -19,6 +19,15 @@
   "danger": "#EF4444",
   "danger_hover": "#DC2626",
   "on_accent": "#FFFFFF",
+  "image_overlay": "#A6000000",
+  "image_overlay_text": "#F3F4F6",
   "image_bg": "#E5E7EB",
-  "selection": "#93C5FD"
+  "selection": "#93C5FD",
+  "chart_1": "#65A30D",
+  "chart_2": "#3F6212",
+  "chart_3": "#9CA3AF",
+  "chart_4": "#0284C7",
+  "chart_5": "#7C3AED",
+  "chart_grid": "#E5E7EB",
+  "chart_budget": "#DC2626"
 }

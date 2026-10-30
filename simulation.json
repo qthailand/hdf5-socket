@@ -5,48 +5,69 @@
     "stage": "auto",
     "envi_scan_axis": "samples",
     "dataset": "spectrogram",
-    "cache": "disk",
+    "cache": "auto",
     "cache_dir": null
   },
   "camera": {
-    "fps": 500,
+    "fps": 250,
     "overrun": "drop",
     "buffer_frames": 256,
     "loop": true,
-    "belt_speed_m_s": 24.0
+    "belt_speed_m_s": 0.4
   },
   "acquisition": {
     "use_file_metadata": true,
-    "camera_backend": "poa",
+    "camera_backend": "genicam",
     "camera_bin": 2,
-    "raw_inverted": false,
-    "m_nm_per_px_bin1": 0.2903,
-    "c_nm": 399.791,
-    "resolution_nm": 2.0,
-    "wavelength_profile": null,
-    "exposure_ms": null,
-    "gain": null,
-    "temperature_c": null
+    "raw_inverted": true,
+    "m_nm_per_px_bin1": 0.36385766843509226,
+    "c_nm": 842.1014795620235,
+    "resolution_nm": 5.0,
+    "wavelength_profile": "auto",
+    "exposure_ms": 4.0,
+    "gain": 1.0,
+    "temperature_c": null,
+    "wavelength_range_nm": [
+      900.0,
+      1700.0
+    ]
   },
   "corrections": {
     "enabled": true,
     "backend": "auto",
-    "dark": "none",
+    "dark": "auto",
     "hot_pixel": true,
-    "smile": "none"
+    "smile": "auto",
+    "reflectance": "auto"
   },
   "processing": {
     "workers": 4,
-    "profile_every_s": 5.0
+    "profile_every_s": 5.0,
+    "numba_threads": 6
   },
   "display": {
     "gui_hz": 30,
-    "canvas_width": 1024,
-    "canvas_line_stride": 2,
-    "theme": "dark"
+    "canvas_width": 4096,
+    "canvas_line_stride": 1,
+    "theme": "dark",
+    "line_aspect": 1.0,
+    "raw_zone_fraction": 0.3333,
+    "hidden_classes": [
+      "bg",
+      "background"
+    ]
   },
   "model": {
-    "path": "rf_coco_model.joblib",
+    "path": "sgd_first_reflectance.joblib",
     "band_tolerance_nm": 0.5
+  },
+  "optics": {
+    "slit_width_um": 50.0,
+    "pixel_size_um": 5.0,
+    "spectrograph_magnification": 1.0,
+    "lens_magnification": 0.0123,
+    "slit_fov_mm": 500.0,
+    "belt_pixel_mm": null,
+    "recording_pixel_mm": 0.1264
   }
 }

@@ -24,11 +24,14 @@ class SmileRuntime:
     Threading: not thread-safe; call ``set_bin``/``load`` and ``apply`` from the same
     thread (or serialise them externally).
     """
-    def __init__(self, folder):
+    def __init__(self, folder, fallback_folder=None):
         """Args:
             folder: Directory containing ``smile_model_bin<N>.npz`` files (str or ``os.PathLike``).
+            fallback_folder: Read-only directory searched when ``folder`` has no model for the
+                bin (older per-backend layout), or ``None``.
         """
         self.folder = Path(folder)
+        self.fallback_folder = None if fallback_folder is None else Path(fallback_folder)
         self.calibration = None
         self.bin_value = None
         self.path = None
@@ -56,7 +59,8 @@ class SmileRuntime:
         """Switch to the model of a hardware bin, disabling correction if there is none.
 
         Args:
-            bin_value: Hardware bin; the file ``smile_model_bin<bin_value>.npz`` is looked up in the folder.
+            bin_value: Hardware bin; the file ``smile_model_bin<bin_value>.npz`` is looked up in the
+                folder, then in ``fallback_folder``.
 
         Returns:
             bool: True if a model was found and loaded, False if correction is now disabled.
@@ -65,6 +69,8 @@ class SmileRuntime:
         self.bin_value = int(bin_value)
         self.path = None
         path = self.folder / f'smile_model_bin{bin_value}.npz'
+        if not path.exists() and self.fallback_folder is not None:
+            path = self.fallback_folder / path.name
         if path.exists():
             self.load(path, bin_value)
             logger.info('Smile model loaded: %s', path)

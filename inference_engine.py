@@ -31,6 +31,9 @@ class PushbroomLineClassifier:
         self.selected_bands = np.asarray(artifact['selected_bands'], dtype=np.intp)
         self.classes_ = np.asarray(artifact['classes'])
         self.category_names: dict = dict(artifact.get('category_names', {}))
+        # 'counts' (dark-corrected DN, as dataset.bip) or 'reflectance' (after the reflectance step)
+        self.input_units_declared = 'input_units' in artifact
+        self.input_units = str(artifact.get('input_units', 'counts'))
         wl = artifact.get('band_wavelengths')
         self.band_wavelengths = None if wl is None else np.asarray(wl, dtype=np.float32)
         self.n_bands = artifact.get('n_bands', None if wl is None else len(wl))
@@ -93,3 +96,42 @@ class PushbroomLineClassifier:
         scores = x @ self.W_fused
         scores += self.b_fused
         return self._class_ids[scores.argmax(axis=1)]
+
+
+class SpeedTestClassifier(PushbroomLineClassifier):
+    """Stand-in model with the same per-line work as a real one, for data without a model yet.
+
+    Uses **every input band** by default (a full-spectrum linear model: ``bands x classes``
+    weights), or ``n_selected`` bands spread evenly. Fixed random weights, ``n_classes`` classes:
+    ``predict`` costs what a trained linear model of that size costs, the classes mean nothing.
+    Used when ``model.path`` is ``"none"`` (e.g. a new camera before training).
+    """
+
+    def __init__(self, n_selected: int | None = None, n_classes: int = 3, seed: int = 0) -> None:
+        self._n_selected, self._seed = n_selected, seed
+        self.classes_ = np.arange(1, n_classes + 1)
+        self.category_names = {int(c): f"Class {int(c)} (speed test)" for c in self.classes_}
+        self.band_wavelengths = None
+        self.n_bands = None
+        self.input_units = 'any'
+        self.input_units_declared = True
+        self._class_ids = self.classes_.astype(np.uint8)
+        self.W_fused = None
+        self.b_fused = np.zeros(n_classes, np.float32)
+        self.selected_bands = np.arange(0, dtype=np.intp)
+        self.path = (f"speed-only model ({'all' if n_selected is None else n_selected} bands x {n_classes} classes, "
+                     "no trained weights)")
+
+    def bind(self, wavelengths, n_columns: int, tolerance_nm: float = 0.5):
+        n = n_columns if self._n_selected is None else self._n_selected
+        if n_columns < n:
+            raise ValueError(f"speed-only model needs at least {n} bands, input has {n_columns}")
+        if self.W_fused is None:                  # weights sized on the first stream's band count
+            rng = np.random.default_rng(self._seed)
+            self.W_fused = rng.standard_normal((n, self.classes_.size)).astype(np.float32)
+            self.selected_bands = np.arange(n, dtype=np.intp)
+        elif self.W_fused.shape[0] != n:
+            raise ValueError(f"speed-only model was sized for {self.W_fused.shape[0]} bands, this input gives {n}")
+        columns = np.linspace(0, n_columns - 1, n).round().astype(np.intp)
+        which = 'all' if n == n_columns else f"{n} of"
+        return columns, f"speed-only model: {which} {n_columns} bands x {self.classes_.size} classes, classes not meaningful"

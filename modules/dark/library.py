@@ -25,11 +25,15 @@ Example:
     (7, 24.8, 'dark_b1_e100.0_g5.0_t+25.npz')
 
 Storage layout (one .npz per (bin, exposure, gain, temperature) combination; the
-temperature in the name is the capture's mean rounded to whole degrees):
-    dark_frames/
+temperature in the name is the capture's mean rounded to whole degrees). Dark current and hot
+pixels belong to one sensor, so the application keeps the darks in the camera's profile
+(``modules.contracts.CameraProfile``); files of the older per-backend folder are read as
+``fallback_folder``:
+    camera_profiles/<backend>/<model>_<serial>/dark/
         dark_b1_e100.0_g5.0_t+25.npz
         dark_b1_e100.0_g5.0_t+31.npz
-        dark_b2_e50.0_g1.0.npz          (camera reported no temperature, or an older file)
+    dark_frames/<backend>/
+        dark_b2_e50.0_g1.0.npz          (older file: camera unknown, and no temperature)
         ...
 
 Each .npz contains:
@@ -41,12 +45,15 @@ Each .npz contains:
     n_frames      — scalar int (number of frames averaged)
     temperature, temperature_min, temperature_max
                   — scalar float (°C) over the captured frames; absent when unknown
+    camera_model, camera_serial
+                  — scalar str of the camera that took the frames; absent when unknown
 
 Selection:
     ``load``/``find`` pick, among the files of a (bin, exposure, gain), the one whose
     temperature is nearest the given temperature (:data:`UNKNOWN_TEMPERATURE_C` when the
     camera reports none). A file without a temperature is used only when no file of that
-    combination has one.
+    combination has one. ``fallback_folder`` is searched only when ``folder`` has no file
+    of that combination; new captures always go to ``folder``.
 """
 
 import logging
@@ -97,15 +104,27 @@ class DarkFrameLibrary:
             hot_map   = result['hot_pixel_map']
     """
 
-    def __init__(self, folder: str, n_frames: int = 50):
+    def __init__(self, folder: str, n_frames: int = 50, fallback_folder: Optional[str] = None,
+                 camera_model: Optional[str] = None, camera_serial: Optional[str] = None):
         """Open (and create if needed) the library folder.
 
         Args:
-            folder: Directory holding the ``.npz`` files; created if missing.
+            folder: Directory holding the ``.npz`` files; created if missing. Captures are
+                saved here.
             n_frames: Number of frames averaged per capture.
+            fallback_folder: Read-only folder searched when ``folder`` has no file for the
+                requested ``(bin, exposure, gain)`` (darks stored before per-camera folders);
+                ``None`` or the same folder disables it.
+            camera_model: Camera model written into captured files, or ``None`` if unknown.
+            camera_serial: Camera serial number written into captured files, or ``None``.
         """
         self.folder = folder
         self.n_frames = n_frames
+        same = fallback_folder is not None and (
+            os.path.normcase(os.path.abspath(fallback_folder)) == os.path.normcase(os.path.abspath(folder)))
+        self.fallback_folder = None if same else fallback_folder
+        self.camera_model = camera_model or None
+        self.camera_serial = camera_serial or None
         os.makedirs(folder, exist_ok=True)
 
         # Capture state (reset by start_capture)
@@ -206,7 +225,8 @@ class DarkFrameLibrary:
              temperature: Optional[float] = None) -> Optional[str]:
         """Path of the stored dark that :meth:`load` would return, without reading it.
 
-        Only lists the folder, so it is cheap enough to call whenever the temperature changes.
+        Only lists the folder (and ``fallback_folder`` when ``folder`` has nothing for this
+        combination), so it is cheap enough to call whenever the temperature changes.
 
         Args:
             bin: Hardware bin factor.
@@ -221,6 +241,8 @@ class DarkFrameLibrary:
             nothing is stored.
         """
         legacy, by_temperature = self._candidates(bin, exposure, gain)
+        if legacy is None and not by_temperature and self.fallback_folder is not None:
+            legacy, by_temperature = self._candidates(bin, exposure, gain, self.fallback_folder)
         if by_temperature:
             target = valid_temperature(temperature)
             if target is None:
@@ -251,7 +273,10 @@ class DarkFrameLibrary:
                 'temperature':     float | None, # °C, mean over the capture
                 'temperature_min': float | None,
                 'temperature_max': float | None,
+                'camera_model':    str | None,   # camera that took the frames, if recorded
+                'camera_serial':   str | None,
                 'filename':        str,
+                'path':            str,          # in ``folder`` or ``fallback_folder``
             }
         Returns None if no matching dark frame exists or it cannot be read.
         """
@@ -268,26 +293,29 @@ class DarkFrameLibrary:
                 'gain':          float(data['gain']),
                 'n_frames':      int(data['n_frames']),
                 **self._temperature_fields(data),
+                **self._camera_fields(data),
                 'filename':      os.path.basename(path),
+                'path':          path,
             }
         except Exception:
             logger.exception("DarkFrameLibrary: failed to load %s", path)
             return None
 
     def exists(self, bin: int, exposure: float, gain: float) -> bool:
-        """Return True if any dark frame is stored for this combination.
+        """Return True if :meth:`find` has a dark frame for this combination.
 
         Args:
             bin: Hardware bin factor.
             exposure: Exposure time in ms.
             gain: Camera gain.
         """
-        legacy, by_temperature = self._candidates(bin, exposure, gain)
-        return legacy is not None or bool(by_temperature)
+        return self.find(bin, exposure, gain) is not None
 
     def delete(self, bin: int, exposure: float, gain: float,
                temperature: Optional[float] = None) -> None:
-        """Delete stored dark frames (no error if none exist).
+        """Delete stored dark frames in ``folder`` (no error if none exist).
+
+        ``fallback_folder`` is never touched.
 
         Args:
             bin: Hardware bin factor.
@@ -346,22 +374,24 @@ class DarkFrameLibrary:
     def _filepath(self, bin: int, exposure: float, gain: float, temperature: Optional[float] = None) -> str:
         return os.path.join(self.folder, self._key(bin, exposure, gain, temperature) + '.npz')
 
-    def _candidates(self, bin: int, exposure: float, gain: float):
-        """``(legacy path or None, [(temperature from the name, path), ...])`` of one combination."""
+    def _candidates(self, bin: int, exposure: float, gain: float, folder: Optional[str] = None):
+        """``(legacy path or None, [(temperature from the name, path), ...])`` of one combination
+        in ``folder`` (default: :attr:`folder`)."""
+        folder = self.folder if folder is None else folder
         prefix = self._key(bin, exposure, gain)
         legacy = None
         by_temperature = []
         try:
-            names = os.listdir(self.folder)
+            names = os.listdir(folder)
         except OSError:
             return None, []
         for name in names:
             if name == prefix + '.npz':
-                legacy = os.path.join(self.folder, name)
+                legacy = os.path.join(folder, name)
             elif name.startswith(prefix + '_t'):
                 match = _TEMPERATURE_SUFFIX.search(name)
                 if match is not None and match.start() == len(prefix):
-                    by_temperature.append((int(match.group(1)), os.path.join(self.folder, name)))
+                    by_temperature.append((int(match.group(1)), os.path.join(folder, name)))
         return legacy, by_temperature
 
     @staticmethod
@@ -377,6 +407,11 @@ class DarkFrameLibrary:
         for name in ('temperature', 'temperature_min', 'temperature_max'):
             fields[name] = float(data[name]) if name in data.files else None
         return fields
+
+    @staticmethod
+    def _camera_fields(data) -> Dict:
+        return {name: (str(data[name]) or None) if name in data.files else None
+                for name in ('camera_model', 'camera_serial')}
 
     def _compute_and_save(self) -> None:
         if not self._stack:
@@ -397,6 +432,8 @@ class DarkFrameLibrary:
                 'temperature_max': np.array(float(temps.max()), dtype=np.float64),
             }
         mean_temperature = float(temperature['temperature']) if temperature else None
+        camera = {name: np.array(value) for name, value in
+                  (('camera_model', self.camera_model), ('camera_serial', self.camera_serial)) if value}
 
         path = self._filepath(self._bin, self._exposure, self._gain, mean_temperature)
         np.savez_compressed(
@@ -408,6 +445,7 @@ class DarkFrameLibrary:
             gain=np.array(self._gain,    dtype=np.float32),
             n_frames=np.array(len(self._stack), dtype=np.int32),
             **temperature,
+            **camera,
         )
         logger.info(
             "DarkFrameLibrary: saved %s (%d frames, %d hot pixels, temperature %s)",

@@ -31,7 +31,7 @@ def main(argv=None) -> int:
     p.add_argument('--fps', type=float, default=None, help='line rate; 0 = as fast as possible')
     p.add_argument('--overrun', choices=('drop', 'block'), default=None)
     p.add_argument('--workers', type=int, default=None)
-    p.add_argument('--backend', choices=('auto', 'cpu', 'cupy_cuda', 'opencv_cuda'), default=None)
+    p.add_argument('--backend', choices=('auto', 'cpu_fused', 'cpu', 'cupy_cuda', 'opencv_cuda'), default=None)
     p.add_argument('--seconds', type=float, default=10.0, help='run time (stops earlier at the end of a non-looping playlist)')
     p.add_argument('--no-loop', action='store_true', help='play the files once')
     p.add_argument('--json', action='store_true', help='print the final report as JSON')
@@ -47,7 +47,7 @@ def main(argv=None) -> int:
             switches.append((float(at), name))
         except ValueError:
             p.error(f"--switch expects BACKEND@SECONDS, got {item!r}")
-        if name not in ('auto', 'cpu', 'cupy_cuda', 'opencv_cuda'):
+        if name not in ('auto', 'cpu_fused', 'cpu', 'cupy_cuda', 'opencv_cuda'):
             p.error(f"--switch: unknown backend {name!r}")
     switches.sort()
 

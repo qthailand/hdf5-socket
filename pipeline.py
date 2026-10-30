@@ -32,16 +32,31 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from modules.preprocessing import PreprocessingRuntime
+from sim_config import STEP_NAMES, apply_reflectance
 
 logger = logging.getLogger(__name__)
 
 LOST_CLASS = 255                     # class id drawn for lines lost to overrun
-BACKENDS = ('auto', 'cpu', 'cupy_cuda', 'opencv_cuda')
+BACKENDS = ('auto', 'cpu_fused', 'cpu', 'cupy_cuda', 'opencv_cuda')
 _LATENCY_WINDOW = 4096
 _RATE_PERIOD_S = 0.5
 
 
 # ------------------------------------------------------------------------------ helpers ---
+
+def _effective(plan, overrides: dict) -> dict:
+    """Steps a worker applies for ``plan``: the override if given, else the plan's own choice,
+    and never a step the plan cannot do (no reference loaded, already binned input)."""
+    result = {}
+    steps = getattr(plan, 'steps', {})
+    for name in STEP_NAMES:
+        info = steps.get(name, {'available': False, 'on': False})
+        wanted = overrides.get(name)
+        if name == 'binning' or wanted is None:
+            wanted = info['on']
+        result[name] = bool(wanted) and (info['available'] or name == 'binning' and info['on'])
+    return result
+
 
 class HighResTimer:
     """Windows: 1 ms scheduler tick while the simulation runs (default is 15.6 ms)."""
@@ -140,13 +155,18 @@ class Snapshot:
     buffers_in_use: int
     buffer_frames: int
     latency_ms: dict                 # p50 / p99 / max, sensor time -> classified
-    stage_ms: dict                   # mean ms per stage over the last interval
+    stage_ms: dict                   # mean ms per stage over the last interval (~0.5 s)
+    stage_stats: dict                # {backend: {'avg': {stage: ms}, 'peak': {stage: ms}}} since reset_perf
+    workers: int
+    steps: dict                      # step -> True/False override, or None = as the plan resolved it
     backend: str                     # backend(s) the workers actually run
     requested_backend: str           # what was asked for (config or set_backend)
     backend_note: str                # why the actual backend differs from the request ('' if not)
     counts: np.ndarray               # (256,) pixels per class id since the last reset
     counted_lines: int               # lines in ``counts``
     canvas: np.ndarray               # (slit, canvas_width) class ids, oldest -> newest
+    raw_canvas: np.ndarray           # (slit, raw_columns) model-input intensity of the newest lines
+                                     # (mean over bands, float32; NaN = lost line), oldest -> newest
     canvas_filled: int
     raw_frame: np.ndarray | None     # newest raw frame (display only)
     position: tuple                  # (source name, frame index, n frames, cycle)
@@ -156,7 +176,7 @@ class Snapshot:
 
 def build_pipeline(config) -> 'Pipeline':
     """Open the configured input, resolve one acquisition plan per file, load and bind the model."""
-    from inference_engine import PushbroomLineClassifier
+    from inference_engine import PushbroomLineClassifier, SpeedTestClassifier
     from sim_config import build_plan
     from sources import open_sources
 
@@ -164,12 +184,36 @@ def build_pipeline(config) -> 'Pipeline':
     sources = open_sources(config.resolve(src_cfg.path), src_cfg.pattern, stage=src_cfg.stage,
                            scan_axis=src_cfg.envi_scan_axis, dataset=src_cfg.dataset, cache=src_cfg.cache,
                            cache_dir=config.resolve(src_cfg.cache_dir))
-    classifier = PushbroomLineClassifier(config.resolve(config.model.path))
+    if config.model.path in (None, '', 'none'):
+        classifier = SpeedTestClassifier()
+        logger.warning("model.path = none: %s", classifier.path)
+    else:
+        classifier = PushbroomLineClassifier(config.resolve(config.model.path))
     plans = []
     for src in sources:
         plan = build_plan(config, src)
         plan.columns, binding = classifier.bind(plan.wavelengths, plan.n_columns, config.model.band_tolerance_nm)
         plan.provenance['model bands'] = (binding, os.path.basename(classifier.path))
+        plan.provenance['input storage'] = (
+            src.storage + (" - timing includes the simulator's own HDF5 decoding; use frames in RAM or "
+                           "the disk cache to measure speed" if src.storage == 'stream' else ''), f"cache={src_cfg.cache}")
+        if src.storage == 'stream':
+            logger.warning("%s is streamed: its decoding competes with the workers, timing is pessimistic", src.name)
+        refl_on = plan.steps.get('reflectance', {}).get('on', False)
+        units = classifier.input_units
+        if units == 'any':
+            plan.provenance['model input'] = ('any (speed-only model)', 'model.path = none')
+            plans.append(plan)
+            logger.info("%s: %d frames %s %s\n%s", src.name, src.n_frames, src.frame_shape, src.dtype,
+                        plan.summary())
+            continue
+        plan.provenance['model input'] = (
+            f"{units}" + ("" if (units == 'reflectance') == refl_on else
+                          f" — WARNING: reflectance step is {'on' if refl_on else 'off'}"),
+            'model artifact' if classifier.input_units_declared else 'assumed (artifact has no input_units)')
+        if (units == 'reflectance') != refl_on:
+            logger.warning("%s: model expects %s but the reflectance step is %s", src.name, units,
+                           'on' if refl_on else 'off')
         logger.info("%s: %d frames %s %s\n%s", src.name, src.n_frames, src.frame_shape, src.dtype, plan.summary())
         plans.append(plan)
     return Pipeline(config, sources, plans, classifier)
@@ -194,6 +238,7 @@ class Pipeline:
         self.classifier = classifier
         cam, disp = config.camera, config.display
         self._fps = float(cam.fps)
+        self._fps_generation = 0                 # bumped by set_fps; the camera re-reads the rate
         self._n_workers = int(config.processing.workers)
         shape = sources[0].frame_shape
         self._slit = shape[0]
@@ -209,6 +254,8 @@ class Pipeline:
         self._threads: list[threading.Thread] = []
         self._profilers = [StageProfiler() for _ in range(self._n_workers)]
         self._runtimes: list[PreprocessingRuntime | None] = [None] * self._n_workers
+        # Step switches (GUI): replaced as a whole, read once per frame by the workers.
+        self._steps: dict = {name: None for name in STEP_NAMES}
         # Backend switch: workers compare the generation at each frame boundary.
         self._requested_backend = self.plans[0].correction_backend
         self._backend_generation = 0
@@ -230,11 +277,15 @@ class Pipeline:
         self._latency_n = 0
         self._stride = disp.canvas_line_stride
         self._canvas = np.zeros((self._slit, disp.canvas_width), np.uint8)
+        # Same ring, same columns: what the model saw (before classification), for the raw zone.
+        self._raw_canvas = np.full((self._slit, disp.canvas_width), np.nan, np.float32)
         self._canvas_col = 0
         self._canvas_filled = 0
         self._canvas_line = 0
         self._position = (sources[0].name, 0, sources[0].n_frames, 0)
         self._stage_ms: dict[str, float] = {}
+        self._stage_totals: dict[str, dict[str, list]] = {}   # backend -> stage -> [ms sum, n]
+        self._stage_peak: dict[str, dict[str, float]] = {}    # backend -> stage -> max interval mean
 
         self._display_interval = 1.0 / max(1.0, disp.gui_hz)
         self._display_t = 0.0
@@ -273,6 +324,12 @@ class Pipeline:
             self._state = 'stopped'
         return not any(t.is_alive() for t in self._threads)
 
+    def reset_perf(self) -> None:
+        """Restart the per-stage averages and peaks (e.g. after changing a setting)."""
+        with self._lock:
+            self._stage_totals.clear()
+            self._stage_peak.clear()
+
     def reset_counts(self) -> None:
         """Start a new batch: class counts restart from zero (throughput counters keep running)."""
         with self._lock:
@@ -296,6 +353,44 @@ class Pipeline:
             self._backend_generation += 1
         logger.info("Backend switch requested: %s", name)
 
+    def set_fps(self, fps: float) -> None:
+        """Change the simulated line rate while running (``0`` = as fast as the chain takes:
+        the camera then waits for a free buffer, so it measures the lossless maximum).
+
+        The camera picks it up at its next line and restarts its clock from there (no burst of
+        "late" lines); buffers, counts and the line order are kept.
+        """
+        fps = float(fps)
+        if fps < 0:
+            raise ValueError("fps must be >= 0")
+        if fps == self._fps:
+            return
+        self._fps = fps
+        self._fps_generation += 1
+        logger.info("Camera line rate -> %s", 'max' if fps == 0 else f"{fps:g} lines/s")
+
+    def set_steps(self, **switches) -> None:
+        """Turn processing steps on/off while running: ``dark`` (dark + hot pixel), ``flip``, ``smile``,
+        ``reflectance``.
+
+        ``True``/``False`` overrides the plan, ``None`` returns to what the plan resolved from
+        file/config. A step that is not available in a plan (no reference loaded, binned input)
+        stays off there whatever is asked; binning cannot be switched off. The change applies
+        from the next line every worker takes; the hsi algorithms themselves are unchanged.
+        """
+        unknown = set(switches) - set(STEP_NAMES)
+        if unknown or 'binning' in switches:
+            raise ValueError(f"switchable steps are dark, flip, smile, reflectance; got {sorted(switches)}")
+        with self._lock:
+            steps = dict(self._steps)
+            steps.update(switches)
+            self._steps = steps
+        logger.info("Processing steps: %s", ', '.join(f"{k}={'plan' if v is None else v}" for k, v in steps.items()))
+
+    def effective_steps(self, plan_index: int = 0) -> dict:
+        """``{step: bool}`` that the workers currently apply for ``plans[plan_index]``."""
+        return _effective(self.plans[plan_index], self._steps)
+
     def _backend_note(self) -> str:
         if self.plans[0].stage == 'binned':
             return ''
@@ -318,16 +413,29 @@ class Pipeline:
             return 'none (binned input)'
         return '/'.join(sorted(names)) or 'uninitialized'
 
-    def snapshot(self) -> Snapshot:
+    def snapshot(self, canvas_columns: int | None = None, raw_columns: int = 0,
+                 step: tuple[int, int] = (1, 1)) -> Snapshot:
+        """State for one refresh.
+
+        ``canvas_columns`` limits the belt map to the newest N columns; ``raw_columns`` returns
+        the model-input intensity of the newest M of them (the GUI's pre-classification zone).
+        ``step`` = (rows, columns) returns every k-th row / column only (counted from the newest
+        column): the GUI asks for its screen resolution instead of copying the full map.
+        """
         with self._lock:
             n = min(self._latency_n, _LATENCY_WINDOW)
             lat = self._latency[:n]
             latency = ({'p50': float(np.percentile(lat, 50)), 'p99': float(np.percentile(lat, 99)),
                         'max': float(lat.max())} if n else {'p50': 0.0, 'p99': 0.0, 'max': 0.0})
-            if self._canvas_filled < self._canvas.shape[1]:
-                canvas = self._canvas[:, :self._canvas_filled].copy()
-            else:
-                canvas = np.roll(self._canvas, -self._canvas_col, axis=1)
+            width = self._canvas.shape[1]
+            n = self._canvas_filled if canvas_columns is None else min(self._canvas_filled, int(canvas_columns))
+            # the newest n columns, oldest first (the canvas is a ring; copy only what is asked)
+            columns = (self._canvas_col - n + np.arange(n)) % width if self._canvas_filled == width \
+                else np.arange(self._canvas_filled - n, self._canvas_filled)
+            rs, cs = max(1, int(step[0])), max(1, int(step[1]))
+            offsets = np.arange(n - 1, -1, -cs)[::-1]              # from the oldest; the newest is kept
+            canvas = self._canvas[::rs, columns[offsets]]
+            raw_canvas = self._raw_canvas[::rs, columns[offsets[offsets >= n - int(raw_columns)]]]
             snap = Snapshot(
                 state=self._state, error=self._error, elapsed_s=time.perf_counter() - self._t0,
                 target_fps=self._fps, camera_fps=self._camera_fps, processed_fps=self._processed_fps,
@@ -335,9 +443,13 @@ class Pipeline:
                 schedule_slips=self._slips,
                 buffers_in_use=len(self._buffers) - self._free.qsize(), buffer_frames=len(self._buffers),
                 latency_ms=latency, stage_ms=dict(self._stage_ms), backend=self.backend_name,
+                stage_stats={b: {'avg': {n: t / c for n, (t, c) in st.items() if c},
+                                 'peak': dict(self._stage_peak.get(b, {}))}
+                             for b, st in self._stage_totals.items()},
+                workers=self._n_workers, steps=dict(self._steps),
                 requested_backend=self._requested_backend, backend_note=self._backend_note(),
                 counts=self._counts.copy(), counted_lines=self._counted_lines,
-                canvas=canvas, canvas_filled=self._canvas_filled,
+                canvas=canvas, raw_canvas=raw_canvas, canvas_filled=self._canvas_filled,
                 raw_frame=self._raw_frame, position=self._position)
         return snap
 
@@ -345,6 +457,7 @@ class Pipeline:
 
     def _camera_loop(self) -> None:
         cam = self.config.camera
+        generation = self._fps_generation
         period = 1.0 / self._fps if self._fps > 0 else 0.0
         drop = cam.overrun == 'drop'
         line = seq = cycle = 0
@@ -366,6 +479,11 @@ class Pipeline:
                     for i in range(src.n_frames):
                         if self._stop.is_set():
                             return
+                        if generation != self._fps_generation:         # line rate changed (GUI)
+                            generation = self._fps_generation
+                            period = 1.0 / self._fps if self._fps > 0 else 0.0
+                            next_t = time.perf_counter()
+                            rate_t, rate_n = next_t, 0
                         if period:
                             _wait_until(next_t, self._stop)
                             t_sensor = next_t
@@ -378,7 +496,9 @@ class Pipeline:
                         try:
                             slot = self._free.get_nowait()
                         except queue.Empty:
-                            if drop:                                   # overrun: the line is lost
+                            # Overrun loses a line only with a line clock; without one (max) the
+                            # camera simply waits: max = the chain's lossless maximum.
+                            if drop and period:
                                 self._lost += 1
                                 line += 1
                                 continue
@@ -440,21 +560,30 @@ class Pipeline:
                                 self._requested_backend)
                 plan = self.plans[job.source]
                 frame = self._buffers[job.slot]
+                # time the line waited in the buffers before a worker took it
+                prof._record('queue', (time.perf_counter() - job.t_sensor) * 1000.0)
                 with prof.time('total'):
+                    on = _effective(plan, self._steps)                # one consistent set per frame
                     if plan.stage == 'raw':
                         binned, _, _ = runtime.process_binned(
-                            frame, plan.dark, plan.binner, calibration=plan.smile,
-                            inverted=plan.raw_inverted, profiler=prof)
+                            frame, plan.dark_processor(on['dark']), plan.binner,
+                            calibration=plan.smile_model if on['smile'] else None,
+                            inverted=on['flip'], profiler=prof)
                     else:
                         binned = frame
+                    if on['reflectance']:                             # last step before the model
+                        with prof.time('reflectance'):
+                            binned = apply_reflectance(binned, plan.reflectance_factors)
                     with prof.time('predict'):
                         ids = classifier.predict(binned, plan.columns)
+                # display only: brightness of what the model saw, one value per slit pixel
+                intensity = binned.mean(axis=1, dtype=np.float32)
                 now = time.perf_counter()
                 if now - self._display_t >= self._display_interval:
                     self._display_t = now
                     self._raw_frame = frame.copy()
                 self._free.put(job.slot)                       # buffer back to the camera
-                self._results.put((job, ids, time.perf_counter()))
+                self._results.put((job, ids, intensity))
         except Exception as exc:
             self._fail(f'worker-{k}', exc)
         finally:
@@ -462,7 +591,21 @@ class Pipeline:
 
     def _new_runtime(self, k: int, backend: str) -> PreprocessingRuntime:
         # Created in this thread: a CUDA backend's context belongs to the thread using it.
-        runtime = PreprocessingRuntime(backend)
+        threads = self.config.processing.numba_threads
+        if threads:
+            import numba                       # thread-local: binning/fused kernels of this worker
+            numba.set_num_threads(max(1, min(int(threads), numba.config.NUMBA_NUM_THREADS)))
+        if backend == 'auto':
+            # hsi's order (CuPy, OpenCV CUDA, CPU) when a GPU is usable; on CPU the fused path,
+            # which gives the same binned frames (checked) with about half the work.
+            from modules.compute_runtime import get_compute_capabilities
+            if not get_compute_capabilities().cuda_available:
+                backend = 'cpu_fused'
+        if backend == 'cpu_fused':
+            from fused_cpu import FusedRuntime
+            runtime = FusedRuntime()
+        else:
+            runtime = PreprocessingRuntime(backend)
         self._runtimes[k] = runtime
         return runtime
 
@@ -504,9 +647,9 @@ class Pipeline:
                 elif item:
                     pending[item[0].seq] = item
                 while next_seq in pending:
-                    job, ids, _ = pending.pop(next_seq)
+                    job, ids, intensity = pending.pop(next_seq)
                     next_seq += 1
-                    self._account(job, ids, job.line - last_line - 1)
+                    self._account(job, ids, job.line - last_line - 1, intensity)
                     last_line = job.line
                     rate_n += 1
 
@@ -514,15 +657,24 @@ class Pipeline:
                 if now - rate_t >= _RATE_PERIOD_S:
                     self._processed_fps = rate_n / (now - rate_t)
                     rate_t, rate_n = now, 0
-                if now - stage_t >= 1.0:
+                if now - stage_t >= 0.5:
                     for prof in self._profilers:
                         for name, (total, count) in prof.take().items():
                             for acc in (stage_acc, log_acc):
                                 cell = acc.setdefault(name, [0.0, 0])
                                 cell[0] += total
                                 cell[1] += count
+                    backend = self.backend_name
                     with self._lock:
                         self._stage_ms = {n: t / c for n, (t, c) in stage_acc.items() if c}
+                        totals = self._stage_totals.setdefault(backend, {})
+                        peaks = self._stage_peak.setdefault(backend, {})
+                        for name, (total, count) in stage_acc.items():
+                            if count:
+                                cell = totals.setdefault(name, [0.0, 0])
+                                cell[0] += total
+                                cell[1] += count
+                                peaks[name] = max(peaks.get(name, 0.0), total / count)
                     stage_acc.clear()
                     stage_t = now
                 if profile_every and now - log_t >= profile_every:
@@ -541,7 +693,7 @@ class Pipeline:
             if self._state in ('running', 'starting'):
                 self._state = 'stopped' if self._stop.is_set() else 'finished'
 
-    def _account(self, job: _Job, ids: np.ndarray, gap: int) -> None:
+    def _account(self, job: _Job, ids: np.ndarray, gap: int, intensity: np.ndarray | None = None) -> None:
         """One line, in order. ``gap`` lines before it were lost to overrun."""
         counts = np.bincount(ids, minlength=256)
         t_done = time.perf_counter()
@@ -553,6 +705,7 @@ class Pipeline:
             self._processed += 1
             if self._canvas_line % self._stride == 0:
                 self._canvas[:, self._canvas_col] = ids
+                self._raw_canvas[:, self._canvas_col] = np.nan if intensity is None else intensity
                 self._advance_canvas(1)
             self._canvas_line += 1
             self._latency[self._latency_n % _LATENCY_WINDOW] = (t_done - job.t_sensor) * 1000.0
@@ -567,6 +720,7 @@ class Pipeline:
         width = self._canvas.shape[1]
         for _ in range(min(columns, width)):
             self._canvas[:, self._canvas_col] = LOST_CLASS
+            self._raw_canvas[:, self._canvas_col] = np.nan
             self._advance_canvas(1)
 
     def _advance_canvas(self, n: int) -> None:

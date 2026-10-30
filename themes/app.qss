@@ -39,6 +39,18 @@ QComboBox {
     border-radius: 6px;
     padding: 3px 8px;
 }
+QSpinBox {
+    background-color: @surface_alt;
+    color: @text;
+    border: 1px solid @border;
+    border-radius: 6px;
+    padding: 3px 6px;
+    min-width: 120px;
+}
+QSpinBox:focus { border-color: @accent; }
+
+QPushButton#presetButton { padding: 2px 8px; font-size: 11px; border-radius: 5px; }
+
 QComboBox QAbstractItemView {
     background-color: @surface;
     color: @text;
@@ -82,6 +94,29 @@ QFrame[accent="neutral"] { border-left: 3px solid @border_strong; }
 
 /* ---------------------------------------------------------- main window --- */
 
+QSplitter::handle { background-color: transparent; }
+QSplitter::handle:vertical {
+    margin: 3px 0;                 /* a thin line in the middle of the 8 px gap */
+    border-radius: 1px;
+    background-color: @border;
+}
+QSplitter::handle:vertical:hover { background-color: @accent; }
+QSplitter::handle:vertical:pressed { background-color: @accent_hover; }
+QSplitter::handle:horizontal {
+    margin: 0 3px;                 /* a thin line in the middle of the 8 px gap */
+    border-radius: 1px;
+    background-color: @border;
+}
+QSplitter::handle:horizontal:hover { background-color: @accent; }
+QSplitter::handle:horizontal:pressed { background-color: @accent_hover; }
+
+QPushButton#toggleButton { padding: 3px 10px; color: @text_muted; }
+QPushButton#toggleButton:checked {
+    background-color: @surface_hover;
+    color: @text;
+    border-color: @accent;
+}
+
 QLabel#imagePanel {
     background-color: @image_bg;
     color: @text_faint;
@@ -97,6 +132,40 @@ QLabel#backendLabel { padding: 4px 8px; font-size: 12px; color: @text_muted; }
 QLabel#backendLabel[accent="warn"] { color: @warning; }
 
 QLabel#infoLabel { padding: 6px 8px; font-family: "@mono_family"; font-size: 11px; color: @text_muted; }
+
+/* ------------------------------------------------------- processing steps --- */
+
+QCheckBox#stepCheck { background: transparent; color: @text; spacing: 6px; padding: 2px 4px; }
+QCheckBox#stepCheck:disabled { color: @text_faint; }
+QCheckBox#stepCheck::indicator {
+    width: 13px; height: 13px;
+    border: 1px solid @border_strong;
+    border-radius: 3px;
+    background: @surface_alt;
+}
+QCheckBox#stepCheck::indicator:hover { border-color: @accent; }
+QCheckBox#stepCheck::indicator:checked { background: @accent; border-color: @accent; }
+QCheckBox#stepCheck::indicator:disabled { background: @surface; border-color: @border; }
+QCheckBox#stepCheck::indicator:checked:disabled { background: @text_faint; border-color: @text_faint; }
+
+QLabel#stepWarning { background: transparent; color: @warning; font-weight: 600; padding-left: 10px; }
+
+/* ------------------------------------------------------------ side tabs --- */
+
+QTabWidget#sideTabs::pane { border: none; background: @bg; }
+QTabWidget#sideTabs::tab-bar { left: 6px; }
+QTabBar::tab {
+    background: transparent;
+    color: @text_faint;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 16px;           /* no font-size/-weight here: Qt sizes tabs before applying them */
+}
+QTabBar::tab:hover { color: @text; }
+QTabBar::tab:selected { color: @text; border-bottom: 2px solid @accent; }
+
+/* Performance panel: KPI values; chart colours are the chart_* tokens (used from Python). */
+QLabel#kpiValue { background: transparent; color: @text; font-size: 15px; font-weight: 700; }
 
 /* --------------------------------------------------------- class legend --- */
 
@@ -116,21 +185,13 @@ QPushButton#dangerButton:hover { background-color: @danger_hover; }
 QLabel#caption { background: transparent; color: @text_faint; font-size: 10px; font-weight: 700; }
 QLabel#bigValue { background: transparent; color: @text; font-size: 20px; font-weight: 700; }
 
-/* Class cards: panel + a stripe in the class colour (set by the legend). */
-QFrame#classCard { border-radius: 8px; }
-QFrame#classCard:hover { border-top-color: @accent; border-right-color: @accent; border-bottom-color: @accent; }
-
+/* Materials: class key (badge, name, accumulated pixels); bar colours are class colours. */
 QLabel#className { background: transparent; font-size: 13px; font-weight: 700; color: @text; }
 QLabel#metricCaption { background: transparent; font-size: 11px; color: @text_faint; }
 QLabel#metricRealtime { background: transparent; font-size: 13px; font-weight: 700; color: @accent_hover; }
 QLabel#metricTotal { background: transparent; font-size: 13px; font-weight: 700; color: @success; }
+QLabel#className:disabled, QLabel#metricTotal:disabled { color: @text_faint; }   /* hidden class */
 
-/* Badge and bar colours are the class colours, set per widget by the legend. */
+/* Badge colour is the class colour, set per widget by the legend. */
 QPushButton#classBadge { border: 1px solid @border_strong; border-radius: 4px; padding: 0; }
 QPushButton#classBadge:hover { border: 2px solid @accent_hover; }
-
-QProgressBar#classBar {
-    background-color: @surface_alt;
-    border: none;
-    border-radius: 2px;
-}

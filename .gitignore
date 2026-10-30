@@ -8,10 +8,18 @@ __pycache__/
 
 # Recordings and large data (keep them outside git; dataset headers/annotations stay)
 data/
-dataset/*.bip
+*.bip
 *.h5
 *.hdf5
 
 # Archives and generated reports
 *.zip
-gpu_report.json
+*.npz
+*.npy
+*.*.npz
+*.*.*.npz
+*.*.*.*.npz
+*.json
+
+*.csv
+*.joblib

@@ -19,13 +19,24 @@ contiguous copy (needed for >1000 frames/s): compressed HDF5 chunks are decoded 
 parallel and BSQ/BIL cubes are transposed, either into RAM or into a ``.npy`` cache file
 that is memory mapped and reused on the next start (``cache='disk'``). An uncompressed
 contiguous HDF5 dataset or a BIP cube read along ``lines`` is mapped without any copy.
+
+Recordings larger than the free disk/RAM are streamed (``cache='stream'``): a reader thread
+reads the compressed chunks in order and a thread pool inflates them ahead of the camera
+(:class:`H5FrameStream`), so memory stays at a few dozen frames. ``cache='auto'`` (default)
+reuses an existing cache, else takes disk if it has room, RAM if 8 GB stay free, otherwise
+streams - it never fills the disk. Streaming is fine for checking the processing but its own
+decoding (~9 ms and a new 2.6 MB buffer per 1024 x 1280 frame) competes with the frame workers:
+measure speed with frames in RAM or in the disk cache (see :attr:`FrameSource.storage`).
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 import os
+import queue
 import re
+import shutil
+import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -37,6 +48,9 @@ logger = logging.getLogger(__name__)
 
 H5_SUFFIXES = ('.h5', '.hdf5')
 STAGES = ('auto', 'raw', 'binned')
+CACHES = ('auto', 'disk', 'ram', 'stream')
+_DISK_MARGIN = 2 << 30          # bytes left free on the cache drive
+_RAM_RESERVE = 8 << 30          # 'auto' keeps a file in RAM only if this much stays free
 _ENVI_DTYPES = {1: np.uint8, 2: np.int16, 3: np.int32, 4: np.float32, 5: np.float64,
                 12: np.uint16, 13: np.uint32}
 _COPY_BLOCK_BYTES = 64 << 20
@@ -65,6 +79,13 @@ class FrameSource:
         return os.path.basename(self.path)
 
     @property
+    def storage(self) -> str:
+        """``'ram'``, ``'disk'`` (memory-mapped cache or file) or ``'stream'`` (decoded while playing)."""
+        if isinstance(self.frames, H5FrameStream):
+            return 'stream'
+        return 'disk' if isinstance(self.frames, np.memmap) else 'ram'
+
+    @property
     def n_frames(self) -> int:
         return int(self.frames.shape[0])
 
@@ -78,7 +99,7 @@ class FrameSource:
 
 
 def open_sources(path, pattern: str | None = None, *, stage: str = 'auto', scan_axis: str = 'samples',
-                 dataset: str = 'spectrogram', cache: str = 'disk', cache_dir=None) -> list[FrameSource]:
+                 dataset: str = 'spectrogram', cache: str = 'auto', cache_dir=None) -> list[FrameSource]:
     """Open a file, or every matching file of a folder, as a playlist of frame sources.
 
     Args:
@@ -87,7 +108,8 @@ def open_sources(path, pattern: str | None = None, *, stage: str = 'auto', scan_
         stage: ``'auto'``, ``'raw'`` or ``'binned'`` (see :class:`FrameSource`).
         scan_axis: ENVI axis that is the scan direction: ``'samples'`` (HSI) or ``'lines'``.
         dataset: HDF5 dataset name.
-        cache: ``'disk'`` (decoded frames in a reusable ``.npy`` memory map) or ``'ram'``.
+        cache: ``'auto'``, ``'disk'`` (decoded frames in a reusable ``.npy`` memory map), ``'ram'``
+            or ``'stream'`` (decoded on the fly ahead of the camera; see the module docstring).
         cache_dir: Folder of the disk cache (default ``<folder of path>/.cache``).
 
     Returns:
@@ -101,8 +123,8 @@ def open_sources(path, pattern: str | None = None, *, stage: str = 'auto', scan_
         raise ValueError(f"stage must be one of {STAGES}, got {stage!r}")
     if scan_axis not in ('samples', 'lines'):
         raise ValueError(f"scan_axis must be 'samples' or 'lines', got {scan_axis!r}")
-    if cache not in ('disk', 'ram'):
-        raise ValueError(f"cache must be 'disk' or 'ram', got {cache!r}")
+    if cache not in CACHES:
+        raise ValueError(f"cache must be one of {CACHES}, got {cache!r}")
     path = Path(path)
     if path.is_dir():
         if pattern:
@@ -151,7 +173,7 @@ def _plain(value):
 
 
 def open_hdf5(path, *, dataset: str = 'spectrogram', stage: str = 'auto',
-              cache: str = 'disk', cache_dir=None) -> FrameSource:
+              cache: str = 'auto', cache_dir=None) -> FrameSource:
     """Open an HDF5 spectrogram ``(frame, slit, spectral)`` (see :func:`open_sources`)."""
     import h5py
     path = Path(path)
@@ -176,7 +198,8 @@ def open_hdf5(path, *, dataset: str = 'spectrogram', stage: str = 'auto',
         logger.info("%s: %d frames %s %s mapped without copy", path.name, shape[0], shape[1:], dtype)
     else:
         frames = _materialise(path, f"h5:{dataset}", shape, dtype.newbyteorder('='), cache, cache_dir,
-                              lambda out: _decode_hdf5(path, dataset, out))
+                              lambda out: _decode_hdf5(path, dataset, out),
+                              stream=lambda: H5FrameStream(path, dataset))
     return FrameSource(str(path), frames, stage, wavelengths, metadata)
 
 
@@ -267,7 +290,7 @@ def parse_envi_header(path) -> tuple[Path, dict]:
 
 
 def open_envi(path, *, stage: str = 'auto', scan_axis: str = 'samples',
-              cache: str = 'disk', cache_dir=None) -> FrameSource:
+              cache: str = 'auto', cache_dir=None) -> FrameSource:
     """Open an ENVI BSQ/BIL/BIP cube as frames ``(slit, bands)`` (see :func:`open_sources`)."""
     data_path, header = parse_envi_header(path)
     L, S, B = header['lines'], header['samples'], header['bands']
@@ -307,30 +330,87 @@ def open_envi(path, *, stage: str = 'auto', scan_axis: str = 'samples',
             for i in range(0, view.shape[0], step):
                 out[i:i + step] = view[i:i + step]
         frames = _materialise(data_path, f"envi:{interleave}:{scan_axis}", view.shape,
-                              dtype.newbyteorder('='), cache, cache_dir, fill)
+                              dtype.newbyteorder('='), cache, cache_dir, fill,
+                              stream=(lambda: view) if dtype.isnative else None)
     return FrameSource(str(data_path), frames, stage,
                        wavelengths if stage == 'binned' else None, metadata)
 
 
 # --------------------------------------------------------------------------- caching ---
 
-def _materialise(path: Path, kind: str, shape, dtype, cache, cache_dir, fill):
-    """Frame-major copy of a file's frames, in RAM or in a reusable ``.npy`` memory map."""
+def _available_ram() -> int | None:
+    """Free physical memory in bytes (``None`` if unknown)."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+
+            class _Status(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                            ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                            ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                            ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                            ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+            status = _Status()
+            status.dwLength = ctypes.sizeof(_Status)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            return int(status.ullAvailPhys)
+        return int(os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))
+    except Exception:
+        return None
+
+
+def _free_disk(folder: Path) -> int:
+    folder = Path(folder)
+    while not folder.exists() and folder.parent != folder:
+        folder = folder.parent
+    return shutil.disk_usage(folder).free
+
+
+def _materialise(path: Path, kind: str, shape, dtype, cache, cache_dir, fill, stream=None):
+    """Frame-major frames of a file: RAM copy, reusable ``.npy`` memory map, or a stream.
+
+    ``cache='auto'`` reuses an existing cache file, else picks disk (enough room left),
+    RAM (file at most a quarter of the free memory) or streaming. An explicit ``'disk'`` or
+    ``'ram'`` without room raises instead of filling the drive or swapping.
+    """
     shape = tuple(int(v) for v in shape)
     nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    st = path.stat()
+    cache_dir = Path(cache_dir or path.parent / '.cache')
+    key = hashlib.sha1(f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{kind}|{shape}|{np.dtype(dtype).str}"
+                       .encode()).hexdigest()[:16]
+    target = cache_dir / f"{path.stem}.{key}.npy"
+    gb = nbytes / 2**30
+    if cache == 'auto':
+        free_disk, free_ram = _free_disk(cache_dir), _available_ram()
+        if target.is_file():
+            cache = 'disk'
+        elif free_disk >= nbytes + _DISK_MARGIN:
+            cache = 'disk'
+        elif free_ram is not None and nbytes <= free_ram - _RAM_RESERVE:
+            cache = 'ram'
+        else:
+            cache = 'stream' if stream is not None else 'ram'
+        logger.info("%s: %.1f GB decoded; free disk %.1f GB, free RAM %s -> cache=%s", path.name, gb,
+                    free_disk / 2**30, 'unknown' if free_ram is None else f"{free_ram / 2**30:.1f} GB", cache)
+    if cache == 'stream':
+        if stream is None:
+            raise ValueError(f"{path.name}: streaming is not supported for this file; use cache 'ram' or 'disk'")
+        return stream()
+    if cache == 'disk' and not target.is_file() and _free_disk(cache_dir) < nbytes + _DISK_MARGIN:
+        raise OSError(f"{path.name}: the cache needs {gb:.1f} GB but {cache_dir} has "
+                      f"{_free_disk(cache_dir) / 2**30:.1f} GB free; use cache 'auto' or 'stream'")
     if cache == 'ram':
+        free_ram = _available_ram()
+        if free_ram is not None and nbytes > 0.8 * free_ram:
+            raise MemoryError(f"{path.name}: {gb:.1f} GB does not fit the free RAM "
+                              f"({free_ram / 2**30:.1f} GB); use cache 'auto' or 'stream'")
         out = np.empty(shape, dtype)
         fill(out)
         logger.info("%s: %d frames %s %s decoded into RAM (%.0f MB)", path.name, shape[0], shape[1:],
                     dtype, nbytes / 1e6)
         return out
 
-    st = path.stat()
-    cache_dir = cache_dir or path.parent / '.cache'
-    key = hashlib.sha1(f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{kind}|{shape}|{np.dtype(dtype).str}"
-                       .encode()).hexdigest()[:16]
-    cache_dir = Path(cache_dir)
-    target = cache_dir / f"{path.stem}.{key}.npy"
     if target.is_file():
         try:
             frames = np.load(target, mmap_mode='r')
@@ -356,3 +436,143 @@ def _materialise(path: Path, kind: str, shape, dtype, cache, cache_dir, fill):
     logger.info("%s: %d frames %s %s decoded into cache %s (%.0f MB)", path.name, shape[0], shape[1:],
                 dtype, target.name, nbytes / 1e6)
     return np.load(target, mmap_mode='r')
+
+
+# -------------------------------------------------------------------------- streaming ---
+
+def _lower_thread_priority() -> None:
+    """Below-normal OS priority for the calling thread (Windows; elsewhere a no-op)."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -1)     # THREAD_PRIORITY_BELOW_NORMAL
+        except Exception:
+            pass
+
+
+class H5FrameStream:
+    """Frames of a gzip HDF5 spectrogram, inflated ahead of the reader (``cache='stream'``).
+
+    Behaves like a read-only ``(frames, slit, spectral)`` array for what the simulator needs:
+    ``shape``, ``dtype``, ``ndim``, ``len()``, ``stream[i]`` and ``stream[a:b]``. Sequential
+    access (the camera) is served from a bounded prefetch queue: one thread reads the compressed
+    chunks in order and a pool inflates them; after the last frame it continues at frame 0, so a
+    looping playlist never waits. A short skip ahead (lines lost to overrun) drops queued frames;
+    any other index restarts the prefetch there, after the previous reader thread has ended -
+    HDF5 is never called from two threads at once. Memory: ``depth`` decoded frames.
+    """
+
+    def __init__(self, path, dataset: str = 'spectrogram', depth: int = 32, workers: int | None = None):
+        import h5py
+        self.path, self.dataset = str(path), dataset
+        with h5py.File(self.path, 'r') as f:
+            ds = f[dataset]
+            self.shape = tuple(int(v) for v in ds.shape)
+            self.dtype = ds.dtype.newbyteorder('=')
+            plist = ds.id.get_create_plist()
+            filters = [plist.get_filter(i)[0] for i in range(plist.get_nfilters())]
+            self._direct = ds.chunks == (1, *ds.shape[1:]) and filters == [h5py.h5z.FILTER_DEFLATE]
+        self.ndim = 3
+        self._depth = depth
+        # Decoding is the simulator's own cost (a camera delivers frames uncompressed), so it runs
+        # on a few low-priority threads: ~110 frames/s each for 1024 x 1280, and the frame
+        # workers win the CPU whenever both want it.
+        self._pool = ThreadPoolExecutor(max_workers=workers or min(4, os.cpu_count() or 4),
+                                        thread_name_prefix='inflate', initializer=_lower_thread_priority)
+        self._lock = threading.Lock()
+        self._queue: queue.Queue | None = None
+        self._stop: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+        self._next = None
+        logger.info("%s: %d frames %s %s streamed (%s, %d frames ahead)", Path(self.path).name, self.shape[0],
+                    self.shape[1:], self.dtype, 'parallel inflate' if self._direct else 'sequential read', depth)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def _decode(self, raw) -> np.ndarray:
+        return np.frombuffer(zlib.decompress(raw), dtype=self.dtype).reshape(self.shape[1:])
+
+    def _reader(self, start: int, out: queue.Queue, stop: threading.Event) -> None:
+        import h5py
+        _lower_thread_priority()
+        n = self.shape[0]
+        try:
+            with h5py.File(self.path, 'r') as f:
+                ds = f[self.dataset]
+                i = start
+                while not stop.is_set():
+                    if self._direct:
+                        mask, raw = ds.id.read_direct_chunk((i, 0, 0))
+                        item = self._pool.submit(self._decode, raw)
+                    else:
+                        item = ds[i]
+                    while not stop.is_set():
+                        try:
+                            out.put((i, item), timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+                    i = (i + 1) % n
+        except Exception as exc:                          # surfaced to the consumer
+            out.put((None, exc))
+
+    def _end_reader(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        while self._thread.is_alive():          # it may be blocked on a full queue: drain it
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._thread.join(0.05)
+        self._thread = None
+
+    def _restart(self, start: int) -> None:
+        self._end_reader()                      # only one thread may call HDF5
+        self._stop = threading.Event()
+        self._queue = queue.Queue(maxsize=self._depth)
+        self._thread = threading.Thread(target=self._reader, args=(start, self._queue, self._stop),
+                                        name=f"read-{Path(self.path).stem}", daemon=True)
+        self._thread.start()
+        self._next = start
+
+    def _frame(self, i: int) -> np.ndarray:
+        n = self.shape[0]
+        if not -n <= i < n:
+            raise IndexError(i)
+        i %= n
+        with self._lock:
+            ahead = None if self._next is None else (i - self._next) % n
+            if ahead is None or ahead > self._depth:
+                self._restart(i)
+            while True:                          # a short skip ahead: drop the frames in between
+                index, item = self._queue.get()
+                if index is None:
+                    raise item
+                if index == i:
+                    break
+            self._next = (i + 1) % n
+        return item.result() if hasattr(item, 'result') else np.asarray(item)
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, np.integer)):
+            return self._frame(int(key))
+        if isinstance(key, slice):
+            indices = range(*key.indices(self.shape[0]))
+            out = np.empty((len(indices), *self.shape[1:]), self.dtype)
+            for j, i in enumerate(indices):
+                out[j] = self._frame(i)
+            return out
+        raise TypeError("H5FrameStream supports int and slice indexing")
+
+    def __array__(self, dtype=None):
+        array = self[:]
+        return array if dtype is None else array.astype(dtype)
+
+    def close(self) -> None:
+        with self._lock:
+            self._end_reader()
+        self._pool.shutdown(wait=False)

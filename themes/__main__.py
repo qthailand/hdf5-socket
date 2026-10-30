@@ -11,7 +11,7 @@ can be edited and checked without restarting.
 import sys
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar,
+from PyQt5.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
                              QPushButton, QVBoxLayout, QWidget)
 
 from themes import ACCENTS, THEME_DIR, apply_theme, make_panel, set_accent_color, use_dark_title_bar
@@ -90,12 +90,7 @@ class Gallery(QWidget):
             label = QLabel(text)
             label.setObjectName(name)
             row.addWidget(label)
-        bar_widget = QProgressBar()
-        bar_widget.setObjectName("classBar")
-        bar_widget.setFixedHeight(4)
-        bar_widget.setTextVisible(False)
-        bar_widget.setValue(60)
-        row.addWidget(bar_widget, stretch=1)
+        row.addStretch()
         root.addLayout(row)
 
         image = QLabel("imagePanel")

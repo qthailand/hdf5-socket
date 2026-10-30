@@ -34,10 +34,8 @@ def load_coco_masks(json_path: str, height: int, width: int) -> tuple[np.ndarray
     return label_mask, category_names
 
 
-def train_smart_bands_sgd(num_selected_bands: int = 30):
-    hdr_path = 'dataset/dataset.bip.hdr'
-    json_path = 'dataset/dataset.bip.json'
-    model_output = 'rf_coco_model.joblib'
+def train_smart_bands_sgd(num_selected_bands: int = 30, hdr_path: str = 'dataset/first.bip.hdr',
+                          json_path: str = 'dataset/first.bip.json', model_output: str = 'rf_coco_model.joblib'):
 
     print("Loading Pre-binned Datacube...")
     img_obj = spy.open_image(hdr_path)
@@ -101,6 +99,12 @@ def train_smart_bands_sgd(num_selected_bands: int = 30):
     W_fused = (W_orig / scale).T                       # (k_bands, n_classes)
     b_fused = b_orig - np.dot(W_orig, (mean / scale))  # (n_classes,)
 
+    # Reflectance cubes (hsi radiometric output) are float32 with values around 0..1; raw/binned
+    # cubes are counts. The simulator compares this with its Reflectance step.
+    sample = np.asarray(datacube[::8, ::8], dtype=np.float64)
+    is_float = np.issubdtype(np.asarray(datacube[:1, :1]).dtype, np.floating)
+    input_units = 'reflectance' if is_float and np.percentile(sample, 99) < 5 else 'counts'
+
     artifact = {
         'model': model,
         'W_fused': np.ascontiguousarray(W_fused, dtype=np.float32),
@@ -111,11 +115,22 @@ def train_smart_bands_sgd(num_selected_bands: int = 30):
         # Lets the simulator feed the model by wavelength and reject a mismatching calibration.
         'band_wavelengths': np.asarray(img_obj.bands.centers, dtype=np.float32),
         'n_bands': int(num_bands),
+        # 'counts' or 'reflectance', from the training cube (the simulator compares this with its
+        # Reflectance step: a counts model gets nonsense from reflectance input and vice versa).
+        'input_units': input_units,
         'training_header': hdr_path,
     }
     joblib.dump(artifact, model_output)
+    print(f"Model input units: {input_units} (the simulator's Reflectance step must match)")
     print(f"\nSuccessfully trained and saved optimized model artifact to '{model_output}'")
 
 
 if __name__ == '__main__':
-    train_smart_bands_sgd(num_selected_bands=30)
+    import argparse
+    parser = argparse.ArgumentParser(description='Train the linear (SGD) model on a labelled ENVI cube.')
+    parser.add_argument('--hdr', default='dataset/first.bip.hdr', help='ENVI header of the training cube')
+    parser.add_argument('--labels', default='dataset/first.bip.json', help='COCO polygons of that cube')
+    parser.add_argument('--out', default='rf_coco_model.joblib', help='model artifact to write')
+    parser.add_argument('--bands', type=int, default=30, help='bands kept by SelectKBest')
+    args = parser.parse_args()
+    train_smart_bands_sgd(args.bands, args.hdr, args.labels, args.out)

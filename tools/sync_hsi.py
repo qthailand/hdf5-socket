@@ -27,6 +27,7 @@ VENDORED = (
     'dark/core.py', 'dark/library.py', 'dark/selection.py',
     'smile/calibration.py', 'smile/core.py', 'smile/surface.py', 'smile/runtime.py',
     'spectral_processing/binning.py',
+    'radiometric/core.py', 'cube_io/envi.py', 'cube_io/writers.py',
 )
 
 
