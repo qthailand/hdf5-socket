@@ -36,6 +36,9 @@ class ClassLegendWidget(QWidget):
     color_changed = pyqtSignal(int, list)
     # The operator started a new batch; the owner resets the pipeline's counters.
     reset_requested = pyqtSignal()
+    # After every redraw: (basis unit, [(name, QColor, real-time %, accumulated %, accumulated px)]),
+    # the shown classes exactly as charted; feeds the Composition tab.
+    shares_changed = pyqtSignal(str, list)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -196,6 +199,8 @@ class ClassLegendWidget(QWidget):
         self.chart.unit = "% of pixels" if self._shown.all() else "% of shown classes"
         self.chart.set_data(names, [("Real-time", colours, list(realtime)),
                                     ("Accumulated", faded, list(accumulated))])
+        pixels = list(self._total_px[self._shown])
+        self.shares_changed.emit(self.chart.unit, list(zip(names, colours, realtime, accumulated, pixels)))
 
     @staticmethod
     def _update_badge_style(button: QPushButton, rgb: list[int] | np.ndarray) -> None:

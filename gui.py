@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Desktop view of the pushbroom sorting simulation.
+"""Desktop view of the pushbroom sorting simulation (recorded files) or of a live camera.
 
 The window only draws: ``pipeline.Pipeline`` runs camera, workers and statistics in its own
 threads and the GUI pulls a :class:`pipeline.Snapshot` ``display.gui_hz`` times per second.
@@ -8,6 +8,8 @@ A slow GUI therefore shows fewer refreshes but never loses or double-counts a li
     python gui.py
     python gui.py --config simulation.json --source dataset/dataset.bip.hdr --fps 300
     python gui.py --theme light                 # themes/<name>.json, or a path to a theme JSON
+    python gui.py --live                        # live camera (source.kind = camera), acquisition.* applied
+    python gui.py --live --set acquisition.exposure_ms=2 --set acquisition.gain=1
 
 Colours and fonts live in ``themes/`` (``app.qss`` + one token JSON per theme); this module
 only sets object names and the panel/accent properties.
@@ -24,12 +26,16 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QSpinBox, QTabWidget, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
                              QSizePolicy, QSplitter, QVBoxLayout, QWidget)
 
+from focus import edge_contrast
 from modules.compute_runtime import get_compute_capabilities, initialize_compute
+from modules.sharpness import sharpness_score
 from pipeline import LOST_CLASS, build_pipeline
-from sim_config import load_config
+from sim_config import load_config, parse_set_overrides
 from themes import apply_theme, make_panel, set_accent, use_dark_title_bar
 from utils import generate_tab10_lut
 from widgets.class_legend_widget import ClassLegendWidget
+from widgets.composition_widget import CompositionWidget
+from widgets.focus_panel import FocusPanel
 from widgets.performance_panel import PerformancePanel, ThroughputStrip
 
 logging.basicConfig(
@@ -41,13 +47,14 @@ logger = logging.getLogger(__name__)
 
 
 class PushbroomScannerMainWindow(QMainWindow):
-    """Raw frame, belt classification map, throughput/latency status and class statistics."""
+    """Raw frame with focus aid, belt classification map, throughput/latency status and class statistics."""
 
     def __init__(self, config) -> None:
         super().__init__()
         initialize_compute()
         self.config = config
-        self.setWindowTitle("HSI Industrial Scanner — pushbroom simulation")
+        self._live = config.live_camera
+        self.setWindowTitle("HSI Industrial Scanner — " + ("live camera" if self._live else "pushbroom simulation"))
         self.resize(1280, 760)
         self._init_ui()
 
@@ -65,12 +72,12 @@ class PushbroomScannerMainWindow(QMainWindow):
             hidden=self.config.display.hidden_classes)
         self.class_legend_widget.color_changed.connect(self._on_class_color_changed)
         self.class_legend_widget.reset_requested.connect(self._pipeline.reset_counts)
+        self.class_legend_widget.reset_requested.connect(self._forget_previous_counts)
         self.performance_panel.reset_requested.connect(self._pipeline.reset_perf)
         self._setup_backend_selector()
         self._setup_step_switches()
         self._setup_fps_control()
-        self._prev_counts = np.zeros(256, np.int64)
-        self._prev_counted_lines = 0
+        self._forget_previous_counts()
         self._info_label.setText(self._plan_text())
 
         self._pipeline.start()
@@ -84,7 +91,18 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._raw_label.setObjectName("imagePanel")
         self._raw_label.setAlignment(Qt.AlignCenter)
         self._raw_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self._raw_label.setToolTip("Newest raw frame from the simulated camera (slit × spectral), display only")
+        self._raw_label.setToolTip(f"Newest raw frame from the {'live' if self._live else 'simulated'} camera "
+                                   "(slit × spectral), display only")
+        # Focus aid beside the preview (as in hsi's scan window): sharpness of the same raw frames.
+        self.focus_panel = FocusPanel()
+        self._focus_frame = None                   # last frame scored (each frame is scored once)
+        self._preview_row = QWidget()
+        self._preview_row.setObjectName("previewRow")
+        preview_row = QHBoxLayout(self._preview_row)
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        preview_row.setSpacing(8)
+        preview_row.addWidget(self._raw_label, stretch=1)
+        preview_row.addWidget(self.focus_panel)
 
         self._canvas_label = QLabel("Belt classification map")
         self._canvas_label.setObjectName("imagePanel")
@@ -115,6 +133,14 @@ class PushbroomScannerMainWindow(QMainWindow):
                                         "(hidden = not rendered, saves GUI time)")
         self._preview_button.toggled.connect(self._set_preview_visible)
 
+        self._focus_button = QPushButton("Focus")
+        self._focus_button.setObjectName("toggleButton")
+        self._focus_button.setCheckable(True)
+        self._focus_button.setChecked(True)
+        self._focus_button.setToolTip("Show / hide the focus aid beside the spectrogram preview "
+                                      "(hidden = no sharpness computed)")
+        self._focus_button.toggled.connect(self._set_focus_visible)
+
         self._side_button = QPushButton("Analytics")
         self._side_button.setObjectName("toggleButton")
         self._side_button.setCheckable(True)
@@ -124,6 +150,7 @@ class PushbroomScannerMainWindow(QMainWindow):
 
         backend_row = QHBoxLayout()
         backend_row.addWidget(self._preview_button)
+        backend_row.addWidget(self._focus_button)
         backend_row.addWidget(self._side_button)
         caption = QLabel("Correction backend")
         caption.setObjectName("metricCaption")
@@ -199,12 +226,12 @@ class PushbroomScannerMainWindow(QMainWindow):
         bottom.addWidget(self._status_label)
         bottom.addWidget(self._info_label, stretch=1)
 
-        # One vertical splitter: [raw spectrogram | belt map | bottom pane]. The preview can be
-        # collapsed completely (handle or button); the belt map and the status cannot.
+        # One vertical splitter: [raw spectrogram + focus | belt map | bottom pane]. The preview row
+        # can be collapsed completely (handle or button); the belt map and the status cannot.
         self._splitter = QSplitter(Qt.Vertical)
         self._splitter.setObjectName("mainSplitter")
         self._splitter.setChildrenCollapsible(False)
-        for widget in (self._raw_label, self._canvas_label, self._bottom_pane):
+        for widget in (self._preview_row, self._canvas_label, self._bottom_pane):
             self._splitter.addWidget(widget)
         self._splitter.setCollapsible(0, True)
         for index, stretch in enumerate((1, 2, 0)):          # extra height goes to the images
@@ -220,6 +247,8 @@ class PushbroomScannerMainWindow(QMainWindow):
 
         # Side panel: real-time pipeline performance (speed) and material statistics.
         self.class_legend_widget = ClassLegendWidget()
+        self.composition_widget = CompositionWidget()
+        self.class_legend_widget.shares_changed.connect(self.composition_widget.set_shares)
         self.performance_panel = PerformancePanel()
         self._side_tabs = QTabWidget()
         self._side_tabs.setObjectName("sideTabs")
@@ -227,6 +256,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._side_tabs.tabBar().setExpanding(False)
         self._side_tabs.addTab(self.performance_panel, "Performance")
         self._side_tabs.addTab(self.class_legend_widget, "Materials")
+        self._side_tabs.addTab(self.composition_widget, "Composition")
         self._side_tabs.setMinimumWidth(260)
         left.setContentsMargins(0, 0, 0, 0)
         left_pane = QWidget()
@@ -259,6 +289,7 @@ class PushbroomScannerMainWindow(QMainWindow):
 
     _LAYOUT_KEY = "main_splitter"
     _SIDE_LAYOUT_KEY = "side_splitter"
+    _FOCUS_KEY = "focus_panel_visible"
 
     def _preview_collapsed(self) -> bool:
         return self._splitter.sizes()[0] == 0
@@ -274,6 +305,26 @@ class PushbroomScannerMainWindow(QMainWindow):
             self._preview_height = raw
             self._splitter.setSizes([0, raw + canvas, bottom])
             self._raw_label.clear()
+
+    def _set_focus_visible(self, visible: bool) -> None:
+        """Show / hide the focus aid; it lives in the preview row, so showing it opens the preview."""
+        self.focus_panel.setVisible(visible)
+        if visible:
+            self.focus_panel.reset()               # an old peak is from another scene / setting
+            if self._preview_collapsed():
+                self._preview_button.setChecked(True)
+        self._focus_frame = None
+
+    def _focus_active(self) -> bool:
+        return self._focus_button.isChecked() and not self._preview_collapsed()
+
+    def _update_focus(self, frame) -> None:
+        """Score each new preview frame once (hsi's 5 Hz), only while the focus aid is on screen."""
+        if frame is None or frame is self._focus_frame or not self._focus_active():
+            return
+        self._focus_frame = frame
+        axis = self.focus_panel.axis
+        self.focus_panel.set_value(edge_contrast(frame, axis), reference=sharpness_score(frame, axis=axis))
 
     def _sync_preview_button(self) -> None:
         """Keep the button in step when the preview is collapsed/opened by dragging the handle."""
@@ -308,6 +359,8 @@ class PushbroomScannerMainWindow(QMainWindow):
         restored = state is not None and self._splitter.restoreState(state)
         side_state = self._settings().value(self._SIDE_LAYOUT_KEY)
         side_restored = side_state is not None and self._side_splitter.restoreState(side_state)
+        focus = self._settings().value(self._FOCUS_KEY, True)
+        self._focus_button.setChecked(focus not in (False, 'false', '0', 0))
         # Sizes are only real once the window is laid out; set the defaults and sync then.
         QTimer.singleShot(0, lambda: self._finish_layout(restored, side_restored))
 
@@ -333,18 +386,37 @@ class PushbroomScannerMainWindow(QMainWindow):
         settings = self._settings()
         settings.setValue(self._LAYOUT_KEY, self._splitter.saveState())
         settings.setValue(self._SIDE_LAYOUT_KEY, self._side_splitter.saveState())
+        settings.setValue(self._FOCUS_KEY, self._focus_button.isChecked())
 
     def _plan_text(self) -> str:
         """Where every correction/calibration value came from (first file of the playlist)."""
         plan = self._pipeline.plans[0]
         src = self._pipeline.sources[0]
-        parts = [f"{len(self._pipeline.sources)} file(s), first {src.name} {src.frame_shape} {src.dtype}, stage={plan.stage}"]
+        if self._live:
+            parts = [f"live camera {src.name} {src.frame_shape} {src.dtype}, stage={plan.stage}"]
+        else:
+            parts = [f"{len(self._pipeline.sources)} file(s), first {src.name} {src.frame_shape} {src.dtype}, "
+                     f"stage={plan.stage}"]
         parts += [f"{key}: {value}  [{origin}]" for key, (value, origin) in plan.provenance.items()]
         return "\n".join(parts)
 
     def _setup_fps_control(self) -> None:
         """Presets for the simulated line rate. The recording's exposure only selects the
-        preprocessing files (dark etc.); the simulation speed is set here, independently."""
+        preprocessing files (dark etc.); the simulation speed is set here, independently.
+
+        A live camera free-runs at the rate its exposure and readout allow: the box then shows
+        the measured line rate, read-only (refreshed with the status line)."""
+        if self._live:
+            self._fps_spin.setEnabled(False)
+            self._fps_spin.setSpecialValueText("measuring…")
+            self._fps_spin.setValue(0)
+            self._fps_spin.setToolTip("Measured line rate of the live camera. It free-runs at the rate its exposure "
+                                      "and readout allow\n(acquisition.exposure_ms); file playback sets the rate here.")
+            square = self._square_pixel_fps()
+            if square:
+                self._belt_label.setToolTip(f"Square pixels on the belt need {square:g} lines/s at "
+                                            f"{self.config.camera.belt_speed_m_s * 60:g} m/min")
+            return
         square = self._square_pixel_fps()
         values = sorted({100, 250, 500, 1000, 2000} | ({square} if square else set())) + [0]
         for value in values:
@@ -377,6 +449,17 @@ class PushbroomScannerMainWindow(QMainWindow):
         pixel = self._belt_pixel_mm()
         speed = self.config.camera.belt_speed_m_s
         return int(round(speed * 1000.0 / pixel)) if pixel and speed else None
+
+    def _show_live_rate(self, fps: float, stalled: bool = False) -> None:
+        """Live camera: the measured line rate in the (read-only) rate box and the belt readout."""
+        if not fps:
+            if stalled:                                # no stale rate while the camera sends nothing
+                self._fps_spin.setSpecialValueText("no frames")
+                self._fps_spin.setValue(0)
+                self._belt_label.setText("no frames from the camera")
+            return
+        self._fps_spin.setValue(int(round(fps)))
+        self._update_fps_labels(fps)
 
     def _update_fps_labels(self, fps: float) -> None:
         speed = self.config.camera.belt_speed_m_s
@@ -477,6 +560,12 @@ class PushbroomScannerMainWindow(QMainWindow):
 
     # ------------------------------------------------------------------------- refresh ---
 
+    def _forget_previous_counts(self) -> None:
+        # Reset Batch zeroes the pipeline's counts in this thread, so the next real-time delta
+        # starts from zero even when the batch is already as long again by the next refresh.
+        self._prev_counts = np.zeros(256, np.int64)
+        self._prev_counted_lines = 0
+
     def _refresh_gui_slot(self) -> None:
         columns, step = self._canvas_columns(), self._belt_step()
         s = self._pipeline.snapshot(canvas_columns=columns, raw_columns=self._raw_zone_columns(columns), step=step)
@@ -488,9 +577,12 @@ class PushbroomScannerMainWindow(QMainWindow):
         if legend_due:
             self.throughput_strip.update_snapshot(s)
         charts_due = self._tick % max(1, round(hz / 5)) == 0
+        focus_due = self._tick % max(1, round(hz * FocusPanel.INTERVAL_S)) == 0
 
         if s.raw_frame is not None and not self._preview_collapsed():
             self._set_pixmap(self._raw_label, _to_gray8(s.raw_frame, self._raw_label.size()), Qt.KeepAspectRatio)
+        if focus_due:
+            self._update_focus(s.raw_frame)
         if s.canvas.shape[1] > 0:
             self._show_belt(s.canvas, s.raw_canvas, step[1])
 
@@ -508,14 +600,27 @@ class PushbroomScannerMainWindow(QMainWindow):
         name, index, n_frames, cycle = s.position
         total = s.frames_delivered + s.lines_lost
         lost_pct = 100.0 * s.lines_lost / total if total else 0.0
-        target = 'max' if s.target_fps == 0 else f"{s.target_fps:g}"
         mm = (f" · {self.config.camera.belt_speed_m_s * 1000.0 / s.target_fps:.1f} mm/line"
               if s.target_fps else "")
         stage_total = s.stage_ms.get('total', 0.0)
         state = s.state.upper() if s.state != 'running' else 'RUN'
-        text = (f"{state} | {name} [{index + 1}/{n_frames}] cycle {cycle} | "
+        stalled = False
+        if s.source_kind == 'camera':
+            # free-running camera: target_fps is its measured frame rate (0 = nothing delivered lately)
+            stalled = s.state == 'running' and s.elapsed_s > 1.0 and s.target_fps == 0
+            target = f"{s.target_fps:,.0f}" if s.target_fps else ('0 (no frames)' if stalled else '…')
+            where = f"{name} frame {index + 1:,}"
+            lost_detail = (f", camera {s.lines_lost_camera:,}" if s.lines_lost_camera else "") + \
+                (f", read timeouts {s.grab_timeouts:,}" if s.grab_timeouts else "")
+            if legend_due:
+                self._show_live_rate(s.target_fps, stalled)
+        else:
+            target = 'max' if s.target_fps == 0 else f"{s.target_fps:g}"
+            where = f"{name} [{index + 1}/{n_frames}] cycle {cycle}"
+            lost_detail = ""
+        text = (f"{state} | {where} | "
                 f"line rate {target}/s{mm} | camera {s.camera_fps:,.0f}/s · processed {s.processed_fps:,.0f}/s\n"
-                f"lines {s.lines_processed:,} · lost {s.lines_lost:,} ({lost_pct:.2f}%) · "
+                f"lines {s.lines_processed:,} · lost {s.lines_lost:,} ({lost_pct:.2f}%{lost_detail}) · "
                 f"buffers {s.buffers_in_use}/{s.buffer_frames} · latency p50 {s.latency_ms['p50']:.2f} "
                 f"p99 {s.latency_ms['p99']:.2f} max {s.latency_ms['max']:.1f} ms · "
                 f"{s.backend} {stage_total:.2f} ms/line/worker")
@@ -526,7 +631,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._backend_label.setText(f"running: {s.backend}  (requested {s.requested_backend}){note}")
         set_accent(self._backend_label, 'warn' if s.backend_note else 'ok')
         # ok / warn / error: stripe and text colours come from the theme
-        set_accent(self._status_label, 'error' if s.error else 'warn' if s.lines_lost else 'ok')
+        set_accent(self._status_label, 'error' if s.error else 'warn' if s.lines_lost or stalled else 'ok')
 
     def _canvas_columns(self) -> int:
         """Belt-map columns that fill the label at the true pixel proportions.
@@ -643,10 +748,19 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._gui_timer.stop()
         self._save_layout()
         if not self._pipeline.stop():
+            busy = self._pipeline.busy_threads()
+            if busy == ['camera'] and getattr(self, '_close_refused', False):
+                # Second try and only the camera thread is left, blocked inside the SDK: quit anyway
+                # (closing the camera from this thread could crash the SDK; the OS releases it).
+                logger.warning("Closing with the camera thread still blocked in a read; the camera was not closed")
+                event.accept()
+                return
             # Keep the window (and the threads' owners) alive while a worker is still busy,
             # e.g. a CUDA backend finishing its initialisation; close again to retry.
-            logger.warning("Shutdown pending; a pipeline thread is still running")
-            self._status_label.setText("Shutdown pending: waiting for a pipeline thread — close again")
+            self._close_refused = True
+            logger.warning("Shutdown pending; pipeline thread(s) still running: %s", ', '.join(busy))
+            self._status_label.setText(f"Shutdown pending: waiting for {', '.join(busy)} — close again")
+            self._gui_timer.start()                    # keep the window alive meanwhile
             event.ignore()
             return
         logger.info("All pipeline threads stopped. Closing application.")
@@ -679,10 +793,19 @@ def main() -> None:
     parser.add_argument('--fps', type=float, default=None, help='line rate; 0 = as fast as possible')
     parser.add_argument('--workers', type=int, default=None)
     parser.add_argument('--theme', default=None, help='theme name in themes/ or a theme JSON (overrides display.theme)')
+    parser.add_argument('--live', action='store_true',
+                        help='live camera instead of files (source.kind = camera; see the live section)')
+    parser.add_argument('--set', action='append', default=[], metavar='SECTION.KEY=VALUE',
+                        help='override any simulation.json value, e.g. --set acquisition.exposure_ms=2 (JSON values)')
     args = parser.parse_args()
 
-    config = load_config(args.config, camera={'fps': args.fps}, processing={'workers': args.workers},
-                         display={'theme': args.theme})
+    overrides = {'camera': {'fps': args.fps}, 'processing': {'workers': args.workers},
+                 'display': {'theme': args.theme}, 'source': {'kind': 'camera' if args.live else None}}
+    try:
+        explicit = parse_set_overrides(args.set)
+    except ValueError as exc:
+        parser.error(str(exc))
+    config = load_config(args.config, explicit=explicit, **overrides)
     if args.source:
         config = replace(config, source=replace(config.source, path=str(Path(args.source).resolve()),
                                                 pattern=args.pattern))

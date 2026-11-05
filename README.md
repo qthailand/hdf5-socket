@@ -3,7 +3,8 @@
 Replays data recorded by the HSI acquisition project (`C:\ClassificationPipeLine\hsi`) as a
 high-rate line-scan camera (300 – 1000+ lines/s) and runs the same per-frame processing as
 the acquisition, followed by the classifier — to develop industrial sorting software
-without camera or belt.
+without camera or belt. The same pipeline also runs on a **live camera** (hsi's camera
+backends, `source.kind = "camera"`, see *Live camera*).
 
 ```
 raw sensor frame ─► dark ─► hot pixel ─► flip (raw_inverted) ─► Smile ─► lambda binning ─► model ─► belt map / statistics
@@ -18,10 +19,12 @@ python gui.py --source dataset/dataset.bip.hdr --fps 300
 python simulate.py --fps 1000 --seconds 20            # headless report: throughput, lost lines, latency
 python simulate.py --fps 0 --overrun block            # maximum lossless rate of this PC
 python simulate.py --set corrections.smile=auto --set corrections.dark=auto
+python gui.py --live                                  # live camera instead of files
+python simulate.py --live --seconds 30 --set acquisition.exposure_ms=2
 ```
 
-`simulate.py --set SECTION.KEY=VALUE` overrides any `simulation.json` value. The socket
-streamer `python . send/recv` (`__main__.py`) is a separate tool.
+`--set SECTION.KEY=VALUE` (`gui.py` and `simulate.py`) overrides any `simulation.json` value. The
+socket streamer `python . send/recv` (`__main__.py`) is a separate tool.
 
 ## Input
 
@@ -50,6 +53,60 @@ panel shows each file's storage and the GUI warns *streamed from HDF5: timing in
 decoding*. With ~6 GB free on C: the two GenICam files (5.0 + 5.5 GB decoded) are streamed;
 free ~13 GB for the disk cache, or play one file in RAM:
 `python gui.py --source data/first.h5` with `source.cache = "ram"`.
+
+## Live camera (`source.kind = "camera"`)
+
+The same pipeline reads a real camera instead of files: `python gui.py --live`,
+`python simulate.py --live`, or `"source": {"kind": "camera"}` in `simulation.json`. Everything
+after the frame buffers is unchanged (corrections, model, belt map, statistics), because a camera
+delivers what a *Keep Spectrogram* recording stores: the raw `uint16` frame `(slit, spectral)` at
+the hardware bin.
+
+The camera code is hsi's `modules/camera` (POA, GenICam, XIMEA), byte-identical copies like the
+processing code (see *Same algorithms as hsi*). The vendor SDK folders (`modules/camera/poa`,
+`modules/camera/ximea`: ctypes wrappers and DLLs, the XIMEA one 110 MB) are not in git, as in
+hsi; copy them once:
+
+```bash
+python tools/sync_hsi.py --update --only camera       # camera files incl. the poa/ and ximea/ SDKs
+python -m modules.camera --backend genicam --cti C:\path\producer.cti --bin 2   # hsi's hardware check
+```
+
+GenICam also needs `pip install harvesters` and a GenTL producer (`.cti`); POA and XIMEA ship
+Windows DLLs only.
+
+At start the camera gets the `acquisition` values, which then also select the dark, Smile and
+wavelength files, as the attributes of a recording do (origin `camera:...` in the info panel):
+
+| Key | Live meaning |
+|---|---|
+| `acquisition.camera_backend` | `poa`, `genicam` or `ximea`; also the `calibration/*/<backend>/` folder |
+| `acquisition.camera_bin` | hardware bin set on the camera (an unsupported bin is an error) |
+| `acquisition.exposure_ms`, `gain` | required; applied to the camera, and the values it applied pick the dark |
+| `acquisition.raw_inverted` | slit flip, as for files |
+| `live.camera_index` | device index (GenICam, XIMEA; POA opens its first camera) |
+| `live.cti_path` | GenICam GenTL producer; `null` = `$GENICAM_GENTL64_PATH\libsv_gev_tl_x64.cti` |
+| `live.sensor_pixel_size` | GenICam `SensorPixelSize` 8/10/12 bits: must be what the darks were recorded with (it changes the value scaling) |
+| `live.read_timeout_ms` | longest wait for one frame (default 100); a stop is noticed within this time |
+
+The sensor temperature at start picks the nearest dark, as in hsi. Reflectance `auto` looks for
+`reflectance/live_<backend>.npy`.
+
+How it runs (`Pipeline._live_loop`, `camera_source.py`):
+
+* The camera **free-runs** at the rate its exposure and readout allow (hsi sets no frame rate
+  either). `camera.fps`, `overrun: "block"` and `loop` apply to files only; the line-rate box
+  shows the measured rate, read-only, and the mm/line readout uses it.
+* Each frame is written straight into a free buffer (GenICam converts into it, the other
+  backends copy). With no free buffer the frame is still read and dropped as an **overrun**;
+  frames the camera or the link lost (GenICam frame-id gaps, POA's dropped counter) are lost
+  lines too (`lines_lost_camera`). Both are drawn magenta. XIMEA reports no drops.
+* **Latency** starts at the camera timestamp for GenICam (camera clock latched to the host and
+  re-latched every 30 s; implausible stamps fall back to the arrival time), otherwise at the
+  frame's arrival (`Snapshot.line_clock`: `camera` / `arrival`).
+* Gain, exposure and bin stay fixed while running, because they select the calibration: change
+  them in `simulation.json` or with `--set` and start again. The pipeline's camera thread owns the
+  camera and closes it when the pipeline stops.
 
 ## Acquisition calibration (no link to the hsi project at run time)
 
@@ -117,12 +174,54 @@ data stops the start instead of feeding wrong bands. Add the wavelengths to an o
 artifact with `python tools/add_band_wavelengths.py model.joblib dataset/dataset.bip.hdr`;
 `train_sgd_coco.py` now stores them.
 
+## Confidence and calibration (offline)
+
+The running system classifies with `predict` only (the class, no probability), so confidence
+costs nothing at run time. To check a model offline,
+`PushbroomLineClassifier.predict_confidence` also returns the **confidence** of each pixel: the
+probability of the winning class exactly as sklearn's `predict_proba` gives it for the
+`log_loss` SGD model (one-vs-rest: sigmoid of every class score, normalised to sum 1; checked
+against sklearn in the tests), computed from the scores divided by the artifact's
+`temperature`. The class is always the same as `predict`'s.
+
+`tools/check_calibration.py` checks that "90 %" means right about 90 % of the time: it runs the
+artifact through `PushbroomLineClassifier.predict_confidence` on the labelled pixels of the
+training cube (`training_header`, COCO polygons `<cube>.json`) and prints a reliability table
+(per confidence bin: pixels, mean confidence, actual accuracy), the ECE, the accuracy below and
+above `--min-confidence` and per class accuracy, precision and mean confidence. By default it
+uses the 20 % held-out pixels of `train_sgd_coco.py` (the split depends only on the labels, so
+it is reproduced exactly; `--split train|all`, `--temperature 1` for the uncalibrated model).
+
+```bash
+python tools/check_calibration.py                       # sgd_first_reflectance.joblib
+```
+
+The plain SGD model is **under-confident**: on the held-out pixels of `first` it is right 92.0 %
+of the time but reports 77.4 % on average (pixels reported at 80-90 % are right 99 % of the
+time; ECE 0.146). `train_sgd_coco.py` therefore fits a **temperature** T on the held-out pixels
+(the one scalar that minimises their log loss) and stores it in the artifact;
+`predict_confidence` divides the scores by T before the sigmoid (T < 1 sharpens). The class
+(`predict`, argmax) does not change. For `first` T = 0.474: mean confidence 90.4 % for 92.0 %
+accuracy, ECE 0.016 (0.015-0.017 when T is fitted on one half of the held-out pixels and
+checked on the other). Artifacts without `temperature` keep T = 1.0 (sklearn's value); retrain
+to add it (`python train_sgd_coco.py --hdr dataset/first.hdr --out sgd_first_reflectance.joblib`
+gives the same weights).
+
+* One T fixes the overall scale, not every class: mango pixels assigned to mango are right 98 %
+  of the time at 50 % confidence, katom 80 % at 87 % (two thirds of the mango pixels are taken for
+  katom: mango recall 33 %). That is the model, not the calibration.
+* The held-out pixels are neighbours of training pixels in the same recording. On a new
+  recording (other fruit, lighting, belt) accuracy is lower; label part of it and run the check
+  on it (`--hdr new.hdr --labels new.json`) before trusting its confidence there.
+
 ## Pipeline (pipeline.py)
 
 * **Camera**: fixed line clock `camera.fps` (0 = free run), frame copied into one of
   `camera.buffer_frames` pre-allocated buffers. No free buffer = **overrun**: with
   `overrun: "drop"` the line is lost like on a real camera, counted, and drawn magenta on the
-  belt map; `"block"` makes the camera wait (throughput test).
+  belt map; `"block"` makes the camera wait (throughput test). A live camera
+  (`source.kind = "camera"`) fills the same buffers at its own rate and always drops on overrun
+  (see *Live camera*).
 * **Workers** (`processing.workers`): parallel correction + binning + classification, each
   with its own `PreprocessingRuntime` (CUDA context per thread). Kernels are warmed up
   before the clock starts.
@@ -147,15 +246,16 @@ from hsi.
 
 ## Same algorithms as hsi
 
-Dark, hot pixel, flip, Smile (loading via hsi `SmileRuntime`) and binning run hsi's own code:
-16 files under `modules/` are byte-identical copies, only the package `__init__.py` files are
-local. The CPU, CuPy and OpenCV-CUDA backends are hsi's (`modules/preprocessing`), including
+Dark, hot pixel, flip, Smile (loading via hsi `SmileRuntime`) and binning run hsi's own code,
+and the live camera hsi's camera backends: the files listed in `tools/sync_hsi.py` are
+byte-identical copies, only the package `__init__.py` files are local. The CPU, CuPy and OpenCV-CUDA backends are hsi's (`modules/preprocessing`), including
 its rule that a GPU result is checked once against the CPU reference (at most 1 count) and
 falls back to CPU otherwise.
 
 ```bash
 python tools/sync_hsi.py            # verify against ..\hsi (also a test)
 python tools/sync_hsi.py --update   # take over a newer hsi version
+python tools/sync_hsi.py --update --only camera   # only modules/camera (and its SDK folders)
 ```
 
 ## Switching CPU / CuPy
@@ -391,6 +491,7 @@ order are kept; the stage averages restart). The belt readout shows mm per line 
 `camera.belt_speed_m_s`. **Max** = the camera delivers the next line as soon as a buffer is free:
 the chain's lossless maximum (measured ~440 lines/s here). The recording's exposure only selects
 the preprocessing files and does not limit this rate. Headless: `Pipeline.set_fps(value)`.
+With a live camera the box is read-only and shows the camera's measured line rate.
 
 A row of cards under the belt map, visible whatever side tab is open: **Camera FPS** (delivered /
 target line rate), **Processed FPS** (lines classified per second), **Capacity (est.)** (workers ×
@@ -430,11 +531,12 @@ Chart colours are the `chart_*` tokens of the theme. **Materials** is the former
 
 ## Window layout
 
-The left side is one vertical splitter: **raw spectrogram | belt map | bottom pane**
+The left side is one vertical splitter: **raw spectrogram + focus | belt map | bottom pane**
 (backend selector, status line, provenance info).
 
 * Upper handle, or the **Spectrogram** button: shrink or fully collapse the real-time raw
   spectrogram preview. While collapsed it is not rendered at all (saves GUI time at high rates).
+* **Focus** button: the focus aid beside the preview (below); hidden = no score computed.
 * Lower handle: drag down to give the belt map more height; the info panel shrinks to nothing,
   the backend row and status line stay visible.
 * Vertical handle between the images and **Material Analytics**, or the **Analytics** button:
@@ -442,6 +544,37 @@ The left side is one vertical splitter: **raw spectrogram | belt map | bottom pa
 * The layout is remembered between runs (Windows registry,
   `HKCU\Software\NARIT-TSC\PushbroomSortingSimulation`); delete that key to get the default
   1:2 split back.
+
+## Focusing the camera (focus aid)
+
+The **FOCUS** card beside the spectrogram preview follows hsi's scan-window sharpness sidebar:
+put a still, high-contrast target under the slit (e.g. black/white bars across the belt), turn
+the lens focus ring slowly and stop where the number is highest. A score every 6 GUI refreshes
+(hsi's 0.2 s at the default `display.gui_hz` 30; with the pipeline running, about 3 per second
+were measured at 250 lines/s), each preview frame scored once, nothing computed while the card
+or the preview is hidden. One update (edge contrast + hsi's score) took ~11 ms at 250 lines/s.
+
+* **Big number**: edge contrast of the raw frame in % per pixel (`focus.edge_contrast`): the
+  frame is averaged over the other axis, then the RMS step between neighbouring pixels of that
+  profile is divided by its mean. Independent of exposure and gain; ~1 ms per 1024 × 1280 frame.
+* **Bar and %**: score / running peak; the peak decays by 0.9995 per score as in hsi. **↺**
+  forgets it (do this after changing the target, exposure or bin).
+* **Trend**: the last 150 scores (~50 s at ~3 per second); the green dot is the best score in that window, so after turning
+  past focus you can see how far to turn back.
+* **hsi score**: hsi's `sharpness_score` formula (mean |Sobel|, `modules/sharpness/core.py`, a
+  byte-identical copy) on the same raw frame, for comparison. hsi's scan window applies it to
+  its dark/Smile-corrected, binned frame, so its numbers are not the same as this line's.
+* **Slit / λ**: `Slit` (default) = imaging focus along the slit; `λ` = sharpness along the
+  wavelength axis, for focusing the spectrograph on a line lamp.
+
+Why the bar does not use hsi's score: the mean *absolute* gradient across an edge equals the
+edge height however much it is blurred, and on raw frames the sensor noise (~500 counts sd here)
+sets a high floor. On three recorded frames in `data/`, defocused by 1 px (Gaussian sigma, noise
+added after the blur as in a real lens), hsi's score kept 93.5-95.1 % of its in-focus value,
+edge contrast 71-96 % (on one frame slightly less responsive than hsi's up to 2 px, ahead from
+3 px; at 5 px 36-73 % against 81-88 %). This is one simulation: the noise level is estimated
+from the frames. On a bar target hsi's score stays flat up to 2 px of blur while edge contrast
+falls to 53 % at 1 px; `tests/test_focus.py` pins this down.
 
 ## Theme
 
@@ -484,6 +617,10 @@ python -m pytest -q tests
 ```
 
 `test_preprocessing*.py` and `cuda_emulation.py` are copied from hsi; `test_simulation.py`
-covers sources, calibration resolution, model binding, lossless ordering, overrun counting
+covers sources, calibration resolution, model binding, confidence = sklearn `predict_proba`,
+temperature scaling, lossless ordering, overrun counting
 the bit-exact reproduction of the training cube, live backend switching and that the
-processing code is still identical to hsi; `test_themes.py` checks the themes.
+processing code is still identical to hsi; `test_live_camera.py` runs the live camera source
+against a fake camera backend (no hardware: configuration, calibration from the camera's
+values, frame-id gaps and overruns, timestamps, stop/close); `test_themes.py` checks the themes;
+`test_focus.py` the focus score and the focus card.

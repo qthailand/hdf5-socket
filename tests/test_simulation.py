@@ -207,6 +207,70 @@ def test_classifier_index_fallback_checks_band_count(model):
         model.bind(None, 6)
 
 
+def test_confidence_is_sklearn_predict_proba(tmp_path):
+    """Fused weights (as train_sgd_coco.py stores them) give the probability of sklearn's own
+    log_loss model (one-vs-rest) for the chosen class."""
+    import joblib
+    from sklearn.linear_model import SGDClassifier
+    from sklearn.preprocessing import StandardScaler
+    rng = np.random.default_rng(1)
+    y = rng.integers(1, 4, 600)
+    x = rng.normal(100.0, 20.0, (600, 6)) + y[:, None] * np.array([5.0, -3.0, 0.0, 8.0, 1.0, -6.0])
+    scaler = StandardScaler().fit(x)
+    sk = SGDClassifier(loss='log_loss', random_state=0).fit(scaler.transform(x), y)
+    joblib.dump({'W_fused': (sk.coef_ / scaler.scale_).T,
+                 'b_fused': sk.intercept_ - sk.coef_ @ (scaler.mean_ / scaler.scale_),
+                 'selected_bands': np.arange(6), 'classes': sk.classes_}, tmp_path / 'm.joblib')
+    model = PushbroomLineClassifier(tmp_path / 'm.joblib')
+    columns, _ = model.bind(None, 6)
+    ids, confidence = model.predict_confidence(x, columns)
+    np.testing.assert_array_equal(ids, model.predict(x, columns))
+    assert (ids == sk.predict(scaler.transform(x))).mean() > 0.99          # float32 vs float64 near ties
+    np.testing.assert_allclose(confidence, sk.predict_proba(scaler.transform(x)).max(axis=1), atol=1e-4)
+    with np.errstate(all='raise'):                                          # far outside the training data
+        _, extreme = model.predict_confidence(x * 1e6, columns)
+    assert np.all((extreme > 0) & (extreme <= 1))
+    x[0, 2] = np.nan                                                        # a bad band: uncertain, never NaN
+    ids, confidence = model.predict_confidence(x, columns)
+    assert confidence[0] == 0.0 and np.isfinite(confidence).all()
+    np.testing.assert_array_equal(ids, model.predict(x, columns))
+
+
+def test_temperature_scales_confidence_not_class(tmp_path):
+    """The artifact's ``temperature`` divides the scores before the confidence (what
+    train_sgd_coco.py fits), never changes the class, and is recovered from labels drawn at it."""
+    import joblib
+    from train_sgd_coco import fit_temperature, ovr_probabilities
+    rng = np.random.default_rng(2)
+    W = rng.normal(0.0, 1.0, (4, 3)).astype(np.float32)
+    b = np.array([-1.0, 0.5, -0.2], np.float32)
+    artifact = {'W_fused': W, 'b_fused': b, 'selected_bands': np.arange(4), 'classes': np.array([1, 2, 3])}
+    joblib.dump(artifact, tmp_path / 'plain.joblib')
+    joblib.dump({**artifact, 'temperature': 0.5}, tmp_path / 'sharp.joblib')
+    plain, sharp = PushbroomLineClassifier(tmp_path / 'plain.joblib'), PushbroomLineClassifier(tmp_path / 'sharp.joblib')
+    assert plain.temperature == 1.0                                         # older artifacts: sklearn's value
+    x = rng.normal(0.0, 2.0, (2000, 4)).astype(np.float32)
+    columns, _ = plain.bind(None, 4)
+    ids, conf = plain.predict_confidence(x, columns)
+    sharp_ids, sharp_conf = sharp.predict_confidence(x, columns)
+    np.testing.assert_array_equal(sharp_ids, ids)
+    np.testing.assert_array_equal(sharp.predict(x, columns), plain.predict(x, columns))
+    scores = x.astype(np.float64) @ W + b
+    np.testing.assert_allclose(conf, ovr_probabilities(scores).max(axis=1), atol=1e-5)
+    np.testing.assert_allclose(sharp_conf, ovr_probabilities(scores, 0.5).max(axis=1), atol=1e-5)
+    assert sharp_conf.mean() > conf.mean() + 0.05                          # T < 1 sharpens (on average:
+                                                                            # one-vs-rest is not a softmax)
+
+    big = rng.normal(0.0, 3.0, (20000, 3))                                 # labels drawn at T = 0.5
+    p = ovr_probabilities(big, 0.5)
+    y_index = (rng.random(big.shape[0])[:, None] > p.cumsum(axis=1)).sum(axis=1)
+    assert fit_temperature(big, y_index) == pytest.approx(0.5, rel=0.1)
+
+    joblib.dump({**artifact, 'temperature': 0.0}, tmp_path / 'bad.joblib')
+    with pytest.raises(ValueError, match='temperature'):
+        PushbroomLineClassifier(tmp_path / 'bad.joblib')
+
+
 # ---------------------------------------------------------------------- pipeline ---
 
 class StubPlan:

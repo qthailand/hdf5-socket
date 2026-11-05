@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
-"""Lossless high-rate pushbroom simulation: camera -> parallel frame workers -> in-order sink.
+"""Lossless high-rate pushbroom pipeline: camera -> parallel frame workers -> in-order sink.
 
 A pushbroom frame is one line of the belt, so no frame may vanish unnoticed::
 
-    CameraSimulator ──(frame buffers)──► FrameWorker × N ──(results)──► Aggregator ──► snapshot()
-     paces lines at camera.fps           dark/hot/flip/Smile/bin          restores line order,     GUI pulls
-     copies each frame into a free       + classify (each worker owns     counts EVERY line, fills  at ~30 Hz
-     buffer like a frame grabber         its PreprocessingRuntime)        the belt map, latency
+    Camera thread ──(frame buffers)──► FrameWorker × N ──(results)──► Aggregator ──► snapshot()
+     file playback paced at camera.fps,  dark/hot/flip/Smile/bin          restores line order,     GUI pulls
+     or a live camera (source.kind);     + classify (each worker owns     counts EVERY line, fills  at ~30 Hz
+     each frame lands in a free buffer   its PreprocessingRuntime)        the belt map, latency
 
+* Source: ``source.kind = "file"`` replays recordings (:meth:`Pipeline._playback_loop`);
+  ``"camera"`` reads a live hsi camera backend (:meth:`Pipeline._live_loop`, ``camera_source.py``).
+  The workers, aggregator and GUI are the same for both.
 * Buffers: ``camera.buffer_frames`` frame slots are allocated once. A line for which no slot
   is free is an *overrun*: with ``overrun='drop'`` it is lost exactly like on a real camera
-  (counted, and shown as a magenta column on the belt map); with ``'block'`` the camera waits
-  (lossless throughput measurement).
-* Timing: ``camera.fps`` is a fixed line clock (no drift); a frame's sensor time is its
-  scheduled time, so latency includes any lag of the simulated camera itself.
+  (counted, and shown as a magenta column on the belt map); with ``'block'`` the simulated
+  camera waits (lossless throughput measurement; a live camera always drops). Frames a live
+  camera loses itself (frame-id gaps, SDK counter) are lost lines too (``lines_lost_camera``).
+* Timing: file playback has a fixed line clock ``camera.fps`` (no drift) and a frame's sensor
+  time is its scheduled time, so latency includes any lag of the simulated camera itself. A live
+  camera free-runs at its own rate; sensor time is the camera timestamp where it has one
+  (GenICam), else the arrival time (see ``camera_source.CameraClock``).
 * Statistics: class pixel counts are accumulated per line in the aggregator, in line order,
   independently of how often the GUI draws.
 
@@ -133,10 +139,11 @@ class _Job:
     seq: int            # delivered-frame number (contiguous)
     line: int           # sensor line number (includes lost lines)
     slot: int
-    t_sensor: float     # perf_counter time the line was exposed
+    t_sensor: float     # perf_counter time the line was exposed (latency starts here)
     source: int
     index: int
     cycle: int
+    t_queued: float     # perf_counter time the line entered the buffers (queue wait starts here)
 
 
 @dataclass
@@ -145,7 +152,7 @@ class Snapshot:
     state: str                       # starting | running | finished | stopped | error
     error: str | None
     elapsed_s: float
-    target_fps: float
+    target_fps: float                # file: the simulated line rate (0 = max); live camera: its measured rate
     camera_fps: float                # lines the camera delivered per second (recent)
     processed_fps: float             # lines classified per second (recent)
     frames_delivered: int
@@ -169,21 +176,49 @@ class Snapshot:
                                      # (mean over bands, float32; NaN = lost line), oldest -> newest
     canvas_filled: int
     raw_frame: np.ndarray | None     # newest raw frame (display only)
-    position: tuple                  # (source name, frame index, n frames, cycle)
+    position: tuple                  # (source name, frame index, n frames, cycle); live: n frames = 0
+    source_kind: str = 'file'        # file | camera
+    lines_lost_camera: int = 0       # live: part of lines_lost the camera/link lost (never delivered)
+    grab_timeouts: int = 0           # live: reads that returned no frame within live.read_timeout_ms
+    line_clock: str = 'schedule'     # sensor time = file: 'schedule'; live: 'camera' timestamps or 'arrival'
 
 
 # ----------------------------------------------------------------------------- pipeline ---
 
 def build_pipeline(config) -> 'Pipeline':
-    """Open the configured input, resolve one acquisition plan per file, load and bind the model."""
+    """Open the configured input, resolve one acquisition plan per file, load and bind the model.
+
+    With ``source.kind = "camera"`` the input is the live camera (``camera_source.open_camera``):
+    it is opened and configured here and handed to the pipeline, which closes it when it stops
+    (or here, if building the rest fails).
+    """
+    src_cfg = config.source
+    camera = None
+    if src_cfg.kind == 'camera':
+        from camera_source import open_camera
+        camera, live = open_camera(config)
+        sources = [live]
+    else:
+        from sources import open_sources
+        sources = open_sources(config.resolve(src_cfg.path), src_cfg.pattern, stage=src_cfg.stage,
+                               scan_axis=src_cfg.envi_scan_axis, dataset=src_cfg.dataset, cache=src_cfg.cache,
+                               cache_dir=config.resolve(src_cfg.cache_dir))
+    try:
+        return _bind_pipeline(config, sources, camera)
+    except BaseException:
+        if camera is not None:
+            try:
+                camera.close()
+            except Exception:
+                logger.exception("Closing the camera after a failed build failed too")
+        raise
+
+
+def _bind_pipeline(config, sources, camera) -> 'Pipeline':
     from inference_engine import PushbroomLineClassifier, SpeedTestClassifier
     from sim_config import build_plan
-    from sources import open_sources
 
     src_cfg = config.source
-    sources = open_sources(config.resolve(src_cfg.path), src_cfg.pattern, stage=src_cfg.stage,
-                           scan_axis=src_cfg.envi_scan_axis, dataset=src_cfg.dataset, cache=src_cfg.cache,
-                           cache_dir=config.resolve(src_cfg.cache_dir))
     if config.model.path in (None, '', 'none'):
         classifier = SpeedTestClassifier()
         logger.warning("model.path = none: %s", classifier.path)
@@ -194,9 +229,14 @@ def build_pipeline(config) -> 'Pipeline':
         plan = build_plan(config, src)
         plan.columns, binding = classifier.bind(plan.wavelengths, plan.n_columns, config.model.band_tolerance_nm)
         plan.provenance['model bands'] = (binding, os.path.basename(classifier.path))
-        plan.provenance['input storage'] = (
-            src.storage + (" - timing includes the simulator's own HDF5 decoding; use frames in RAM or "
-                           "the disk cache to measure speed" if src.storage == 'stream' else ''), f"cache={src_cfg.cache}")
+        if camera is not None:
+            plan.provenance['input'] = (f"live camera {src.name} {src.frame_shape} {np.dtype(src.dtype).name}, "
+                                        f"read timeout {config.live.read_timeout_ms} ms", 'source.kind = camera')
+        else:
+            plan.provenance['input storage'] = (
+                src.storage + (" - timing includes the simulator's own HDF5 decoding; use frames in RAM or "
+                               "the disk cache to measure speed" if src.storage == 'stream' else ''),
+                f"cache={src_cfg.cache}")
         if src.storage == 'stream':
             logger.warning("%s is streamed: its decoding competes with the workers, timing is pessimistic", src.name)
         refl_on = plan.steps.get('reflectance', {}).get('on', False)
@@ -204,7 +244,7 @@ def build_pipeline(config) -> 'Pipeline':
         if units == 'any':
             plan.provenance['model input'] = ('any (speed-only model)', 'model.path = none')
             plans.append(plan)
-            logger.info("%s: %d frames %s %s\n%s", src.name, src.n_frames, src.frame_shape, src.dtype,
+            logger.info("%s: %s %s %s\n%s", src.name, _frames_text(src), src.frame_shape, src.dtype,
                         plan.summary())
             continue
         plan.provenance['model input'] = (
@@ -214,30 +254,46 @@ def build_pipeline(config) -> 'Pipeline':
         if (units == 'reflectance') != refl_on:
             logger.warning("%s: model expects %s but the reflectance step is %s", src.name, units,
                            'on' if refl_on else 'off')
-        logger.info("%s: %d frames %s %s\n%s", src.name, src.n_frames, src.frame_shape, src.dtype, plan.summary())
+        logger.info("%s: %s %s %s\n%s", src.name, _frames_text(src), src.frame_shape, src.dtype, plan.summary())
         plans.append(plan)
-    return Pipeline(config, sources, plans, classifier)
+    return Pipeline(config, sources, plans, classifier, camera=camera)
+
+
+def _frames_text(src) -> str:
+    return 'live camera' if src.storage == 'live' else f"{src.n_frames} frames"
 
 
 class Pipeline:
-    """Run one simulation stream.
+    """Run one stream: a playlist of recordings, or a live camera.
 
     Args:
         config: ``SimulationConfig``.
-        sources: Playlist from ``sources.open_sources`` (same frame shape/dtype/stage).
+        sources: Playlist from ``sources.open_sources`` (same frame shape/dtype/stage), or the
+            one ``camera_source.LiveSource`` of ``camera``.
         plans: One ``AcquisitionPlan`` per source (``sim_config.build_plan``), with ``columns``.
         classifier: ``PushbroomLineClassifier``.
+        camera: An opened, not streaming hsi camera backend (``camera_source.open_camera``), or
+            ``None`` to play ``sources``. The pipeline owns it from here: its camera thread starts
+            the stream, reads every frame and closes the camera when it ends; :meth:`stop` closes
+            it too if the pipeline never started.
     """
 
-    def __init__(self, config, sources, plans, classifier) -> None:
+    def __init__(self, config, sources, plans, classifier, camera=None) -> None:
         if len(plans) != len(sources):
             raise ValueError("one acquisition plan per source is required")
+        if camera is not None and len(sources) != 1:
+            raise ValueError("a live camera is exactly one source")
         self.config = config
         self.sources = sources
         self.plans = plans
         self.classifier = classifier
+        self.camera = camera
         cam, disp = config.camera, config.display
-        self._fps = float(cam.fps)
+        # A live camera free-runs; its measured rate takes the place of the simulated line clock.
+        self._fps = 0.0 if camera is not None else float(cam.fps)
+        if camera is not None and cam.overrun == 'block':
+            logger.warning("camera.overrun = block applies to file playback only: a live camera cannot wait, "
+                           "a line with no free buffer is lost")
         self._fps_generation = 0                 # bumped by set_fps; the camera re-reads the rate
         self._n_workers = int(config.processing.workers)
         shape = sources[0].frame_shape
@@ -264,9 +320,13 @@ class Pipeline:
         # camera thread state
         self._delivered = 0
         self._lost = 0
+        self._lost_camera = 0                    # live: frames the camera never delivered (in _lost too)
+        self._grab_timeouts = 0                  # live: reads without a frame
+        self._line_clock = 'schedule' if camera is None else 'arrival'
         self._slips = 0
         self._camera_fps = 0.0
         self._camera_done = False
+        self._workers_released = False           # stop() sent the workers' end marker itself
 
         # aggregator state (guarded by _lock)
         self._counts = np.zeros(256, np.int64)
@@ -308,21 +368,54 @@ class Pipeline:
             thread = threading.Thread(target=target, args=args, name=name, daemon=True)
             self._threads.append(thread)
             thread.start()
-        logger.info("Pipeline started: %s lines/s target, %d workers, %d buffers, overrun=%s",
-                    'max' if self._fps == 0 else f"{self._fps:g}", self._n_workers,
-                    len(self._buffers), self.config.camera.overrun)
+        if self.camera is not None:
+            logger.info("Pipeline started: live camera %s (free-running), %d workers, %d buffers",
+                        self.sources[0].name, self._n_workers, len(self._buffers))
+        else:
+            logger.info("Pipeline started: %s lines/s target, %d workers, %d buffers, overrun=%s",
+                        'max' if self._fps == 0 else f"{self._fps:g}", self._n_workers,
+                        len(self._buffers), self.config.camera.overrun)
 
     def stop(self, timeout: float = 3.0) -> bool:
-        """Stop all threads; returns False if one is still busy after ``timeout``."""
+        """Stop all threads; returns False if one is still busy after ``timeout``.
+
+        A live camera is closed by its own thread on the way out; if the pipeline never started,
+        it is closed here. ``timeout`` is at least one ``live.read_timeout_ms`` read plus 1 s, so a
+        read in progress can end. A camera thread still blocked in the SDK after that keeps the
+        camera (closing it from this thread could crash the SDK): call ``stop`` again.
+        """
+        if self.camera is not None:
+            timeout = max(timeout, self.config.live.read_timeout_ms / 1000.0 + 1.0)
         self._stop.set()
         deadline = time.perf_counter() + timeout
         for thread in self._threads:
             thread.join(max(0.0, deadline - time.perf_counter()))
+            if thread.name == 'camera' and thread.is_alive() and not self._workers_released:
+                # The camera thread is stuck in a read and has not sent the workers their end
+                # marker yet: send it here, so that only the camera thread is left running.
+                self._workers_released = True
+                for _ in range(self._n_workers):
+                    self._work.put(None)
+                deadline = max(deadline, time.perf_counter() + 1.0)
         if self._timer is not None:
             self._timer.close()
+            self._timer = None
+        if self.camera is not None and not any(t.name == 'camera' and t.is_alive() for t in self._threads):
+            self._close_camera()
         if self._state in ('running', 'starting'):
             self._state = 'stopped'
         return not any(t.is_alive() for t in self._threads)
+
+    def busy_threads(self) -> list[str]:
+        """Names of the pipeline threads still running (after :meth:`stop`: the ones that did not end)."""
+        return [t.name for t in self._threads if t.is_alive()]
+
+    def _close_camera(self) -> None:
+        """Stop the stream and release the live camera (idempotent, never raises)."""
+        try:
+            self.camera.close()
+        except Exception:
+            logger.exception("Closing the camera failed")
 
     def reset_perf(self) -> None:
         """Restart the per-stage averages and peaks (e.g. after changing a setting)."""
@@ -360,6 +453,9 @@ class Pipeline:
         The camera picks it up at its next line and restarts its clock from there (no burst of
         "late" lines); buffers, counts and the line order are kept.
         """
+        if self.camera is not None:
+            raise RuntimeError("a live camera runs at its own line rate (exposure and readout); "
+                               "set_fps applies to file playback")
         fps = float(fps)
         if fps < 0:
             raise ValueError("fps must be >= 0")
@@ -450,25 +546,42 @@ class Pipeline:
                 requested_backend=self._requested_backend, backend_note=self._backend_note(),
                 counts=self._counts.copy(), counted_lines=self._counted_lines,
                 canvas=canvas, raw_canvas=raw_canvas, canvas_filled=self._canvas_filled,
-                raw_frame=self._raw_frame, position=self._position)
+                raw_frame=self._raw_frame, position=self._position,
+                source_kind='file' if self.camera is None else 'camera',
+                lines_lost_camera=self._lost_camera, grab_timeouts=self._grab_timeouts,
+                line_clock=self._line_clock)
         return snap
 
     # --------------------------------------------------------------------------- camera ---
 
     def _camera_loop(self) -> None:
+        if self.camera is not None:
+            self._live_loop()
+        else:
+            self._playback_loop()
+
+    def _wait_workers_ready(self) -> bool:
+        """Wait until every worker has compiled/selected its kernels; False if stopped first.
+
+        The line clock (or the live camera's stream) starts only then: a real camera is started
+        after the processing chain is ready, too.
+        """
+        for ready in self._ready:
+            while not ready.wait(0.05):
+                if self._stop.is_set():
+                    return False
+        logger.info("Workers ready after %.2f s; camera started", time.perf_counter() - self._t0)
+        return True
+
+    def _playback_loop(self) -> None:
         cam = self.config.camera
         generation = self._fps_generation
         period = 1.0 / self._fps if self._fps > 0 else 0.0
         drop = cam.overrun == 'drop'
         line = seq = cycle = 0
         try:
-            # The clock starts once every worker has compiled/selected its kernels: a real
-            # camera is started after the processing chain is ready, too.
-            for ready in self._ready:
-                while not ready.wait(0.05):
-                    if self._stop.is_set():
-                        return
-            logger.info("Workers ready after %.2f s; camera clock started", time.perf_counter() - self._t0)
+            if not self._wait_workers_ready():
+                return
             self._t0 = time.perf_counter()
             self._state = 'running'
             rate_t, rate_n = time.perf_counter(), 0
@@ -506,7 +619,7 @@ class Pipeline:
                             if slot is None:
                                 return
                         np.copyto(self._buffers[slot], frames[i])
-                        self._work.put(_Job(seq, line, slot, t_sensor, src_i, i, cycle))
+                        self._work.put(_Job(seq, line, slot, t_sensor, src_i, i, cycle, t_sensor))
                         seq += 1
                         line += 1
                         self._delivered = seq
@@ -524,6 +637,116 @@ class Pipeline:
         finally:
             self._camera_done = True
             self._camera_fps = 0.0
+            for _ in range(self._n_workers):
+                self._work.put(None)
+
+    def _live_loop(self) -> None:
+        """Read the live camera into the frame buffers (``source.kind = "camera"``).
+
+        This thread owns the camera: it starts the stream once the workers are ready, reads
+        every frame and closes the camera at the end (stop, or an error). The camera free-runs;
+        before each read the loop takes a free buffer so the backend can write the frame straight
+        into it (``read_frame_raw_into``: GenICam converts into it, the other backends return a
+        new array that is copied). With no free buffer the frame is still read - into a scratch
+        buffer - and, if no buffer came free during the read either, dropped as an overrun: a
+        camera cannot wait, and leaving frames in the SDK queue would only make the SDK lose them
+        uncounted. Frames the camera or link lost (``camera_source.CameraFrameGaps``) are lost
+        lines too. A read that returns nothing (timeout, SDK error) is retried; the stop event
+        aborts a blocked read.
+
+        ``target_fps`` becomes the rate at which the camera delivers frames (overruns included,
+        frames it lost itself not, so an outage does not end in a spike), ``camera_fps`` the rate
+        of frames that reached the buffers. Both fall to 0 while the camera delivers nothing.
+        """
+        from camera_source import CameraClock, CameraFrameGaps
+        camera = self.camera
+        timeout_ms = int(self.config.live.read_timeout_ms)
+        shape = tuple(self._buffers.shape[1:])
+        scratch = np.empty(shape, self._buffers.dtype)
+        target = scratch
+        line = seq = received = 0
+        rate_t, rate_n, rate_received = time.perf_counter(), 0, 0
+
+        def provide(frame_shape):
+            # called by the backend inside its read; must not block (GenICam holds a buffer meanwhile)
+            return target if tuple(frame_shape) == shape else None
+
+        def update_rates(now):
+            nonlocal rate_t, rate_n, rate_received
+            if now - rate_t >= _RATE_PERIOD_S:
+                self._camera_fps = rate_n / (now - rate_t)
+                self._fps = (received - rate_received) / (now - rate_t)
+                rate_t, rate_n, rate_received = now, 0, received
+
+        try:
+            if not self._wait_workers_ready():
+                return
+            camera.set_stop_event(self._stop)          # set() makes a blocked read return None
+            try:
+                camera.start_stream()
+            except Exception:
+                if self._stop.is_set():                # e.g. GenICam start retries cut short by a stop
+                    logger.info("Camera start abandoned: stop requested")
+                    return
+                raise
+            gaps, clock = CameraFrameGaps(camera), CameraClock(camera)
+            gaps.start()
+            self._t0 = time.perf_counter()
+            self._state = 'running'
+            rate_t = time.perf_counter()
+            while not self._stop.is_set():
+                try:
+                    slot = self._free.get_nowait()
+                except queue.Empty:
+                    slot = None
+                target = scratch if slot is None else self._buffers[slot]
+                frame = camera.read_frame_raw_into(provide, timeout_ms=timeout_ms)
+                t_arrival = time.perf_counter()
+                if frame is None:
+                    if slot is not None:
+                        self._free.put(slot)
+                    if not self._stop.is_set():
+                        self._grab_timeouts += 1
+                    update_rates(t_arrival)
+                    continue
+                if tuple(frame.shape) != shape:
+                    raise RuntimeError(f"camera frame {tuple(frame.shape)} differs from the {shape} the "
+                                       "calibration was resolved for (bin or ROI changed?)")
+                received += 1
+                missed = gaps.missed()
+                if missed:
+                    self._lost += missed
+                    self._lost_camera += missed
+                    line += missed
+                t_sensor = clock.sensor_time(t_arrival)
+                self._line_clock = clock.source
+                if slot is None:                         # a buffer may have come free during the read
+                    try:
+                        slot = self._free.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        target = self._buffers[slot]
+                if slot is None:                         # overrun: no free buffer for this line
+                    self._lost += 1
+                    line += 1
+                else:
+                    if frame is not target:
+                        np.copyto(target, frame)
+                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival))
+                    seq += 1
+                    line += 1
+                    self._delivered = seq
+                    rate_n += 1
+                update_rates(time.perf_counter())
+        except Exception as exc:
+            self._fail('camera', exc)
+        finally:
+            self._camera_done = True
+            self._camera_fps = 0.0
+            self._close_camera()                         # stops the stream first
+            logger.info("Camera closed after %d frames (%d lost in the camera, %d read timeouts)",
+                        seq, self._lost_camera, self._grab_timeouts)
             for _ in range(self._n_workers):
                 self._work.put(None)
 
@@ -560,8 +783,9 @@ class Pipeline:
                                 self._requested_backend)
                 plan = self.plans[job.source]
                 frame = self._buffers[job.slot]
-                # time the line waited in the buffers before a worker took it
-                prof._record('queue', (time.perf_counter() - job.t_sensor) * 1000.0)
+                # time the line waited in the buffers before a worker took it (for a live camera
+                # with timestamps the latency also has exposure and transfer; the queue wait not)
+                prof._record('queue', (time.perf_counter() - job.t_queued) * 1000.0)
                 with prof.time('total'):
                     on = _effective(plan, self._steps)                # one consistent set per frame
                     if plan.stage == 'raw':

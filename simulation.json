@@ -1,5 +1,6 @@
 {
   "source": {
+    "kind": "file",
     "path": "data",
     "pattern": "*.h5",
     "stage": "auto",
@@ -69,5 +70,11 @@
     "slit_fov_mm": 500.0,
     "belt_pixel_mm": null,
     "recording_pixel_mm": 0.1264
+  },
+  "live": {
+    "camera_index": 0,
+    "cti_path": null,
+    "sensor_pixel_size": 10,
+    "read_timeout_ms": 100
   }
 }

@@ -36,8 +36,13 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = ROOT / 'simulation.json'
 
 
+#: ``source.kind``: replay recorded files, or read a live camera (``camera_source.py``).
+SOURCE_KINDS = ('file', 'camera')
+
+
 @dataclass(frozen=True)
 class SourceConfig:
+    kind: str = 'file'                   # file (path below) | camera (live: see the 'live' section)
     path: str = 'data'
     pattern: str | None = None           # glob in a folder; None = all *.h5/*.hdf5/*.hdr
     stage: str = 'auto'                  # auto | raw | binned
@@ -50,11 +55,28 @@ class SourceConfig:
 @dataclass(frozen=True)
 class CameraConfig:
     fps: float = 500.0                   # simulated line rate; 0 = as fast as the pipeline takes
+                                         # (file source only: a live camera runs at its own rate)
     overrun: str = 'drop'                # drop: a frame with no free buffer is lost (counted)
-                                         # block: the camera waits (lossless throughput test)
+                                         # block: the camera waits (lossless throughput test; file
+                                         # source only - a live camera cannot wait, it always drops)
     buffer_frames: int = 256             # frame buffers between camera and processing
-    loop: bool = True                    # restart the playlist at its end
+    loop: bool = True                    # restart the playlist at its end (file source only)
     belt_speed_m_s: float = 0.4          # 24 m/min; only for the mm/line readout
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    """The live camera (``source.kind = "camera"``): which device and how it is read.
+
+    The values that select the calibration files - ``acquisition.camera_backend``, ``camera_bin``,
+    ``exposure_ms``, ``gain`` and ``raw_inverted`` - are applied to the camera at start, so the
+    dark/Smile/wavelength files match the frames it delivers (see ``camera_source.py``).
+    """
+    camera_index: int = 0                # device index for GenICam / XIMEA (POA opens its first camera)
+    cti_path: str | None = None          # GenICam GenTL producer (.cti); None = the SVS producer found in
+                                         # $GENICAM_GENTL64_PATH (sv_gev_tl_x64.cti / libsv_gev_tl_x64.cti)
+    sensor_pixel_size: int = 10          # GenICam SensorPixelSize 8/10/12 bits: must be what the darks used
+    read_timeout_ms: int = 100           # longest wait for one frame (1..10000); a stop waits for one read
 
 
 @dataclass(frozen=True)
@@ -143,6 +165,7 @@ class SimulationConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     optics: OpticsConfig = field(default_factory=OpticsConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     base_dir: str = str(ROOT)            # folder relative paths resolve against
 
     def resolve(self, value: str | None) -> Path | None:
@@ -155,7 +178,31 @@ class SimulationConfig:
     def calibration_dir(self) -> Path:
         return Path(self.base_dir) / 'calibration'
 
+    @property
+    def live_camera(self) -> bool:
+        """True when the frames come from a live camera (``source.kind = "camera"``)."""
+        return self.source.kind == 'camera'
+
     def validate(self) -> 'SimulationConfig':
+        if self.source.kind not in SOURCE_KINDS:
+            raise ValueError(f"source.kind must be one of {SOURCE_KINDS}, got {self.source.kind!r}")
+        if self.live_camera:
+            from modules.camera.factory import BACKENDS as camera_backends
+            acq = self.acquisition
+            if str(acq.camera_backend).lower() not in camera_backends:
+                raise ValueError(f"source.kind = camera: acquisition.camera_backend must be one of "
+                                 f"{camera_backends}, got {acq.camera_backend!r}")
+            if acq.exposure_ms is None or acq.gain is None:
+                raise ValueError("source.kind = camera: set acquisition.exposure_ms and acquisition.gain "
+                                 "(they are applied to the camera and select the dark frame)")
+            if not acq.exposure_ms > 0:
+                raise ValueError("acquisition.exposure_ms must be > 0")
+            if self.live.sensor_pixel_size not in (8, 10, 12):
+                raise ValueError("live.sensor_pixel_size must be 8, 10 or 12")
+            if not 1 <= self.live.read_timeout_ms <= 10000:
+                raise ValueError("live.read_timeout_ms must be 1..10000 (a stop waits for one read)")
+            if self.live.camera_index < 0:
+                raise ValueError("live.camera_index must be >= 0")
         if self.source.stage not in ('auto', 'raw', 'binned'):
             raise ValueError(f"source.stage: {self.source.stage!r}")
         if self.camera.fps < 0:
@@ -183,15 +230,42 @@ class SimulationConfig:
 
 _SECTION_CLASSES = {'source': SourceConfig, 'camera': CameraConfig, 'acquisition': AcquisitionConfig,
                     'corrections': CorrectionConfig, 'processing': ProcessingConfig,
-                    'display': DisplayConfig, 'model': ModelConfig, 'optics': OpticsConfig}
+                    'display': DisplayConfig, 'model': ModelConfig, 'optics': OpticsConfig,
+                    'live': LiveConfig}
 
 
-def load_config(path=None, **overrides) -> SimulationConfig:
+def parse_set_overrides(items) -> dict:
+    """``--set SECTION.KEY=VALUE`` strings -> ``{section: {key: value}}``, the ``explicit`` of :func:`load_config`.
+
+    Values are read as JSON (``2``, ``true``, ``null``, ``[900, 1700]``), else kept as text;
+    ``null`` sets the key to ``None`` (e.g. ``--set live.cti_path=null``).
+
+    Raises:
+        ValueError: an item is not ``SECTION.KEY=VALUE``.
+    """
+    overrides = {}
+    for item in items:
+        key, eq, text = item.partition('=')
+        section, dot, name = key.partition('.')
+        if not eq or not dot or not section or not name:
+            raise ValueError(f"--set expects SECTION.KEY=VALUE, got {item!r}")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            value = text
+        overrides.setdefault(section, {})[name] = value
+    return overrides
+
+
+def load_config(path=None, explicit: dict | None = None, **overrides) -> SimulationConfig:
     """Read ``simulation.json``; unknown sections/keys are errors (typos must not pass silently).
 
     Args:
         path: JSON file (default ``simulation.json`` beside this module).
-        overrides: ``section={key: value}`` dicts applied on top of the file (command line).
+        explicit: ``{section: {key: value}}`` applied last and as given, ``None`` included
+            (``--set``, see :func:`parse_set_overrides`).
+        overrides: ``section={key: value}`` dicts applied on top of the file (command-line
+            flags); a ``None`` value means "flag not given" and keeps the file's value.
     """
     path = Path(path or DEFAULT_CONFIG_PATH).resolve()
     data = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
@@ -199,6 +273,8 @@ def load_config(path=None, **overrides) -> SimulationConfig:
         logger.warning("No %s; using built-in defaults", path)
     for name, values in overrides.items():
         data.setdefault(name, {}).update({k: v for k, v in values.items() if v is not None})
+    for name, values in (explicit or {}).items():
+        data.setdefault(name, {}).update(values)
     unknown = set(data) - set(_SECTION_CLASSES)
     if unknown:
         raise ValueError(f"{path.name}: unknown section(s) {sorted(unknown)}")
@@ -277,12 +353,16 @@ class AcquisitionPlan:
         return "\n".join(lines)
 
 
-def _pick(meta: dict, keys, fallback, use_meta: bool, cast=lambda v: v):
-    """``(value, origin)`` from the first metadata key present, else ``(fallback, 'config')``."""
+def _pick(meta: dict, keys, fallback, use_meta: bool, cast=lambda v: v, origin: str = 'file'):
+    """``(value, origin)`` from the first metadata key present, else ``(fallback, 'config')``.
+
+    ``origin`` names where the metadata came from: ``file`` (recorded attributes) or ``camera``
+    (what a live camera reports after its settings were applied).
+    """
     if use_meta:
         for key in keys:
             if key in meta and meta[key] is not None:
-                return cast(meta[key]), f"file:{key}"
+                return cast(meta[key]), f"{origin}:{key}"
     return fallback, 'config'
 
 
@@ -308,29 +388,44 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
         return plan
 
     acq, cor = config.acquisition, config.corrections
-    meta, use = source.metadata, acq.use_file_metadata
-    plan.camera_backend, o = _pick(meta, ('camera_backend',), acq.camera_backend, use, str)
+    # A live camera's metadata is what the camera reports with the configured settings applied:
+    # always the truth for its frames, whatever use_file_metadata says (that switch is for files).
+    origin = getattr(source, 'metadata_origin', 'file')
+    meta, use = source.metadata, acq.use_file_metadata or origin == 'camera'
+
+    def pick(keys, fallback, cast=lambda v: v):
+        return _pick(meta, keys, fallback, use, cast, origin)
+
+    plan.camera_backend, o = pick(('camera_backend',), acq.camera_backend, str)
     prov['camera_backend'] = (plan.camera_backend, o)
-    plan.camera_bin, o = _pick(meta, ('camera_bin',), acq.camera_bin, use, int)
+    plan.camera_bin, o = pick(('camera_bin',), acq.camera_bin, int)
     prov['camera_bin'] = (plan.camera_bin, o)
-    plan.raw_inverted, o = _pick(meta, ('raw_inverted',), acq.raw_inverted, use, bool)
+    plan.raw_inverted, o = pick(('raw_inverted',), acq.raw_inverted, bool)
     prov['raw_inverted'] = (plan.raw_inverted, o)
-    exposure, o_e = _pick(meta, ('exposure_ms',), acq.exposure_ms, use, float)
-    gain, o_g = _pick(meta, ('gain',), acq.gain, use, float)
+    exposure, o_e = pick(('exposure_ms',), acq.exposure_ms, float)
+    gain, o_g = pick(('gain',), acq.gain, float)
     # the dark the recording used was captured at dark_temperature_c (HSI picks the nearest one)
-    temperature, _ = _pick(meta, ('temperature_c', 'dark_temperature_c', 'sensor_temperature_c_start',
-                                  'temperature'), acq.temperature_c, use, float)
+    temperature, _ = pick(('temperature_c', 'dark_temperature_c', 'sensor_temperature_c_start', 'temperature'),
+                          acq.temperature_c, float)
 
     # Wavelength axis: recorded values > wavelength profile > config numbers.
     m1, c, o_m = acq.m_nm_per_px_bin1, acq.c_nm, 'config'
     profile = _wavelength_profile_path(config, plan.camera_backend, plan.camera_bin)
+    if profile is None and origin == 'camera' and acq.wavelength_profile == 'auto':
+        # A recording carries its own m/c; a live camera does not. The config numbers belong to
+        # one camera, so a missing profile must not silently put another camera's axis under the model.
+        raise ValueError(
+            f"no wavelength profile calibration/wavelength/{plan.camera_backend}/wavelength_bin{plan.camera_bin}.json "
+            f"for the live {plan.camera_backend} camera at bin {plan.camera_bin}: add it (hsi wavelength "
+            "calibration), set acquisition.wavelength_profile to a file, or to \"none\" to use "
+            "acquisition.m_nm_per_px_bin1 / c_nm on purpose")
     if profile is not None:
         m1, c, o_m = _load_wavelength_profile(profile, plan.camera_bin, shape)
     if use and meta.get('m_nm_per_px_bin1') is not None and meta.get('c_nm') is not None:
         m1, c, o_m = float(meta['m_nm_per_px_bin1']), float(meta['c_nm']), 'file:m_nm_per_px_bin1,c_nm'
     plan.m_nm_per_px_bin1, plan.c_nm = float(m1), float(c)
     prov['wavelength m,c'] = (f"m={m1:.6g} nm/px (bin 1) x bin {plan.camera_bin}, c={c:.6g} nm", o_m)
-    plan.resolution_nm, o = _pick(meta, ('resolution_nm',), acq.resolution_nm, use, float)
+    plan.resolution_nm, o = pick(('resolution_nm',), acq.resolution_nm, float)
     prov['resolution_nm'] = (plan.resolution_nm, o)
 
     full = LambdaBinner(m=plan.m_nm_per_px_bin1 * plan.camera_bin, c=plan.c_nm,

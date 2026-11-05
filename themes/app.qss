@@ -192,6 +192,13 @@ QLabel#metricRealtime { background: transparent; font-size: 13px; font-weight: 7
 QLabel#metricTotal { background: transparent; font-size: 13px; font-weight: 700; color: @success; }
 QLabel#className:disabled, QLabel#metricTotal:disabled { color: @text_faint; }   /* hidden class */
 
+/* Composition tab: accumulated share per class; swatch colour is the class colour (set in code). */
+QLabel#shareValue { background: transparent; font-size: 15px; font-weight: 700; color: @text; }
+QLabel#classSwatch { border: 1px solid @border_strong; border-radius: 3px; }
+/* Accumulated / Real-time switch above the pie chart. */
+QPushButton#segmentButton { padding: 2px 8px; font-size: 11px; border-radius: 5px; color: @text_muted; }
+QPushButton#segmentButton:checked { background-color: @surface_hover; color: @text; border-color: @accent; }
+
 /* Badge colour is the class colour, set per widget by the legend. */
 QPushButton#classBadge { border: 1px solid @border_strong; border-radius: 4px; padding: 0; }
 QPushButton#classBadge:hover { border: 2px solid @accent_hover; }

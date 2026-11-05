@@ -11,6 +11,7 @@ import joblib
 import cv2
 import numpy as np
 import spectral as spy
+from scipy.optimize import minimize_scalar
 from sklearn.linear_model import SGDClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.preprocessing import StandardScaler
@@ -32,6 +33,28 @@ def load_coco_masks(json_path: str, height: int, width: int) -> tuple[np.ndarray
             cv2.fillPoly(label_mask, [pts], color=cat_id)
 
     return label_mask, category_names
+
+
+def ovr_probabilities(scores: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """sklearn's ``predict_proba`` of a one-vs-rest ``log_loss`` model, from ``scores / temperature``."""
+    p = 1.0 / (1.0 + np.exp(-np.clip(scores / temperature, -80.0, 80.0)))
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(scores: np.ndarray, y_index: np.ndarray) -> float:
+    """Temperature minimising the log loss of ``ovr_probabilities(scores, T)`` on held-out pixels.
+
+    ``y_index`` is the column of each pixel's true class. T < 1 sharpens an under-confident
+    model, T > 1 softens an over-confident one; the winning class never changes.
+    """
+    rows = np.arange(y_index.size)
+
+    def log_loss(log_t):
+        p = ovr_probabilities(scores, np.exp(log_t))[rows, y_index]
+        return -np.log(np.maximum(p, 1e-12)).mean()
+
+    result = minimize_scalar(log_loss, bounds=(np.log(0.01), np.log(100.0)), method='bounded')
+    return float(np.exp(result.x))
 
 
 def train_smart_bands_sgd(num_selected_bands: int = 30, hdr_path: str = 'dataset/first.bip.hdr',
@@ -89,6 +112,15 @@ def train_smart_bands_sgd(num_selected_bands: int = 30, hdr_path: str = 'dataset
     print("\nClassification Evaluation Report (Test Set):")
     print(classification_report(y_test, y_pred, target_names=target_names))
 
+    # Temperature scaling: one scalar, fitted on the held-out pixels, so that the confidence (the
+    # winning class's predict_proba) matches how often the class is right. The class is unchanged.
+    test_scores = model.decision_function(X_test_scaled)
+    temperature = fit_temperature(test_scores, np.searchsorted(model.classes_, y_test))
+    print(f"Confidence temperature {temperature:.3f}: held-out accuracy {np.mean(y_pred == y_test):.4f}, "
+          f"mean confidence {ovr_probabilities(test_scores).max(axis=1).mean():.4f} -> "
+          f"{ovr_probabilities(test_scores, temperature).max(axis=1).mean():.4f} "
+          f"(reliability table: tools/check_calibration.py)")
+
     # Save Artifact (คำนวณ Weights รวม Scaler สำหรับ Direct Matrix Mult)
     # W_scaled = W / scale, b_scaled = b - sum(W * mean / scale)
     W_orig = model.coef_                               # (n_classes, k_bands)
@@ -119,6 +151,8 @@ def train_smart_bands_sgd(num_selected_bands: int = 30, hdr_path: str = 'dataset
         # Reflectance step: a counts model gets nonsense from reflectance input and vice versa).
         'input_units': input_units,
         'training_header': hdr_path,
+        # Divides the scores before the confidence (inference_engine.predict_confidence).
+        'temperature': temperature,
     }
     joblib.dump(artifact, model_output)
     print(f"Model input units: {input_units} (the simulator's Reflectance step must match)")

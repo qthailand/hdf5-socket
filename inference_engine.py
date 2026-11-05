@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """Per-line linear classifier (``argmax(x[bands] @ W + b)``) bound to the input's wavelengths.
 
+:meth:`PushbroomLineClassifier.predict_confidence` also returns the winning class's
+probability per pixel (sklearn ``predict_proba`` of the ``log_loss`` model); only for offline
+checks (``tools/check_calibration.py``): the pipeline calls :meth:`~PushbroomLineClassifier.predict`.
+
 The model artifact (``joblib``) holds ``W_fused`` ``(n_selected, n_classes)``, ``b_fused``,
 ``selected_bands`` (indices into the training cube's bands), ``classes`` and
 ``category_names``; ``band_wavelengths`` (nm of every training band) is optional.
@@ -31,6 +35,11 @@ class PushbroomLineClassifier:
         self.selected_bands = np.asarray(artifact['selected_bands'], dtype=np.intp)
         self.classes_ = np.asarray(artifact['classes'])
         self.category_names: dict = dict(artifact.get('category_names', {}))
+        # Temperature scaling of the confidence (train_sgd_coco.py fits it on held-out pixels);
+        # 1.0 = sklearn's predict_proba. Never changes the class.
+        self.temperature = float(artifact.get('temperature', 1.0))
+        if not self.temperature > 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
         # 'counts' (dark-corrected DN, as dataset.bip) or 'reflectance' (after the reflectance step)
         self.input_units_declared = 'input_units' in artifact
         self.input_units = str(artifact.get('input_units', 'counts'))
@@ -90,12 +99,39 @@ class PushbroomLineClassifier:
             logger.warning("Classifier bound %s", binding)
         return np.ascontiguousarray(columns, dtype=np.intp), binding
 
-    def predict(self, binned: np.ndarray, columns: np.ndarray) -> np.ndarray:
-        """Class id (uint8) of every slit pixel of one ``(slit, n_bins)`` frame."""
+    def _scores(self, binned: np.ndarray, columns: np.ndarray) -> np.ndarray:
         x = binned[:, columns].astype(np.float32)
         scores = x @ self.W_fused
         scores += self.b_fused
-        return self._class_ids[scores.argmax(axis=1)]
+        return scores
+
+    def predict(self, binned: np.ndarray, columns: np.ndarray) -> np.ndarray:
+        """Class id (uint8) of every slit pixel of one ``(slit, n_bins)`` frame."""
+        return self._class_ids[self._scores(binned, columns).argmax(axis=1)]
+
+    def predict_confidence(self, binned: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(class ids, confidence)`` of every slit pixel of one ``(slit, n_bins)`` frame.
+
+        Confidence (float32, 0..1) is the probability of the winning class exactly as sklearn's
+        ``predict_proba`` gives it for a ``log_loss`` SGD model: one-vs-rest, the sigmoid of every
+        class score normalised to sum 1, after dividing the scores by the artifact's
+        ``temperature`` (1.0 when absent: sklearn's value). Check it against labelled pixels with
+        ``tools/check_calibration.py`` before trusting a threshold. A pixel with a NaN band gets
+        0 (uncertain), so one bad pixel cannot turn a class's sum into NaN.
+        """
+        scores = self._scores(binned, columns)
+        winner = scores.argmax(axis=1)
+        if self.temperature != 1.0:
+            scores /= self.temperature                    # T > 0: the winner stays the same
+        np.clip(scores, -80.0, 80.0, out=scores)          # exp stays finite in float32
+        np.negative(scores, out=scores)
+        np.exp(scores, out=scores)
+        scores += 1.0
+        np.reciprocal(scores, out=scores)                 # sigmoid; monotonic, so the max is the winner
+        confidence = scores.max(axis=1)
+        confidence /= scores.sum(axis=1)
+        confidence[np.isnan(confidence)] = 0.0
+        return self._class_ids[winner], confidence
 
 
 class SpeedTestClassifier(PushbroomLineClassifier):

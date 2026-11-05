@@ -32,7 +32,8 @@ def test_theme_has_chart_tokens(theme):
         assert key in tokens, f"{theme}.json lacks {key} (used by widgets/performance_panel.py)"
 
 
-@pytest.mark.parametrize('module', ['gui.py', 'widgets/class_legend_widget.py', 'widgets/performance_panel.py'])
+@pytest.mark.parametrize('module', ['gui.py', 'widgets/class_legend_widget.py', 'widgets/performance_panel.py',
+                                    'widgets/composition_widget.py', 'widgets/focus_panel.py'])
 def test_no_hard_coded_colours_in_widgets(module):
     source = (ROOT / module).read_text(encoding='utf-8')
     assert not re.findall(r'#[0-9A-Fa-f]{6}\b', source), "colours belong in themes/*.json"
@@ -132,3 +133,44 @@ def test_materials_background_hidden_by_default_and_shares_over_shown_classes():
     np.testing.assert_allclose(accumulated, [10.0, 30.0, 60.0])
     legend.setup_classes_from_model({0: 'a', 1: 'b'}, generate_tab10_lut(), np.array([0, 1]), hidden=['A'])
     assert legend.shares()[0] == ['b']
+
+
+def test_composition_tab_shows_percent_of_each_class():
+    from PyQt5.QtWidgets import QApplication
+    from themes import apply_theme
+    from utils import generate_tab10_lut
+    from widgets.class_legend_widget import ClassLegendWidget
+    from widgets.composition_widget import CompositionWidget
+    app = QApplication.instance() or QApplication([])
+    apply_theme(app, 'dark')
+    legend, comp = ClassLegendWidget(), CompositionWidget()
+    legend.shares_changed.connect(comp.set_shares)
+    legend.setup_classes_from_model({0: 'A', 1: 'B', 2: 'bg'}, generate_tab10_lut(), np.array([0, 1, 2]))
+    counts = np.zeros(256, np.int64)
+    counts[:3] = (40, 60, 500)
+    legend.update_counts(counts, counts, 1)
+    rows = comp.rows()
+    assert [r[0] for r in rows] == ['B', 'A']                          # largest first, bg hidden
+    assert [r[2] for r in rows] == pytest.approx([60.0, 40.0])         # adds up to 100 %
+    assert [r[3] for r in rows] == [60, 40]
+    assert comp._widgets[0][2].text() == '60.0%' and 'SHOWN CLASSES' in comp.lbl_basis.text()
+    assert comp.as_text().splitlines()[1] == 'B	60.00	60.00	60'
+    assert comp.pie.slices() == [('B', pytest.approx(60.0), 60), ('A', pytest.approx(40.0), 40)]
+    comp.resize(320, 700)
+    comp.grab()                                                         # paints without error
+    pie = comp.pie
+    c = pie.rect().center()
+    radius = min(pie.width(), pie.height()) / 2 - 10
+    from PyQt5.QtCore import QPoint
+    assert pie.slice_at(QPoint(c.x() + int(radius), c.y())) == 0       # 3 o'clock: B (0..216 deg)
+    assert pie.slice_at(QPoint(c.x() - int(radius), c.y())) == 1       # 9 o'clock (270 deg): A
+    assert pie.slice_at(c) is None                                      # the hole
+    recent = np.zeros(256, np.int64)
+    recent[:2] = (3, 1)                                                 # real-time: A leads
+    legend.update_counts(recent, counts, 2)
+    comp._pie_mode.button(1).click()
+    assert comp.pie_realtime() and [s[0] for s in comp.pie.slices()] == ['A', 'B']
+    assert [s[1] for s in comp.pie.slices()] == pytest.approx([75.0, 25.0])
+    legend.reset_accumulated_stats()
+    assert [r[2] for r in comp.rows()] == [0.0, 0.0] and comp.pie.slices() == []
+    comp.grab()                                                         # empty pie paints

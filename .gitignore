@@ -6,6 +6,11 @@ __pycache__/
 # Decoded frame caches (rebuilt automatically from the recordings)
 .cache/
 
+# Camera vendor SDKs (ctypes wrappers + native DLLs, not in git as in hsi):
+# python tools/sync_hsi.py --update --only camera
+modules/camera/poa/
+modules/camera/ximea/
+
 # Recordings and large data (keep them outside git; dataset headers/annotations stay)
 data/
 *.bip
