@@ -21,7 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from PyQt5.QtCore import QSettings, Qt, QTimer
+from PyQt5.QtCore import QEvent, QRect, QSettings, Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QSpinBox, QTabWidget, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
                              QSizePolicy, QSplitter, QVBoxLayout, QWidget)
@@ -37,6 +37,11 @@ from widgets.class_legend_widget import ClassLegendWidget
 from widgets.composition_widget import CompositionWidget
 from widgets.focus_panel import FocusPanel
 from widgets.performance_panel import PerformancePanel, ThroughputStrip
+from widgets.reflectance_dialog import ReflectanceDialog
+from widgets.sensor_dialog import SensorDialog
+
+#: binned lines kept (before reflectance) while the reflectance dialog / drawing is open
+CALIBRATION_LINES = 256
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,12 +54,16 @@ logger = logging.getLogger(__name__)
 class PushbroomScannerMainWindow(QMainWindow):
     """Raw frame with focus aid, belt classification map, throughput/latency status and class statistics."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, config_path=None) -> None:
         super().__init__()
         initialize_compute()
         self.config = config
+        self._config_path = config_path
+        self._draw = None                          # reflectance drawing state (frozen belt map)
+        self._step_connected: set[str] = set()
         self._live = config.live_camera
-        self.setWindowTitle("HSI Industrial Scanner — " + ("live camera" if self._live else "pushbroom simulation"))
+        self.setWindowTitle("HSI Industrial Scanner — " +
+                            ("live camera" if self._live else "pushbroom simulation"))
         self.resize(1280, 760)
         self._init_ui()
 
@@ -62,7 +71,8 @@ class PushbroomScannerMainWindow(QMainWindow):
             self._pipeline = build_pipeline(config)
         except Exception as exc:
             logger.critical("Initialization failed: %s", exc, exc_info=True)
-            QMessageBox.critical(self, "Initialization Error", f"Core Initialization Failed:\n{exc}")
+            QMessageBox.critical(self, "Initialization Error",
+                                 f"Core Initialization Failed:\n{exc}")
             raise
 
         classifier = self._pipeline.classifier
@@ -71,9 +81,10 @@ class PushbroomScannerMainWindow(QMainWindow):
             category_names=classifier.category_names, lut=self._lut, classes=classifier.classes_,
             hidden=self.config.display.hidden_classes)
         self.class_legend_widget.color_changed.connect(self._on_class_color_changed)
-        self.class_legend_widget.reset_requested.connect(self._pipeline.reset_counts)
+        # through lambdas: the pipeline is replaced when the sensor settings change
+        self.class_legend_widget.reset_requested.connect(lambda: self._pipeline.reset_counts())
         self.class_legend_widget.reset_requested.connect(self._forget_previous_counts)
-        self.performance_panel.reset_requested.connect(self._pipeline.reset_perf)
+        self.performance_panel.reset_requested.connect(lambda: self._pipeline.reset_perf())
         self._setup_backend_selector()
         self._setup_step_switches()
         self._setup_fps_control()
@@ -145,13 +156,28 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._side_button.setObjectName("toggleButton")
         self._side_button.setCheckable(True)
         self._side_button.setChecked(True)
-        self._side_button.setToolTip("Show / hide the side panel: Performance and Materials (or drag the vertical handle)")
+        self._side_button.setToolTip(
+            "Show / hide the side panel: Performance and Materials (or drag the vertical handle)")
         self._side_button.toggled.connect(self._set_side_visible)
+
+        self._reflectance_button = QPushButton("Reflectance…")
+        self._reflectance_button.setObjectName("toggleButton")
+        self._reflectance_button.setToolTip("Calibrate reflectance: choose the white standard, then draw it "
+                                            "on the RAW zone of the belt map (bound to the current camera values)")
+        self._reflectance_button.clicked.connect(self._open_reflectance_dialog)
+        self._sensor_button = QPushButton("Sensor…")
+        self._sensor_button.setObjectName("toggleButton")
+        self._sensor_button.setToolTip("Exposure, gain and bin of the camera (restarts the pipeline; the dark, "
+                                       "Smile and wavelength files follow the new values)")
+        self._sensor_button.clicked.connect(self._open_sensor_dialog)
+        self._sensor_button.setVisible(self._live)
 
         backend_row = QHBoxLayout()
         backend_row.addWidget(self._preview_button)
         backend_row.addWidget(self._focus_button)
         backend_row.addWidget(self._side_button)
+        backend_row.addWidget(self._sensor_button)
+        backend_row.addWidget(self._reflectance_button)
         caption = QLabel("Correction backend")
         caption.setObjectName("metricCaption")
         backend_row.addWidget(caption)
@@ -240,6 +266,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._splitter.splitterMoved.connect(lambda *_: self._sync_preview_button())
         self._raw_label.setMinimumHeight(40)
         self._canvas_label.setMinimumHeight(80)
+        self._canvas_label.installEventFilter(self)
         self._preview_height = None                # preview height before the last collapse
 
         left = QVBoxLayout()
@@ -324,7 +351,8 @@ class PushbroomScannerMainWindow(QMainWindow):
             return
         self._focus_frame = frame
         axis = self.focus_panel.axis
-        self.focus_panel.set_value(edge_contrast(frame, axis), reference=sharpness_score(frame, axis=axis))
+        self.focus_panel.set_value(edge_contrast(frame, axis),
+                                   reference=sharpness_score(frame, axis=axis))
 
     def _sync_preview_button(self) -> None:
         """Keep the button in step when the preview is collapsed/opened by dragging the handle."""
@@ -481,13 +509,16 @@ class PushbroomScannerMainWindow(QMainWindow):
         disabled with the reason as tooltip. Changes reach the workers at the next line."""
         plans = self._pipeline.plans
         for name, box in self._step_boxes.items():
-            infos = [plan.steps.get(name, {'available': False, 'on': False, 'why': ''}) for plan in plans]
+            box.blockSignals(True)
+            infos = [plan.steps.get(
+                name, {'available': False, 'on': False, 'why': ''}) for plan in plans]
             box.setChecked(infos[0]['on'])
             available = any(info['available'] for info in infos)
             box.setEnabled(available)
             tip = infos[0]['why']
             if len(plans) > 1 and len({info['why'] for info in infos}) > 1:
-                tip += f"\n(first file; {sum(i['available'] for i in infos)}/{len(plans)} files have this step)"
+                n_have = sum(i['available'] for i in infos)
+                tip += f"\n(first file; {n_have}/{len(plans)} files have this step)"
             if name == 'binning' and infos[0]['on']:
                 # Always applied to raw input: shown checked and active (theme colour), but locked,
                 # so it does not look like a step that is off.
@@ -499,8 +530,10 @@ class PushbroomScannerMainWindow(QMainWindow):
                 tip = (f"Always on (the model needs wavelength bins): {plan.provenance['binning'][0]}"
                        if 'binning' in plan.provenance else tip)
             box.setToolTip(tip)
-            if available and name != 'binning':
+            box.blockSignals(False)
+            if available and name != 'binning' and name not in self._step_connected:
                 box.toggled.connect(lambda checked, n=name: self._on_step_toggled(n, checked))
+                self._step_connected.add(name)
         self._update_units_warning()
 
     def _on_step_toggled(self, name: str, checked: bool) -> None:
@@ -511,8 +544,10 @@ class PushbroomScannerMainWindow(QMainWindow):
     def _update_units_warning(self) -> None:
         classifier = self._pipeline.classifier
         reflectance = self._pipeline.effective_steps()['reflectance']
-        wrong = classifier.input_units != 'any' and (classifier.input_units == 'reflectance') != reflectance
-        placeholder = reflectance and any(getattr(p, 'reflectance_placeholder', False) for p in self._pipeline.plans)
+        wrong = classifier.input_units != 'any' and (
+            classifier.input_units == 'reflectance') != reflectance
+        placeholder = reflectance and any(
+            getattr(p, 'reflectance_placeholder', False) for p in self._pipeline.plans)
         streamed = [src.name for src in self._pipeline.sources if src.storage == 'stream']
         self._units_warning.setVisible(wrong or placeholder or bool(streamed))
         if streamed and not (wrong or placeholder):
@@ -543,13 +578,17 @@ class PushbroomScannerMainWindow(QMainWindow):
     def _setup_backend_selector(self) -> None:
         caps = get_compute_capabilities()
         combo = self._backend_combo
+        if combo.count():                       # pipeline replaced: only the selection follows it
+            self._pipeline.set_backend(combo.currentData())
+            return
         for key, text in self._BACKEND_CHOICES:
             capability = getattr(caps, key, None)
             if capability is not None and not capability.available:
                 text += "  — not available"
             combo.addItem(text, key)
             if capability is not None:
-                combo.setItemData(combo.count() - 1, capability.reason or capability.device_name, Qt.ToolTipRole)
+                combo.setItemData(combo.count() - 1,
+                                  capability.reason or capability.device_name, Qt.ToolTipRole)
                 if not capability.available:
                     combo.model().item(combo.count() - 1).setEnabled(False)
         combo.setCurrentIndex(max(0, combo.findData(self.config.corrections.backend)))
@@ -568,7 +607,8 @@ class PushbroomScannerMainWindow(QMainWindow):
 
     def _refresh_gui_slot(self) -> None:
         columns, step = self._canvas_columns(), self._belt_step()
-        s = self._pipeline.snapshot(canvas_columns=columns, raw_columns=self._raw_zone_columns(columns), step=step)
+        s = self._pipeline.snapshot(canvas_columns=columns,
+                                    raw_columns=self._raw_zone_columns(columns), step=step)
         # Images at gui_hz; the class statistics at ~10 Hz and the performance charts at ~5 Hz
         # (their stage numbers change every 0.5 s): less GUI time holding the GIL.
         self._tick = getattr(self, '_tick', 0) + 1
@@ -580,10 +620,11 @@ class PushbroomScannerMainWindow(QMainWindow):
         focus_due = self._tick % max(1, round(hz * FocusPanel.INTERVAL_S)) == 0
 
         if s.raw_frame is not None and not self._preview_collapsed():
-            self._set_pixmap(self._raw_label, _to_gray8(s.raw_frame, self._raw_label.size()), Qt.KeepAspectRatio)
+            self._set_pixmap(self._raw_label, _to_gray8(
+                s.raw_frame, self._raw_label.size()), Qt.KeepAspectRatio)
         if focus_due:
             self._update_focus(s.raw_frame)
-        if s.canvas.shape[1] > 0:
+        if s.canvas.shape[1] > 0 and self._draw is None:
             self._show_belt(s.canvas, s.raw_canvas, step[1])
 
         # Counts accumulate per line in the pipeline; "real-time" is every line since the
@@ -608,7 +649,8 @@ class PushbroomScannerMainWindow(QMainWindow):
         if s.source_kind == 'camera':
             # free-running camera: target_fps is its measured frame rate (0 = nothing delivered lately)
             stalled = s.state == 'running' and s.elapsed_s > 1.0 and s.target_fps == 0
-            target = f"{s.target_fps:,.0f}" if s.target_fps else ('0 (no frames)' if stalled else '…')
+            target = f"{s.target_fps:,.0f}" if s.target_fps else (
+                '0 (no frames)' if stalled else '…')
             where = f"{name} frame {index + 1:,}"
             lost_detail = (f", camera {s.lines_lost_camera:,}" if s.lines_lost_camera else "") + \
                 (f", read timeouts {s.grab_timeouts:,}" if s.grab_timeouts else "")
@@ -628,10 +670,12 @@ class PushbroomScannerMainWindow(QMainWindow):
             text += f"\nERROR: {s.error}"
         self._status_label.setText(text)
         note = f" — {s.backend_note}" if s.backend_note else ""
-        self._backend_label.setText(f"running: {s.backend}  (requested {s.requested_backend}){note}")
+        self._backend_label.setText(
+            f"running: {s.backend}  (requested {s.requested_backend}){note}")
         set_accent(self._backend_label, 'warn' if s.backend_note else 'ok')
         # ok / warn / error: stripe and text colours come from the theme
-        set_accent(self._status_label, 'error' if s.error else 'warn' if s.lines_lost or stalled else 'ok')
+        set_accent(self._status_label,
+                   'error' if s.error else 'warn' if s.lines_lost or stalled else 'ok')
 
     def _canvas_columns(self) -> int:
         """Belt-map columns that fill the label at the true pixel proportions.
@@ -663,7 +707,8 @@ class PushbroomScannerMainWindow(QMainWindow):
         ``canvas`` / ``raw`` hold every ``column_step``-th column, counted from the newest.
         """
         needed = self._canvas_columns()
-        grid = np.arange(needed - 1, -1, -column_step)[::-1]   # drawn columns (offsets from the oldest)
+        # drawn columns (offsets from the oldest)
+        grid = np.arange(needed - 1, -1, -column_step)[::-1]
         if canvas.shape[1] < len(grid):         # not enough history yet: pad the left side
             pad = np.zeros((canvas.shape[0], len(grid) - canvas.shape[1]), canvas.dtype)
             canvas = np.concatenate([pad, canvas], axis=1)
@@ -672,7 +717,8 @@ class PushbroomScannerMainWindow(QMainWindow):
         if raw is None or zone == 0:
             return image
         first = int(np.searchsorted(grid, needed - zone))    # first drawn column of the raw zone
-        image[:, first:image.shape[1] - raw.shape[1]] = 0     # raw zone before any line reached it: black
+        # raw zone before any line reached it: black
+        image[:, first:image.shape[1] - raw.shape[1]] = 0
         if raw.shape[1]:
             self._gray_into(raw, image[:, image.shape[1] - raw.shape[1]:])
         return image
@@ -687,7 +733,8 @@ class PushbroomScannerMainWindow(QMainWindow):
                 self._raw_range = (float(lo), float(hi))
             else:                               # steady grey levels: follow the data slowly
                 a = 0.1
-                self._raw_range = tuple((1 - a) * old + a * new for old, new in zip(self._raw_range, (lo, hi)))
+                self._raw_range = tuple((1 - a) * old + a * new for old,
+                                        new in zip(self._raw_range, (lo, hi)))
         lo, hi = self._raw_range or (0.0, 1.0)
         gray = np.where(finite, raw, np.float32(lo))
         gray -= lo
@@ -699,7 +746,8 @@ class PushbroomScannerMainWindow(QMainWindow):
 
     def _show_belt(self, canvas: np.ndarray, raw: np.ndarray | None, column_step: int = 1) -> None:
         """Belt map with the zone divider and captions painted at screen resolution."""
-        self._set_pixmap(self._canvas_label, self._belt_image(canvas, raw, column_step), Qt.IgnoreAspectRatio)
+        self._set_pixmap(self._canvas_label, self._belt_image(
+            canvas, raw, column_step), Qt.IgnoreAspectRatio)
         needed = self._canvas_columns()
         zone = self._raw_zone_columns(needed)
         pixmap = self._canvas_label.pixmap()
@@ -736,6 +784,265 @@ class PushbroomScannerMainWindow(QMainWindow):
             qimg = QImage(image.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
         label.setPixmap(QPixmap.fromImage(qimg).scaled(label.size(), aspect, Qt.FastTransformation))
 
+    # ------------------------------------------------------------- reflectance (draw on RAW) ---
+
+    def _open_reflectance_dialog(self) -> None:
+        if self._draw is not None:
+            return
+        from sim_config import reflectance_folder
+        pipeline = self._pipeline
+        plan = pipeline.plans[0]
+        folder = reflectance_folder(self.config)
+        tables = sorted(p for p in folder.glob('*') if p.suffix.lower() in ('.xlsx', '.xls', '.csv'))
+        pipeline.start_calibration_capture(CALIBRATION_LINES)
+        dialog = ReflectanceDialog(self, tables, plan.wavelengths, self._camera_text(), pipeline.calibration_count,
+                                   CALIBRATION_LINES)
+        if not dialog.exec_():
+            pipeline.stop_calibration_capture()
+            return
+        choice = dialog.choice()
+        try:
+            from reflectance_builder import reference_values
+            choice['values'] = reference_values(choice['reference'], plan.wavelengths)
+        except Exception as exc:
+            pipeline.stop_calibration_capture()
+            QMessageBox.warning(self, "Reflectance", f"White standard not usable:\n{exc}")
+            return
+        self._start_drawing(choice)
+
+    def _camera_text(self) -> str:
+        """The camera values a calibration is bound to (also written into its JSON)."""
+        v = self._camera_values()
+        temp = f", sensor {v['temperature_c']:.1f} °C" if v.get('temperature_c') is not None else ''
+        return (f"{v['camera']}: bin {v['camera_bin']}, exposure {v['exposure_ms']} ms, gain {v['gain']}{temp}")
+
+    def _camera_values(self) -> dict:
+        plan, src = self._pipeline.plans[0], self._pipeline.sources[0]
+        meta = src.metadata or {}
+        temperature = next((meta[k] for k in ('sensor_temperature_c', 'temperature_c', 'sensor_temperature_c_start')
+                            if meta.get(k) is not None), None)
+        return {'camera': src.name, 'camera_backend': plan.camera_backend, 'camera_bin': plan.camera_bin,
+                'exposure_ms': plan.exposure_ms, 'gain': plan.gain,
+                'temperature_c': None if temperature is None else float(temperature)}
+
+    def _start_drawing(self, choice: dict) -> None:
+        """Freeze the belt map and take the captured lines; a drag on the RAW zone selects the area."""
+        columns, step = self._canvas_columns(), self._belt_step()
+        snap = self._pipeline.snapshot(canvas_columns=columns, raw_columns=self._raw_zone_columns(columns), step=step)
+        ids, lines = self._pipeline.calibration_capture()
+        self._pipeline.stop_calibration_capture()
+        if not ids.size or snap.raw_lines is None or not snap.raw_lines.size:
+            QMessageBox.warning(self, "Reflectance", "No lines captured yet - is the camera running?")
+            return
+        image = self._belt_image(snap.canvas, snap.raw_canvas, step[1])
+        self._draw = {'choice': choice, 'image': image, 'raw_lines': snap.raw_lines.copy(),
+                      'n_raw': snap.raw_canvas.shape[1], 'line_step': step[1] * self.config.display.canvas_line_stride,
+                      'ids': ids, 'lines': lines, 'start': None, 'rect': None}
+        self._canvas_label.setCursor(Qt.CrossCursor)
+        self._paint_drawing()
+
+    def _paint_drawing(self) -> None:
+        d = self._draw
+        image = d['image'].copy()
+        n_img, n_raw = image.shape[1], d['n_raw']
+        first_raw = n_img - n_raw
+        kept = d['raw_lines'] >= int(d['ids'].min())            # columns whose lines were captured
+        image[:, first_raw:][:, ~kept] //= 3
+        image[:, :first_raw] //= 3
+        self._set_pixmap(self._canvas_label, image, Qt.IgnoreAspectRatio)
+        pixmap = self._canvas_label.pixmap().copy()
+        tokens = QApplication.instance().property('theme_tokens')
+        painter = QPainter(pixmap)
+        text = ("Drag a rectangle over the white standard in the RAW zone  ·  Esc cancels  ·  "
+                f"{d['choice']['label']}, {d['choice']['kind']}")
+        font = QFont(tokens['font_family'])
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        box = painter.fontMetrics().boundingRect(text).adjusted(-6, -3, 6, 3)
+        box.moveTo(6, 6)
+        painter.fillRect(box, QColor(tokens['image_overlay']))
+        painter.setPen(QColor(tokens['image_overlay_text']))
+        painter.drawText(box, Qt.AlignCenter, text)
+        if d['rect'] is not None:
+            painter.setPen(QPen(QColor(tokens['accent']), 2))
+            painter.drawRect(d['rect'])
+        painter.end()
+        self._canvas_label.setPixmap(pixmap)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._canvas_label and self._draw is not None:
+            kind = event.type()
+            if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._draw['start'] = event.pos()
+                self._draw['rect'] = QRect(event.pos(), event.pos())
+                self._paint_drawing()
+                return True
+            if kind == QEvent.MouseMove and self._draw['start'] is not None:
+                self._draw['rect'] = QRect(self._draw['start'], event.pos()).normalized()
+                self._paint_drawing()
+                return True
+            if kind == QEvent.MouseButtonRelease and self._draw['start'] is not None:
+                rect = QRect(self._draw['start'], event.pos()).normalized()
+                self._draw['start'] = None
+                if rect.width() >= 2 and rect.height() >= 2:
+                    self._finish_drawing(rect)
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape and self._draw is not None:
+            self._stop_drawing()
+            return
+        super().keyPressEvent(event)
+
+    def _stop_drawing(self) -> None:
+        self._draw = None
+        self._canvas_label.unsetCursor()
+
+    def _drawn_area(self, rect: QRect) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Slit rows ``(first, last + 1)`` and lines ``(first, last)`` under ``rect`` (label pixels)."""
+        d = self._draw
+        w, h = max(1, self._canvas_label.width()), max(1, self._canvas_label.height())
+        slit = self._pipeline.sources[0].frame_shape[0]
+        r0 = int(np.clip(np.floor(rect.top() / h * slit), 0, slit - 1))
+        r1 = int(np.clip(np.ceil((rect.bottom() + 1) / h * slit), r0 + 1, slit))
+        n_img, n_raw = d['image'].shape[1], d['n_raw']
+        c0 = int(np.floor(rect.left() / w * n_img)) - (n_img - n_raw)
+        c1 = int(np.floor(rect.right() / w * n_img)) - (n_img - n_raw)
+        c0, c1 = max(0, c0), min(n_raw - 1, c1)
+        if c1 < c0:
+            raise ValueError("the rectangle is not in the RAW zone (right part of the belt map)")
+        ids = d['raw_lines'][c0:c1 + 1]
+        ids = ids[ids >= 0]
+        if not ids.size:
+            raise ValueError("no lines in the drawn columns")
+        return (r0, r1), (int(ids.min()) - (d['line_step'] - 1), int(ids.max()))
+
+    def _finish_drawing(self, rect: QRect) -> None:
+        from reflectance_builder import _clean_steps, factors_from_lines, quality
+        d, plan = self._draw, self._pipeline.plans[0]
+        steps = self._pipeline.effective_steps()
+        try:
+            if plan.stage == 'raw' and not steps['dark']:
+                raise ValueError("the dark step is off: the white would keep the dark offset. "
+                                 "Turn 'Dark + Hot pixel' on (a dark file for these camera values is needed)")
+            rows, (first, last) = self._drawn_area(rect)
+            keep = (d['ids'] >= first) & (d['ids'] <= last)
+            if not keep.any():
+                raise ValueError("the drawn lines are older than the captured ones (dimmed part)")
+            choice = d['choice']
+            factors, white = factors_from_lines(d['lines'][keep], rows, choice['values'], plan.wavelengths,
+                                                choice['kind'], steps={k: bool(v) for k, v in steps.items()
+                                                                       if k != 'reflectance'})
+        except ValueError as exc:
+            QMessageBox.warning(self, "Reflectance", str(exc))
+            self._draw['rect'] = None
+            self._paint_drawing()
+            return
+        meta = self._pipeline.sources[0].metadata or {}
+        full_scale = meta.get('full_scale') or meta.get('saturation_level')
+        report = quality(white, factors, choice['values'], float(full_scale) if full_scale else None, rows)
+        report['steps'] = _clean_steps(report['steps'])
+        line_ids = d['ids'][keep]
+        text = (f"White standard: {choice['label']}  ({choice['kind']} factors {factors.shape})\n"
+                f"Area: slit rows {rows[0]}-{rows[1] - 1}, {line_ids.size} lines ({int(line_ids[0])}-{int(line_ids[-1])})\n"
+                f"White counts {report['white_counts_min_max'][0]:.0f}-{report['white_counts_min_max'][1]:.0f}"
+                + (f", peak {report['white_peak_pct_of_full_scale']:.0f} % of full scale"
+                   if 'white_peak_pct_of_full_scale' in report else '')
+                + f"\nSpread along the drawn rows: {report['row_spread_pct'] or 0:.1f} %\n"
+                f"Factors {report['factor_min_max'][0]:.3g}-{report['factor_min_max'][1]:.3g}"
+                + (f"\n⚠ {len(report['weak_bands_nm'])} weak bands (< 2 % of the peak): noisy factors"
+                   if report['weak_bands_nm'] else '')
+                + f"\nCamera: {self._camera_text()}\n\nApply now and save (the previous profile goes to history/)?")
+        box = QMessageBox(QMessageBox.Question, "Reflectance calibration", text, parent=self)
+        apply_button = box.addButton("Apply && Save", QMessageBox.AcceptRole)
+        again = box.addButton("Draw again", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec_()
+        if box.clickedButton() is again:
+            self._draw['rect'] = None
+            self._paint_drawing()
+            return
+        if box.clickedButton() is apply_button:
+            info = {'placeholder': False, 'method': 'drawn on RAW (GUI)', 'reference': choice['label'],
+                    'kind': choice['kind'], 'rows': list(rows),
+                    'lines': [int(line_ids[0]), int(line_ids[-1])], 'frames_averaged': int(line_ids.size),
+                    'steps': report['steps'], 'quality': report, **self._camera_values()}
+            self._apply_calibration(factors, info)
+        self._stop_drawing()
+
+    def _apply_calibration(self, factors: np.ndarray, info: dict) -> None:
+        from reflectance_builder import backup_profile, save_profile
+        from sim_config import reflectance_folder, source_stem
+        plan, src = self._pipeline.plans[0], self._pipeline.sources[0]
+        name = source_stem(src)
+        path = reflectance_folder(self.config) / f"{name}.npy"
+        label = f"{path.name} ({'row-wise' if factors.ndim == 2 else 'per band'} {factors.shape}, drawn on RAW, " \
+                f"{info['reference']})"
+        try:
+            self._pipeline.set_reflectance_factors(factors, label)
+            moved = backup_profile(path)
+            save_profile(path.parent, [name], factors, plan.wavelengths, info)
+        except Exception as exc:
+            logger.exception("Reflectance calibration not applied")
+            QMessageBox.critical(self, "Reflectance", f"Not applied:\n{exc}")
+            return
+        logger.info("Reflectance calibrated on RAW: %s%s", path,
+                    f" (previous moved to {moved[0].parent})" if moved else '')
+        self._setup_step_switches()
+        self._info_label.setText(self._plan_text())
+        self.performance_panel.reset_requested.emit()
+
+    # ------------------------------------------------------------------- sensor settings ---
+
+    def _open_sensor_dialog(self) -> None:
+        if self._draw is not None:
+            return
+        plan = self._pipeline.plans[0]
+        dialog = SensorDialog(self, self.config, plan, self._config_path)
+        if not dialog.exec_():
+            return
+        values = dialog.values()
+        acquisition = replace(self.config.acquisition, exposure_ms=values['exposure_ms'], gain=values['gain'],
+                              camera_bin=values['camera_bin'])
+        new_config = replace(self.config, acquisition=acquisition).validate()
+        if values['save']:
+            try:
+                dialog.save(values)
+            except Exception as exc:
+                QMessageBox.warning(self, "Sensor", f"Settings not saved to the config file:\n{exc}")
+        self._restart_pipeline(new_config)
+
+    def _restart_pipeline(self, config) -> None:
+        """Stop the pipeline (closes the camera) and build it again with ``config``."""
+        self._gui_timer.stop()
+        old_config = self.config
+        self._status_label.setText("Restarting with the new sensor settings…")
+        QApplication.processEvents()
+        if not self._pipeline.stop():
+            QMessageBox.warning(self, "Sensor", "The pipeline did not stop (camera busy); try again.")
+            self._gui_timer.start()
+            return
+        try:
+            pipeline = build_pipeline(config)
+        except Exception as exc:
+            logger.exception("Restart with the new sensor settings failed")
+            QMessageBox.critical(self, "Sensor", f"The camera could not start with these settings:\n{exc}\n\n"
+                                                 "Going back to the previous settings.")
+            config = old_config
+            pipeline = build_pipeline(config)
+        self.config = config
+        self._pipeline = pipeline
+        self._setup_backend_selector()
+        self._setup_step_switches()
+        self._forget_previous_counts()
+        self._info_label.setText(self._plan_text())
+        self._raw_range = None
+        self.performance_panel.reset_requested.emit()
+        pipeline.start()
+        self._gui_timer.start()
+
     # ------------------------------------------------------------------------- events ---
 
     def _on_class_color_changed(self, class_id: int, new_rgb: list[int]) -> None:
@@ -752,13 +1059,15 @@ class PushbroomScannerMainWindow(QMainWindow):
             if busy == ['camera'] and getattr(self, '_close_refused', False):
                 # Second try and only the camera thread is left, blocked inside the SDK: quit anyway
                 # (closing the camera from this thread could crash the SDK; the OS releases it).
-                logger.warning("Closing with the camera thread still blocked in a read; the camera was not closed")
+                logger.warning(
+                    "Closing with the camera thread still blocked in a read; the camera was not closed")
                 event.accept()
                 return
             # Keep the window (and the threads' owners) alive while a worker is still busy,
             # e.g. a CUDA backend finishing its initialisation; close again to retry.
             self._close_refused = True
-            logger.warning("Shutdown pending; pipeline thread(s) still running: %s", ', '.join(busy))
+            logger.warning("Shutdown pending; pipeline thread(s) still running: %s",
+                           ', '.join(busy))
             self._status_label.setText(f"Shutdown pending: waiting for {', '.join(busy)} — close again")
             self._gui_timer.start()                    # keep the window alive meanwhile
             event.ignore()
@@ -786,13 +1095,17 @@ def _to_gray8(frame: np.ndarray, size=None) -> np.ndarray:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', default=None, help='simulation.json (default: beside gui.py)')
-    parser.add_argument('--source', default=None, help='HDF5/ENVI file or folder (overrides source.path)')
+    parser.add_argument('--source', default=None,
+                        help='HDF5/ENVI file or folder (overrides source.path)')
     parser.add_argument('--pattern', default=None)
-    parser.add_argument('--fps', type=float, default=None, help='line rate; 0 = as fast as possible')
+    parser.add_argument('--fps', type=float, default=None,
+                        help='line rate; 0 = as fast as possible')
     parser.add_argument('--workers', type=int, default=None)
-    parser.add_argument('--theme', default=None, help='theme name in themes/ or a theme JSON (overrides display.theme)')
+    parser.add_argument('--theme', default=None,
+                        help='theme name in themes/ or a theme JSON (overrides display.theme)')
     parser.add_argument('--live', action='store_true',
                         help='live camera instead of files (source.kind = camera; see the live section)')
     parser.add_argument('--set', action='append', default=[], metavar='SECTION.KEY=VALUE',
@@ -812,7 +1125,7 @@ def main() -> None:
     app = QApplication(sys.argv[:1])
     tokens = apply_theme(app, config.display.theme)
     try:
-        window = PushbroomScannerMainWindow(config)
+        window = PushbroomScannerMainWindow(config, Path(args.config).resolve() if args.config else None)
     except Exception:
         sys.exit(1)
     use_dark_title_bar(window, bool(tokens.get('dark')))

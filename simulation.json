@@ -1,6 +1,6 @@
 {
   "source": {
-    "kind": "file",
+    "kind": "camera",
     "path": "data",
     "pattern": "*.h5",
     "stage": "auto",
@@ -18,19 +18,19 @@
   },
   "acquisition": {
     "use_file_metadata": true,
-    "camera_backend": "genicam",
+    "camera_backend": "poa",
     "camera_bin": 2,
     "raw_inverted": true,
-    "m_nm_per_px_bin1": 0.36385766843509226,
-    "c_nm": 842.1014795620235,
-    "resolution_nm": 5.0,
+    "m_nm_per_px_bin1": 0.29463481548783044,
+    "c_nm": 401.2731205561304,
+    "resolution_nm": 2.0,
     "wavelength_profile": "auto",
-    "exposure_ms": 4.0,
+    "exposure_ms": 1.0,
     "gain": 1.0,
     "temperature_c": null,
     "wavelength_range_nm": [
-      900.0,
-      1700.0
+      400.0,
+      850.0
     ]
   },
   "corrections": {
@@ -59,7 +59,7 @@
     ]
   },
   "model": {
-    "path": "sgd_first_reflectance.joblib",
+    "path": "rf_coco_model.joblib",
     "band_tolerance_nm": 0.5
   },
   "optics": {
@@ -75,6 +75,17 @@
     "camera_index": 0,
     "cti_path": null,
     "sensor_pixel_size": 10,
-    "read_timeout_ms": 100
+    "read_timeout_ms": 100,
+    "reader": "process"
+  },
+  "white_reference": {
+    "path": "reflectance",
+    "pattern": "spectralon*.h5",
+    "table": "reflectance/Spectralon_ref-020.xlsx",
+    "kind": "band",
+    "rows": "auto",
+    "frames": "auto",
+    "avg_window": 20,
+    "slit_offset": 453
   }
 }

@@ -202,7 +202,7 @@ def live_config(tmp_path, workers=2, buffers=64, corrections=None, **acquisition
                    corrections=corrections or CorrectionConfig(enabled=False, backend='cpu'),
                    processing=ProcessingConfig(workers=workers, profile_every_s=0, numba_threads=1),
                    camera=CameraConfig(buffer_frames=buffers), model=ModelConfig(path='none'),
-                   live=LiveConfig(read_timeout_ms=50)).validate()
+                   live=LiveConfig(read_timeout_ms=50, reader='thread')).validate()   # the fakes live here
 
 
 def run_until(pipeline, lines, timeout=20.0):
@@ -304,7 +304,9 @@ def test_overrun_reads_and_drops_the_frame_and_counts_every_line(tmp_path, insta
 
 def test_read_timeouts_are_counted_and_retried(tmp_path, install):
     camera = FakeLineCamera(rate_hz=2000, timeouts=5)
-    s = run_until(value_pipeline(tmp_path, camera, install), 100)
+    # After the timeouts the fake camera catches up with a burst (up to 50 ms = 100 frames at once);
+    # 256 buffers hold it, so a lost line here would be a real fault, not the burst.
+    s = run_until(value_pipeline(tmp_path, camera, install, buffers=256), 100)
     assert s.error is None and s.grab_timeouts == 5 and s.lines_lost == 0 and s.lines_processed >= 100
 
 
@@ -530,6 +532,9 @@ def test_config_needs_exposure_and_gain_and_a_known_backend(tmp_path):
         replace(config, source=replace(config.source, kind='usb')).validate()
     with pytest.raises(ValueError, match='read_timeout_ms'):
         replace(live_config(tmp_path), live=LiveConfig(read_timeout_ms=60000)).validate()
+    with pytest.raises(ValueError, match='live.reader'):
+        replace(live_config(tmp_path), live=LiveConfig(reader='thrad')).validate()
+    assert LiveConfig().reader == 'process'                # the default for real cameras
     # file playback does not need them
     assert replace(config, acquisition=AcquisitionConfig(exposure_ms=None)).validate().live_camera is False
 
@@ -559,7 +564,8 @@ def test_cti_path_and_index_reach_the_backend(tmp_path, install):
     (tmp_path / 'gentl').mkdir()
     (tmp_path / 'gentl' / 'producer.cti').write_bytes(b'')
     config = live_config(tmp_path, camera_backend='genicam')
-    config = replace(config, live=LiveConfig(camera_index=3, cti_path='gentl/producer.cti', sensor_pixel_size=12))
+    config = replace(config, live=LiveConfig(camera_index=3, cti_path='gentl/producer.cti', sensor_pixel_size=12,
+                                                reader='thread'))
     cam, live = open_camera(config)
     try:
         settings = made['settings']
@@ -613,7 +619,7 @@ def test_simulate_live_report_and_exit_code(tmp_path, install, capsys):
                         'm_nm_per_px_bin1': 10.0, 'c_nm': 400.0, 'resolution_nm': 20.0},
         'corrections': {'enabled': False, 'backend': 'cpu'},
         'processing': {'workers': 1, 'profile_every_s': 0, 'numba_threads': 1},
-        'model': {'path': 'none'}, 'live': {'read_timeout_ms': 50}}), encoding='utf-8')
+        'model': {'path': 'none'}, 'live': {'read_timeout_ms': 50, 'reader': 'thread'}}), encoding='utf-8')
     install(FakeLineCamera(rate_hz=500))
     assert simulate.main(['--config', str(path), '--live', '--seconds', '1', '--json']) == 0
     report = json.loads(capsys.readouterr().out)

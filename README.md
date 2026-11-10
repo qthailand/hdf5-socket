@@ -23,8 +23,9 @@ python gui.py --live                                  # live camera instead of f
 python simulate.py --live --seconds 30 --set acquisition.exposure_ms=2
 ```
 
-`--set SECTION.KEY=VALUE` (`gui.py` and `simulate.py`) overrides any `simulation.json` value. The
-socket streamer `python . send/recv` (`__main__.py`) is a separate tool.
+`--set SECTION.KEY=VALUE` (`gui.py` and `simulate.py`) overrides any `simulation.json` value
+(JSON values; `null` clears one). The socket streamer `python . send/recv` (`__main__.py`) is a
+separate tool.
 
 ## Input
 
@@ -84,29 +85,41 @@ wavelength files, as the attributes of a recording do (origin `camera:...` in th
 | `acquisition.camera_bin` | hardware bin set on the camera (an unsupported bin is an error) |
 | `acquisition.exposure_ms`, `gain` | required; applied to the camera, and the values it applied pick the dark |
 | `acquisition.raw_inverted` | slit flip, as for files |
+| `acquisition.wavelength_profile` | `auto`: `calibration/wavelength/<backend>/wavelength_bin<bin>.json` is **required** (a camera carries no m/c of its own; starting without it is an error rather than another camera's axis); `"none"` uses `m_nm_per_px_bin1` / `c_nm` on purpose |
 | `live.camera_index` | device index (GenICam, XIMEA; POA opens its first camera) |
-| `live.cti_path` | GenICam GenTL producer; `null` = `$GENICAM_GENTL64_PATH\libsv_gev_tl_x64.cti` |
+| `live.cti_path` | GenICam GenTL producer; `null` = the SVS producer (`sv_gev_tl_x64.cti`, `libsv_gev_tl_x64.cti`) in one of the `GENICAM_GENTL64_PATH` folders; a missing file is an error naming the path |
 | `live.sensor_pixel_size` | GenICam `SensorPixelSize` 8/10/12 bits: must be what the darks were recorded with (it changes the value scaling) |
-| `live.read_timeout_ms` | longest wait for one frame (default 100); a stop is noticed within this time |
+| `live.read_timeout_ms` | longest wait for one frame, 1–10000 (default 100); a stop waits for one read plus 1 s |
+| `live.reader` | `process` (default): the camera is opened and read in a process of its own, writing into shared-memory frame buffers, so the GUI and the workers cannot slow the camera through the GIL (`camera_process.py`); `thread`: read by a thread of this process (the tests' fake cameras) |
 
 The sensor temperature at start picks the nearest dark, as in hsi. Reflectance `auto` looks for
-`reflectance/live_<backend>.npy`.
+`reflectance/live_<backend>.npy`. `resolution_nm` comes from the config for a live camera (a
+recording carries its own).
 
 How it runs (`Pipeline._live_loop`, `camera_source.py`):
 
 * The camera **free-runs** at the rate its exposure and readout allow (hsi sets no frame rate
   either). `camera.fps`, `overrun: "block"` and `loop` apply to files only; the line-rate box
-  shows the measured rate, read-only, and the mm/line readout uses it.
+  shows the measured rate (frames the camera delivers per second), read-only, and the mm/line
+  readout uses it. When the camera stops sending, the rates fall to 0, the box shows *no frames*,
+  the status line turns orange and counts the read timeouts.
 * Each frame is written straight into a free buffer (GenICam converts into it, the other
-  backends copy). With no free buffer the frame is still read and dropped as an **overrun**;
-  frames the camera or the link lost (GenICam frame-id gaps, POA's dropped counter) are lost
-  lines too (`lines_lost_camera`). Both are drawn magenta. XIMEA reports no drops.
+  backends copy). With no free buffer the frame is still read and, unless a buffer came free
+  during the read, dropped as an **overrun**; frames the camera or the link lost (GenICam
+  frame-id gaps, POA's dropped counter) are lost lines too (`lines_lost_camera`). Both are drawn
+  magenta. XIMEA reports no drops.
 * **Latency** starts at the camera timestamp for GenICam (camera clock latched to the host and
-  re-latched every 30 s; implausible stamps fall back to the arrival time), otherwise at the
-  frame's arrival (`Snapshot.line_clock`: `camera` / `arrival`).
+  re-latched every 30 s; implausible stamps trigger one immediate re-latch, then fall back to
+  the arrival time), otherwise at the frame's arrival (`Snapshot.line_clock`: `camera` /
+  `arrival`). *Queue wait* in the Performance tab is always the time in the buffers.
 * Gain, exposure and bin stay fixed while running, because they select the calibration: change
   them in `simulation.json` or with `--set` and start again. The pipeline's camera thread owns the
-  camera and closes it when the pipeline stops.
+  camera and closes it when the pipeline stops. If a read hangs inside the SDK, closing the
+  window a second time quits anyway (the camera is then not closed; the OS releases it).
+* `simulate.py --live` counts `--seconds` from the start of the stream, reports the camera's
+  mean rate, and exits with 1 when no frame arrived.
+* To focus the lens, use the **FOCUS** card beside the preview with `gui.py --live`: it scores
+  the camera's raw frames as they arrive (see *Focusing the camera*).
 
 ## Acquisition calibration (no link to the hsi project at run time)
 
@@ -329,6 +342,55 @@ The model artifact may declare `input_units` (`counts` or `reflectance`; `train_
 writes `counts`; the current model has none, so `counts` is assumed). When the Reflectance
 step does not match, the GUI shows **⚠ model expects …** next to the steps: speed numbers stay
 valid, the classes do not. Cost on this CPU: ~0.13 ms per line.
+
+### Calibrating in the GUI: draw the white standard on RAW
+
+Until a holder keeps the Spectralon under the slit, calibrate on the running view:
+
+1. **Sensor…** (live camera): exposure, gain and bin. The dialog lists the stored darks and
+   shows which dark the values will use (without one the Dark step is off, so the
+   reflectance would be wrong). **Apply** restarts the pipeline: the camera is reopened with
+   the new values, and the dark, Smile and wavelength files are picked again. **Save to
+   simulation.json** keeps the values for later runs.
+2. **Reflectance…**: pick the white standard (a table in `reflectance/`, e.g.
+   `Spectralon_ref-020.xlsx`, or **Constant reflectance (%)**), choose per-band or row-wise
+   factors, and check the camera values the result will be bound to. While the dialog is open
+   the pipeline keeps the newest 256 binned lines from before the reflectance step.
+3. **Draw on RAW**: the belt map freezes (lines that weren't kept are dimmed). Drag a
+   rectangle over the standard in the RAW zone, and **Esc** cancels. The summary shows white
+   counts, % of full scale, spread, factor range and weak bands. Then choose **Apply & Save**,
+   **Draw again** or **Cancel**.
+
+**Apply & Save** uses the factors from the next line on and switches Reflectance on. It writes
+`reflectance/<source>.npy` (`live_poa.npy` for the live POA), and the JSON beside it holds the
+camera values (backend, bin, `exposure_ms`, `gain`, sensor temperature), area, reference and
+quality report. The previous profile is moved to `reflectance/history/<name>_<time>.*`.
+At every start a profile made at another exposure is scaled to the camera's exposure (counts
+are linear in exposure). Another gain is flagged in the step's tooltip and the log, not scaled.
+
+### White reference from a folder (`white_reference`)
+
+The `white_reference` section reads the white standard like `source` reads the data. At start
+the newest file of `path` (+ `pattern`) **recorded with the data's camera backend and bin** is
+run through the data's own chain and turned into factors. They are cached in
+`reflectance/from_white/<source>.npy` and rebuilt only when the white, the table, the settings
+or the data's bands change. If no white matches, the hand-made `reflectance/<source>.npy` is
+used and the step's tooltip says which whites were skipped and why.
+
+| key | meaning |
+|---|---|
+| `path`, `pattern` | white recording(s): file or folder + glob; `null` = off |
+| `table` | reference reflectance of the standard (`.xlsx`/`.csv`: nm, R) |
+| `kind` | `band` (mean over the target rows) or `row` (row-wise, hsi window `avg_window`) |
+| `rows`, `frames` | `"auto"` (found by brightness), `null` (all) or `[first, last+1]` |
+| `slit_offset` | the white was saved as a slit crop: sensor row where the crop starts |
+
+The white's own exposure/gain select its dark. A white recorded at another exposure than
+the data is scaled to the data's exposure. Configured now: `reflectance/spectralon-20.h5`
+with `Spectralon_ref-020.xlsx`, `slit_offset` 453. That is the GenICam SWIR white (bin 2), so
+it serves a GenICam source and gives the same factors as `first.npy` (difference 0.0). The
+live POA camera skips it and keeps `live_poa.npy`. Put a POA white recording into
+`reflectance/` (or point `path` at a folder) to have POA factors made at start.
 
 ### Making the factors: white reference through the same chain
 

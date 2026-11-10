@@ -889,3 +889,138 @@ def test_optics_summary_slit_in_pixels_and_bandwidth():
     assert 'pixel 0.813 mm' in text and 'slit width 4.07 mm' in text and '500 mm field = 615 px' in text
     assert abs(OpticsConfig().belt_pixel(2) - 0.8130) < 1e-3 and OpticsConfig(belt_pixel_mm=0.5).belt_pixel(2) == 0.5
     assert optics_summary(OpticsConfig(None, 5.0), 2, 0.36, 5.0) == ''
+
+
+# ------------------------------------------------- white reference folder (config input) ---
+
+def white_folder_setup(tmp_path, attrs=None, rows=6, **white):
+    """A white recording in ``white/`` like a Spectralon held under part of the slit for some frames.
+
+    Frames 3..8 have the target (dark 7 + 1000) in slit rows 1..4; the rest is dark only.
+    """
+    from sim_config import WhiteReferenceConfig
+    shape = (6, 40)
+    calibration_tree(tmp_path, shape)
+    frames = np.full((12, rows, shape[1]), 7, np.uint16)
+    frames[3:9, 1:5] = 1007
+    (tmp_path / 'white').mkdir()
+    write_h5(tmp_path / 'white' / 'white.h5', frames,
+             attrs or {'camera_backend': 'poa', 'camera_bin': 2, 'exposure_ms': 1.0, 'gain': 1.0})
+    (tmp_path / 'ref.csv').write_text('300,0.5\n1500,0.5\n2600,0.5\n', encoding='utf-8')
+    config = make_config(tmp_path, corrections=CorrectionConfig(backend='cpu', dark='auto', reflectance='auto'),
+                         white_reference=WhiteReferenceConfig(path='white', table='ref.csv', **white))
+    data = FrameSource('run.h5', np.repeat(frames[5:6, :6] if rows == 6 else np.full((1, *shape), 1007, np.uint16),
+                                           3, axis=0), 'raw',
+                       metadata={'camera_bin': 2, 'exposure_ms': 1.0, 'gain': 1.0})
+    return config, data
+
+
+def test_white_reference_folder_makes_factors_at_start(tmp_path):
+    from sim_config import apply_reflectance
+    config, data = white_folder_setup(tmp_path)
+    plan = build_plan(config, data)
+    step = plan.steps['reflectance']
+    assert step['available'] and step['on'] and 'from white white.h5' in step['why']
+    info = json.loads((tmp_path / 'reflectance' / 'from_white' / 'run.json').read_text(encoding='utf-8'))
+    assert info['rows'] == [1, 5] and info['frames'] == [4, 8]          # found by brightness
+    binned, _, _ = PreprocessingRuntime('cpu').process_binned(
+        np.ascontiguousarray(data.frames[0]), plan.dark_processor(True), plan.binner)
+    reflectance = apply_reflectance(binned, plan.reflectance_factors)
+    np.testing.assert_allclose(reflectance[1:5].mean(axis=0), 0.5, rtol=1e-2)
+    assert not (tmp_path / 'reflectance' / 'run.npy').exists()           # hand-made profiles untouched
+
+
+def test_white_reference_is_cached_until_the_white_changes(tmp_path):
+    config, data = white_folder_setup(tmp_path)
+    build_plan(config, data)
+    out = tmp_path / 'reflectance' / 'from_white' / 'run.npy'
+    first = out.stat().st_mtime_ns
+    assert 'cached' in build_plan(config, data).steps['reflectance']['why']
+    assert out.stat().st_mtime_ns == first
+    time.sleep(0.05)
+    frames = np.full((12, 6, 40), 7, np.uint16)
+    frames[:, :] = 2007                                                  # a new, brighter white
+    write_h5(tmp_path / 'white' / 'white.h5', frames,
+             {'camera_backend': 'poa', 'camera_bin': 2, 'exposure_ms': 1.0, 'gain': 1.0})
+    plan = build_plan(config, data)
+    assert 'cached' not in plan.steps['reflectance']['why']
+    assert json.loads(out.with_suffix('.json').read_text())['rows'] == 'all'   # fills the slit: no target edge
+
+
+def test_white_of_another_camera_falls_back_to_the_named_profile(tmp_path):
+    config, data = white_folder_setup(tmp_path, attrs={'camera_backend': 'genicam', 'camera_bin': 2})
+    step = build_plan(config, data).steps['reflectance']
+    assert not step['available'] and 'no white reference for poa bin 2' in step['why']
+    assert 'white.h5: genicam bin 2' in step['why']
+
+
+def test_slit_cropped_white_needs_its_offset(tmp_path):
+    config, data = white_folder_setup(tmp_path, rows=4)
+    step = build_plan(config, data).steps['reflectance']
+    assert not step['available'] and 'slit_offset' in step['why']
+    config = replace(config, white_reference=replace(config.white_reference, slit_offset=1))
+    step = build_plan(config, data).steps['reflectance']
+    assert step['available'], step['why']
+    info = json.loads((tmp_path / 'reflectance' / 'from_white' / 'run.json').read_text(encoding='utf-8'))
+    assert info['slit_crop'] == {'raw_rows': [1, 5], 'sensor_rows': 6}
+
+
+def test_white_reference_config_is_checked(tmp_path):
+    from sim_config import WhiteReferenceConfig
+    with pytest.raises(ValueError, match='table'):
+        make_config(tmp_path, white_reference=WhiteReferenceConfig(path='white'))
+    with pytest.raises(ValueError, match='rows'):
+        make_config(tmp_path, white_reference=WhiteReferenceConfig(path='white', table='t.csv', rows=[5, 2]))
+
+
+# ------------------------------------------------------- reflectance drawn on the belt map ---
+
+def test_calibration_capture_keeps_binned_lines_before_reflectance(tmp_path):
+    config, src = reflectance_setup(tmp_path, 0.5, rowwise=False)          # reflectance on: x 0.5
+    plan = build_plan(config, src)
+    plan.columns = None
+    pipeline = Pipeline(config, [src], [plan], ValueClassifier())
+    pipeline.start_calibration_capture(8)
+    snap = run_to_end(pipeline)
+    ids, lines = pipeline.calibration_capture()
+    assert ids.tolist() == list(range(22, 30)) and lines.shape == (8, 6, plan.n_columns)
+    np.testing.assert_allclose(lines, 93.0, rtol=1e-3)                    # 100 - dark 7, not x 0.5
+    assert pipeline.snapshot(raw_columns=8).raw_lines.tolist() == list(range(22, 30))   # = belt map columns
+    first, part = pipeline.calibration_capture(24, 25)
+    assert first.tolist() == [24, 25] and part.shape[0] == 2
+    pipeline.stop_calibration_capture()
+    assert pipeline.calibration_capture()[0].size == 0 and pipeline.calibration_count() == 0
+
+
+def test_drawn_factors_give_the_standard_reflectance_and_apply_live(tmp_path):
+    from reflectance_builder import factors_from_lines, reference_values
+    config, src, plan = dark_plan(tmp_path, dark='auto')
+    lines = np.full((10, 6, plan.n_columns), 93.0, np.float32)
+    lines[:, :2] = 5.0                                                    # rows 0-1 off the standard
+    target = reference_values(0.99, plan.wavelengths)
+    factors, white = factors_from_lines(lines, (2, 6), target, plan.wavelengths, 'band')
+    np.testing.assert_allclose(93.0 * factors, 0.99, rtol=1e-6)
+    with pytest.raises(ValueError, match='no signal'):
+        factors_from_lines(np.zeros_like(lines), (2, 6), target, plan.wavelengths)
+    with pytest.raises(ValueError):
+        reference_values(99, plan.wavelengths)                            # percent, not a fraction
+    pipeline = Pipeline(config, [src], [plan], ValueClassifier())
+    pipeline.set_reflectance_factors(factors, 'drawn')
+    assert pipeline.effective_steps()['reflectance'] and plan.steps['reflectance']['available']
+    with pytest.raises(ValueError, match='do not fit'):
+        pipeline.set_reflectance_factors(np.ones(3, np.float32), 'bad')
+
+
+def test_profile_is_bound_to_the_camera_values_it_was_made_at(tmp_path):
+    from reflectance_builder import backup_profile, save_profile
+    config, src = reflectance_setup(tmp_path, 0.5, rowwise=False)
+    probe = build_plan(config, src)
+    folder = tmp_path / 'reflectance'
+    moved = backup_profile(folder / 'x.npy')
+    assert [p.name.split('_')[0] for p in moved] == ['x', 'x'] and not (folder / 'x.npy').exists()
+    save_profile(folder, ['x'], np.full(probe.n_columns, 0.5, np.float32), probe.wavelengths,
+                 {'exposure_ms': 2.0, 'gain': 4.0})                       # made at 2 ms, gain 4
+    plan = build_plan(config, src)                                       # frames at 1 ms, gain 1
+    np.testing.assert_allclose(plan.reflectance_factors, 1.0)            # half the exposure: x 2
+    why = plan.steps['reflectance']['why']
+    assert 'scaled from 2 ms to 1 ms' in why and 'WARNING made at gain 4' in why

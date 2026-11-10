@@ -77,6 +77,8 @@ class LiveConfig:
                                          # $GENICAM_GENTL64_PATH (sv_gev_tl_x64.cti / libsv_gev_tl_x64.cti)
     sensor_pixel_size: int = 10          # GenICam SensorPixelSize 8/10/12 bits: must be what the darks used
     read_timeout_ms: int = 100           # longest wait for one frame (1..10000); a stop waits for one read
+    reader: str = 'process'              # 'process': the camera is read in a process of its own (own GIL,
+                                         # camera_process.py); 'thread': in a thread of this process
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,26 @@ class CorrectionConfig:
     smile: str = 'none'                  # none | auto | path to smile_model_bin<N>.npz
     reflectance: str = 'none'            # none | auto | path: counts x factor, last step before the model
     reflectance_dir: str = 'reflectance' # <dir>/<source name>.npy (+ .wavelength.npy), see reflectance/README.md
+
+
+@dataclass(frozen=True)
+class WhiteReferenceConfig:
+    """The reflectance standard (Spectralon) the factors are made from at start, like ``source``.
+
+    With ``path`` set and ``corrections.reflectance = "auto"``, ``build_plan`` takes the newest
+    file of ``path`` (a file or a folder + ``pattern``) recorded with the data's camera and bin,
+    runs it through the data's chain (``reflectance_builder.ensure_white_profile``) and uses the
+    factors, cached as ``<reflectance_dir>/from_white/<source name>.npy`` until the white, the
+    table or the data's bands change. No matching white: the hand-made ``<source name>.npy``.
+    """
+    path: str | None = None              # white recording(s): file or folder; None = off
+    pattern: str | None = '*.h5'         # glob in a folder
+    table: str | None = None             # reference reflectance of the target (.xlsx/.csv: nm, R)
+    kind: str = 'band'                   # band: (bands,) from the ROI mean | row: (slit rows, bands)
+    rows: object = 'auto'                # slit rows [first, last+1] after the chain | 'auto' (bright rows) | None = all
+    frames: object = 'auto'              # scan frames [first, last+1] | 'auto' (frames with the target) | None = all
+    avg_window: int = 20                 # row window for kind = row (hsi)
+    slit_offset: int | None = None       # white saved as a slit crop: raw sensor row where the crop starts
 
 
 @dataclass(frozen=True)
@@ -166,6 +188,7 @@ class SimulationConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optics: OpticsConfig = field(default_factory=OpticsConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
+    white_reference: WhiteReferenceConfig = field(default_factory=WhiteReferenceConfig)
     base_dir: str = str(ROOT)            # folder relative paths resolve against
 
     def resolve(self, value: str | None) -> Path | None:
@@ -201,6 +224,8 @@ class SimulationConfig:
                 raise ValueError("live.sensor_pixel_size must be 8, 10 or 12")
             if not 1 <= self.live.read_timeout_ms <= 10000:
                 raise ValueError("live.read_timeout_ms must be 1..10000 (a stop waits for one read)")
+            if self.live.reader not in ('process', 'thread'):
+                raise ValueError(f"live.reader must be 'process' or 'thread', got {self.live.reader!r}")
             if self.live.camera_index < 0:
                 raise ValueError("live.camera_index must be >= 0")
         if self.source.stage not in ('auto', 'raw', 'binned'):
@@ -225,13 +250,26 @@ class SimulationConfig:
             raise ValueError("display.line_aspect must be > 0")
         if not 0.0 <= self.display.raw_zone_fraction < 1.0:
             raise ValueError("display.raw_zone_fraction must be in [0, 1)")
+        white = self.white_reference
+        if white.path not in (None, ''):
+            if not white.table:
+                raise ValueError("white_reference.table is required with white_reference.path")
+            if white.kind not in ('band', 'row'):
+                raise ValueError(f"white_reference.kind must be 'band' or 'row', got {white.kind!r}")
+            for key in ('rows', 'frames'):
+                value = getattr(white, key)
+                if not (value in (None, 'auto') or (isinstance(value, (list, tuple)) and len(value) == 2
+                                                    and 0 <= int(value[0]) < int(value[1]))):
+                    raise ValueError(f"white_reference.{key} must be 'auto', null or [first, last+1]")
+            if white.avg_window < 1:
+                raise ValueError("white_reference.avg_window must be >= 1")
         return self
 
 
 _SECTION_CLASSES = {'source': SourceConfig, 'camera': CameraConfig, 'acquisition': AcquisitionConfig,
                     'corrections': CorrectionConfig, 'processing': ProcessingConfig,
                     'display': DisplayConfig, 'model': ModelConfig, 'optics': OpticsConfig,
-                    'live': LiveConfig}
+                    'live': LiveConfig, 'white_reference': WhiteReferenceConfig}
 
 
 def parse_set_overrides(items) -> dict:
@@ -322,6 +360,8 @@ class AcquisitionPlan:
     smile_model: object = None
     reflectance_factors: np.ndarray | None = None   # (slit, bands) or (bands,) float32, also when offered off
     reflectance_placeholder: bool = False           # factors marked placeholder in reflectance/<name>.json
+    exposure_ms: float | None = None             # of the frames: a white of another exposure is scaled to it
+    gain: float | None = None
     #: per step: {'available': bool, 'on': bool, 'why': str} for dark (+hot pixel), flip, smile, binning
     steps: dict = field(default_factory=dict)
     binner: LambdaBinner | None = None
@@ -404,6 +444,7 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
     prov['raw_inverted'] = (plan.raw_inverted, o)
     exposure, o_e = pick(('exposure_ms',), acq.exposure_ms, float)
     gain, o_g = pick(('gain',), acq.gain, float)
+    plan.exposure_ms, plan.gain = exposure, gain
     # the dark the recording used was captured at dark_temperature_c (HSI picks the nearest one)
     temperature, _ = pick(('temperature_c', 'dark_temperature_c', 'sensor_temperature_c_start', 'temperature'),
                           acq.temperature_c, float)
@@ -536,23 +577,34 @@ def optics_summary(optics, camera_bin: int, m_nm_per_px_bin1: float, resolution_
             f"bins {resolution_nm:g} nm = {resolution_nm / bandwidth:.2f} x that{belt}")
 
 
+def source_stem(source) -> str:
+    """Data source name the factors belong to: the file name without its extension."""
+    name = Path(source.path).name
+    for suffix in ('.hdr', '.h5', '.hdf5', '.bip', '.bil', '.bsq', '.img', '.raw', '.dat'):
+        if name.lower().endswith(suffix):
+            name = name[:-len(suffix)]
+    return name
+
+
+def reflectance_folder(config) -> Path:
+    """``corrections.reflectance_dir`` as a path."""
+    return config.resolve(config.corrections.reflectance_dir) or Path(config.base_dir) / 'reflectance'
+
+
 def reflectance_path(config, source) -> Path | None:
     """The factor profile of ``source``: ``<reflectance_dir>/<source name>.npy``, or the configured file."""
     choice = config.corrections.reflectance
     if choice not in (None, '', 'none', 'auto'):
         return config.resolve(choice)
-    folder = config.resolve(config.corrections.reflectance_dir) or Path(config.base_dir) / 'reflectance'
-    name = Path(source.path).name
-    for suffix in ('.hdr', '.h5', '.hdf5', '.bip', '.bil', '.bsq', '.img', '.raw', '.dat'):
-        if name.lower().endswith(suffix):
-            name = name[:-len(suffix)]
-    return folder / f"{name}.npy"
+    return reflectance_folder(config) / f"{source_stem(source)}.npy"
 
 
 def _reflectance_step(config, plan, source) -> None:
     """Load the source's reflectance factors and check them against the bands the model gets.
 
-    ``auto``/a path turns the step on; ``none`` offers a matching file as off. Factors are
+    ``auto``/a path turns the step on; ``none`` offers a matching file as off. With
+    ``white_reference.path`` (and no explicit factor file) the factors are first made from the
+    newest matching white recording (``reflectance_builder.ensure_white_profile``). Factors are
     applied by band index (hsi), so ``check_factor_bands`` refuses another band axis; row-wise
     factors must also have one row per slit pixel of the frame.
     """
@@ -560,11 +612,26 @@ def _reflectance_step(config, plan, source) -> None:
     path = reflectance_path(config, source)
     wanted = choice not in (None, '', 'none')
     n_bands = plan.n_columns
+    white_note = ''
+    if config.white_reference.path not in (None, '') and choice in (None, '', 'none', 'auto'):
+        from reflectance_builder import ensure_white_profile
+        try:
+            built, white_note = ensure_white_profile(config, plan, source_stem(source))
+        except (ValueError, OSError) as exc:
+            logger.warning("White reference for %s not usable: %s", source.name, exc)
+            plan.steps['reflectance'] = {'available': False, 'on': False, 'why': f"white reference: {exc}"}
+            plan.provenance['reflectance'] = (f"white reference not usable: {exc}", choice)
+            return
+        if built is not None:
+            path = built
+        else:
+            logger.info("%s; reflectance from %s if present", white_note, path.name)
     if path is None or not path.is_file():
         if wanted and choice != 'auto':
             raise FileNotFoundError(f"Reflectance profile not found: {path}")
+        why = f"no {path.name} in {path.parent.name}/ (name = data source)"
         plan.steps['reflectance'] = {'available': False, 'on': False,
-                                     'why': f"no {path.name} in {path.parent.name}/ (name = data source)"}
+                                     'why': f"{white_note}; {why}" if white_note else why}
         plan.provenance['reflectance'] = ('none', choice)
         return
     try:
@@ -586,8 +653,19 @@ def _reflectance_step(config, plan, source) -> None:
     kind = 'row-wise' if factors.ndim == 2 else 'per band'
     checked = 'bands checked by wavelength' if wavelengths is not None else 'bands checked by count only (no sidecar)'
     label = f"{path.name} ({kind} {factors.shape}, {checked})"
+    if white_note:
+        label += f" - {white_note}"
     from reflectance_builder import profile_info
     info = profile_info(path)
+    # Factors bound to the camera values they were made at (drawn on RAW / white folder): counts
+    # are linear in exposure, so another exposure is scaled; another gain is only flagged.
+    made_exp, made_gain = info.get('exposure_ms'), info.get('gain')
+    if made_exp and plan.exposure_ms and abs(float(made_exp) - float(plan.exposure_ms)) > 1e-9:
+        factors = factors * np.float32(float(made_exp) / float(plan.exposure_ms))
+        label += f", scaled from {float(made_exp):g} ms to {float(plan.exposure_ms):g} ms"
+    if made_gain is not None and plan.gain is not None and abs(float(made_gain) - float(plan.gain)) > 1e-9:
+        label += f", WARNING made at gain {float(made_gain):g}, camera at {float(plan.gain):g}"
+        logger.warning("Reflectance %s was made at gain %s, frames are at gain %s", path.name, made_gain, plan.gain)
     plan.reflectance_placeholder = bool(info.get('placeholder'))
     if plan.reflectance_placeholder:
         label = (f"PLACEHOLDER {label} - stand-in from {info.get('white', '?')}, not a real white reference; "

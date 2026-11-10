@@ -286,3 +286,248 @@ def quality(white: WhiteReference, factors: np.ndarray, reflectance: np.ndarray,
     if full_scale:
         report['white_peak_pct_of_full_scale'] = float(100 * roi.max() / full_scale)
     return report
+
+
+# ------------------------------------------------- white reference from a folder (config) ---
+
+def bright_span(values, fraction: float = 0.5, margin: int = 0) -> tuple[int, int] | None:
+    """Longest run ``(first, last + 1)`` of ``values`` above ``lo + fraction * (hi - lo)``.
+
+    ``None`` when there is no clear target (contrast under 10 % of the peak): the white then
+    fills everything, e.g. a tile across the whole slit. ``margin`` is cut from both ends of the
+    run (edge rows/frames are partly on the target).
+    """
+    v = np.asarray(values, np.float64)
+    if v.size == 0:
+        return None
+    lo, hi = float(np.nanmin(v)), float(np.nanmax(v))
+    if not np.isfinite(hi) or hi <= 0 or hi - lo < 0.1 * hi:
+        return None
+    mask = np.append(v >= lo + fraction * (hi - lo), False)
+    best, start = (0, 0), None
+    for i, on in enumerate(mask):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            if i - start > best[1] - best[0]:
+                best = (start, i)
+            start = None
+    first, last = best
+    if last - first > 2 * margin + 1:
+        first, last = first + margin, last - margin
+    return first, last
+
+
+def _white_metadata(path: Path) -> dict:
+    """Recorded camera keys of a white file (HDF5 attributes; ``{}`` for other formats)."""
+    if path.suffix.lower() not in ('.h5', '.hdf5'):
+        return {}
+    import h5py
+    try:
+        with h5py.File(path, 'r') as f:
+            meta = dict(f.attrs)
+            for ds in f.values():
+                if hasattr(ds, 'attrs'):
+                    meta.update({k: v for k, v in ds.attrs.items() if k not in meta})
+    except OSError:
+        return {}
+    return meta
+
+
+def find_white(config, plan) -> tuple[Path | None, str]:
+    """Newest file of ``white_reference.path`` recorded with the data's camera backend and bin.
+
+    Returns:
+        ``(path, '')``, or ``(None, why)`` when the folder has no white for these frames.
+
+    Raises:
+        FileNotFoundError: ``white_reference.path`` does not exist.
+    """
+    wr = config.white_reference
+    root = config.resolve(wr.path)
+    if root is None or not root.exists():
+        raise FileNotFoundError(f"white_reference.path not found: {root}")
+    files = [p for p in root.glob(wr.pattern or '*.h5') if p.is_file()] if root.is_dir() else [root]
+    where = f"{root.name}/{wr.pattern or '*.h5'}" if root.is_dir() else root.name
+    if not files:
+        return None, f"no white reference in {where}"
+    skipped = []
+    for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
+        meta = _white_metadata(path)
+        if plan.stage == 'raw':
+            backend, camera_bin = meta.get('camera_backend'), meta.get('camera_bin')
+            if ((backend is not None and str(backend).lower() != str(plan.camera_backend).lower())
+                    or (camera_bin is not None and int(camera_bin) != int(plan.camera_bin))):
+                skipped.append(f"{path.name}: {backend} bin {camera_bin}")
+                continue
+        return path, ''
+    return None, (f"no white reference for {plan.camera_backend} bin {plan.camera_bin} in {where} "
+                  f"({'; '.join(skipped)})")
+
+
+def _plain(value):
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    return value
+
+
+def _clean_steps(steps: dict) -> dict:
+    return {k: (v if isinstance(v, str) or v is None else bool(v)) for k, v in steps.items()}
+
+
+def ensure_white_profile(config, plan, name: str) -> tuple[Path | None, str]:
+    """Factors for data source ``name`` from the configured white reference (``white_reference``).
+
+    The newest matching white (:func:`find_white`) goes through the data's chain exactly as
+    ``tools/make_reflectance.py`` does it: its own dark (by its exposure/gain), flip, Smile,
+    binning; frames and slit rows with the target are found by brightness unless given; a white
+    of another exposure than the data is scaled to the data's exposure (counts are linear in it).
+    The result is cached as ``<reflectance_dir>/from_white/<name>.npy`` (+ ``.json`` with the
+    signature) and rebuilt only when the white, the table, the settings or the data's bands change.
+
+    Returns:
+        ``(profile path, note)``, or ``(None, why)`` when no white fits these frames.
+
+    Raises:
+        ValueError, OSError: the white or the table cannot give factors.
+    """
+    from dataclasses import replace
+    from sim_config import build_plan, reflectance_folder
+    from sources import open_sources
+
+    white_path, why = find_white(config, plan)
+    if white_path is None:
+        return None, why
+    wr = config.white_reference
+    table = config.resolve(wr.table)
+    if table is None or not table.is_file():
+        raise FileNotFoundError(f"white_reference.table not found: {table}")
+    out = reflectance_folder(config) / 'from_white' / f"{name}.npy"
+    st, tst = white_path.stat(), table.stat()
+    wl = plan.wavelengths
+    signature = {
+        'white': str(white_path), 'white_size': int(st.st_size), 'white_mtime_ns': int(st.st_mtime_ns),
+        'table': str(table), 'table_mtime_ns': int(tst.st_mtime_ns), 'kind': wr.kind,
+        'rows': _plain(wr.rows), 'frames': _plain(wr.frames), 'avg_window': int(wr.avg_window),
+        'slit_offset': wr.slit_offset, 'frame_shape': [int(v) for v in plan.frame_shape],
+        'bands': int(plan.n_columns),
+        'wavelength_nm': [round(float(wl[0]), 4), round(float(wl[-1]), 4)] if wl is not None else None,
+        'exposure_ms': plan.exposure_ms,
+        'steps': {k: bool(plan.steps.get(k, {}).get('on')) for k in ('dark', 'flip', 'smile')},
+    }
+    if out.is_file() and profile_info(out).get('signature') == signature:
+        return out, f"from white {white_path.name} (cached)"
+
+    logger.info("Building reflectance factors for %s from white reference %s", name, white_path)
+    src = open_sources(white_path, stage=config.source.stage, scan_axis=config.source.envi_scan_axis,
+                       dataset=config.source.dataset, cache='ram')[0]
+    crop = None
+    if src.stage == 'raw' and plan.stage == 'raw' and src.frame_shape[0] != plan.frame_shape[0]:
+        if wr.slit_offset is None:
+            raise ValueError(f"{white_path.name} has {src.frame_shape[0]} slit rows, the frames "
+                             f"{plan.frame_shape[0]}: a slit crop - set white_reference.slit_offset")
+        crop = (int(wr.slit_offset), int(src.frame_shape[0]), int(plan.frame_shape[0]))
+        src = embed_slit_crop(src, crop[0], crop[2])
+    white_config = replace(config, corrections=replace(config.corrections, reflectance='none'),
+                           white_reference=replace(wr, path=None))
+    white_plan = build_plan(white_config, src)
+
+    if wr.frames == 'auto':
+        means = [float(np.asarray(src.frames[i])[::4, ::4].mean()) for i in range(src.n_frames)]
+        span = bright_span(means, margin=1)
+        frames = slice(*span) if span else None
+    else:
+        frames = slice(*wr.frames) if wr.frames else None
+    white = white_mean(src, white_plan, frames)
+
+    lo, hi = 0, white.mean.shape[0]
+    if crop:
+        lo, hi = crop_rows_after_chain(crop[0], crop[1], crop[2], bool(white_plan.steps['flip']['on']))
+    if wr.rows == 'auto':
+        span = bright_span(white.mean[lo:hi].mean(axis=1), margin=2)
+        rows = (lo + span[0], lo + span[1]) if span else ((lo, hi) if crop else None)
+    else:
+        rows = tuple(int(v) for v in wr.rows) if wr.rows else ((lo, hi) if crop else None)
+
+    reflectance = reference_reflectance(table, white.wavelengths)
+    factors = factors_from_white(white.mean, reflectance, wr.kind, rows, wr.avg_window)
+    notes = []
+    scale = 1.0
+    if white_plan.exposure_ms and plan.exposure_ms and abs(white_plan.exposure_ms - plan.exposure_ms) > 1e-9:
+        scale = float(white_plan.exposure_ms) / float(plan.exposure_ms)
+        factors = (factors * scale).astype(np.float32)
+        notes.append(f"white {white_plan.exposure_ms:g} ms scaled to {plan.exposure_ms:g} ms")
+    if white_plan.gain is not None and plan.gain is not None and abs(white_plan.gain - plan.gain) > 1e-9:
+        notes.append(f"WARNING gain {white_plan.gain:g} vs data {plan.gain:g} (not scaled)")
+        logger.warning("White %s gain %s differs from the data's %s; factors are not scaled for gain",
+                       white_path.name, white_plan.gain, plan.gain)
+    full_scale = src.metadata.get('full_scale') or src.metadata.get('data full scale')
+    report = quality(white, factors, reflectance, float(full_scale) if full_scale else None, rows)
+    report['steps'] = _clean_steps(report['steps'])
+    if report['weak_bands_nm']:
+        logger.warning("White %s: %d bands under 2 %% of the peak signal; their factors amplify noise",
+                       white_path.name, len(report['weak_bands_nm']))
+    span = frames.indices(src.n_frames)[:2] if frames else None
+    info = {'placeholder': False, 'white': white_path.name, 'white_reference': str(white_path),
+            'table': table.name, 'kind': wr.kind, 'rows': list(rows) if rows else 'all',
+            'frames': list(span) if span else 'all', 'frames_averaged': white.n_frames,
+            'steps': _clean_steps(white.steps), 'exposure_scale': scale, 'notes': notes,
+            'quality': report, 'signature': signature}
+    if crop:
+        info['slit_crop'] = {'raw_rows': [crop[0], crop[0] + crop[1]], 'sensor_rows': crop[2]}
+    save_profile(out.parent, [name], factors, white.wavelengths, info)
+    logger.info("Wrote %s (%s, rows %s, %d frames%s)", out, wr.kind, info['rows'], white.n_frames,
+                ("; " + "; ".join(notes)) if notes else '')
+    return out, f"from white {white_path.name}" + (f" ({'; '.join(notes)})" if notes else '')
+
+
+# ------------------------------------------------------ white reference drawn on the belt map ---
+
+def reference_values(reference, wavelengths) -> np.ndarray:
+    """Target reflectance at the band centres: a table path (nm, R) or a constant (0..1)."""
+    if isinstance(reference, (int, float)):
+        if not 0 < float(reference) <= 1.5:
+            raise ValueError(f"reflectance {reference} must be in (0, 1.5] (a fraction, 0.99 = 99 %)")
+        return np.full(len(wavelengths), float(reference), np.float32)
+    return reference_reflectance(reference, wavelengths)
+
+
+def factors_from_lines(lines: np.ndarray, rows: tuple[int, int], reflectance: np.ndarray, wavelengths,
+                       kind: str = 'band', avg_window: int = 20, steps: dict | None = None,
+                       source: str = 'drawn on RAW'):
+    """Factors from binned lines ``(n, slit, bands)`` (before reflectance) with the target in ``rows``.
+
+    Returns:
+        ``(factors, WhiteReference)``; the white is the mean over the lines, all slit rows.
+
+    Raises:
+        ValueError: no lines, rows outside the slit, or a target darker than its surroundings.
+    """
+    lines = np.asarray(lines)
+    if lines.ndim != 3 or lines.shape[0] == 0:
+        raise ValueError("no captured lines inside the drawn area")
+    mean = lines.mean(axis=0, dtype=np.float64)
+    r0, r1 = int(rows[0]), int(rows[1])
+    if not 0 <= r0 < r1 <= mean.shape[0]:
+        raise ValueError(f"rows {r0}:{r1} outside the slit 0:{mean.shape[0]}")
+    if not np.isfinite(mean[r0:r1]).all() or mean[r0:r1].mean() <= 0:
+        raise ValueError("the drawn area has no signal (dark step on? target under the slit?)")
+    white = WhiteReference(mean, np.asarray(wavelengths, np.float64), int(lines.shape[0]),
+                           dict(steps or {}), source)
+    return factors_from_white(mean, reflectance, kind, (r0, r1), avg_window), white
+
+
+def backup_profile(path) -> list[Path]:
+    """Move ``<name>.npy`` (+ ``.wavelength.npy``, ``.json``) to ``<folder>/history/<name>_<time>.*``."""
+    path = Path(path)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    history = path.parent / 'history'
+    moved = []
+    for suffix in ('.npy', '.wavelength.npy', '.json'):
+        old = path.with_name(path.stem + suffix)
+        if old.is_file():
+            history.mkdir(parents=True, exist_ok=True)
+            target = history / f"{path.stem}_{stamp}{suffix}"
+            old.replace(target)
+            moved.append(target)
+    return moved

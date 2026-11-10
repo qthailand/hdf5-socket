@@ -9,7 +9,8 @@ A pushbroom frame is one line of the belt, so no frame may vanish unnoticed::
      each frame lands in a free buffer   its PreprocessingRuntime)        the belt map, latency
 
 * Source: ``source.kind = "file"`` replays recordings (:meth:`Pipeline._playback_loop`);
-  ``"camera"`` reads a live hsi camera backend (:meth:`Pipeline._live_loop`, ``camera_source.py``).
+  ``"camera"`` reads a live hsi camera backend (:meth:`Pipeline._live_loop`, ``camera_source.py``),
+  by default in a camera process of its own (``live.reader``, :meth:`Pipeline._live_process_loop`).
   The workers, aggregator and GUI are the same for both.
 * Buffers: ``camera.buffer_frames`` frame slots are allocated once. A line for which no slot
   is free is an *overrun*: with ``overrun='drop'`` it is lost exactly like on a real camera
@@ -181,6 +182,8 @@ class Snapshot:
     lines_lost_camera: int = 0       # live: part of lines_lost the camera/link lost (never delivered)
     grab_timeouts: int = 0           # live: reads that returned no frame within live.read_timeout_ms
     line_clock: str = 'schedule'     # sensor time = file: 'schedule'; live: 'camera' timestamps or 'arrival'
+    raw_lines: np.ndarray | None = None   # line number of each raw_canvas column (-1 = none yet)
+    calibration_lines: int = 0       # lines held by the calibration capture (0 = not capturing)
 
 
 # ----------------------------------------------------------------------------- pipeline ---
@@ -190,13 +193,18 @@ def build_pipeline(config) -> 'Pipeline':
 
     With ``source.kind = "camera"`` the input is the live camera (``camera_source.open_camera``):
     it is opened and configured here and handed to the pipeline, which closes it when it stops
-    (or here, if building the rest fails).
+    (or here, if building the rest fails). With ``live.reader = "process"`` it is opened and read
+    in a camera process of its own (``camera_process.py``).
     """
     src_cfg = config.source
     camera = None
     if src_cfg.kind == 'camera':
-        from camera_source import open_camera
-        camera, live = open_camera(config)
+        if config.live.reader == 'process':
+            from camera_process import open_camera_process
+            camera, live = open_camera_process(config)
+        else:
+            from camera_source import open_camera
+            camera, live = open_camera(config)
         sources = [live]
     else:
         from sources import open_sources
@@ -299,10 +307,21 @@ class Pipeline:
         shape = sources[0].frame_shape
         self._slit = shape[0]
 
-        self._buffers = np.empty((cam.buffer_frames, *shape), dtype=sources[0].dtype)
-        self._free: queue.SimpleQueue = queue.SimpleQueue()
-        for slot in range(cam.buffer_frames):
-            self._free.put(slot)
+        self._n_buffers = int(cam.buffer_frames)
+        # live.reader = "process": the buffers are shared memory the camera process writes into,
+        # and a slot a worker puts back goes to that process (camera_process.SlotReturn).
+        self._process_reader = bool(getattr(camera, 'separate_process', False))
+        self._shared = None
+        if self._process_reader:
+            from camera_process import SharedFrames, SlotReturn
+            self._shared = SharedFrames(cam.buffer_frames, shape, sources[0].dtype)
+            self._buffers = self._shared.frames
+            self._free = SlotReturn(camera, cam.buffer_frames)
+        else:
+            self._buffers = np.empty((cam.buffer_frames, *shape), dtype=sources[0].dtype)
+            self._free = queue.SimpleQueue()
+            for slot in range(cam.buffer_frames):
+                self._free.put(slot)
         self._work: queue.SimpleQueue = queue.SimpleQueue()
         self._results: queue.SimpleQueue = queue.SimpleQueue()
         self._stop = threading.Event()
@@ -339,6 +358,12 @@ class Pipeline:
         self._canvas = np.zeros((self._slit, disp.canvas_width), np.uint8)
         # Same ring, same columns: what the model saw (before classification), for the raw zone.
         self._raw_canvas = np.full((self._slit, disp.canvas_width), np.nan, np.float32)
+        self._canvas_lines = np.full(disp.canvas_width, -1, np.int64)   # line number of each column
+        # Reflectance calibration (GUI "Reflectance..."): the newest binned lines before the
+        # reflectance step, kept only while a capture is open (see start_calibration_capture).
+        self._cal_ring: np.ndarray | None = None
+        self._cal_ids: np.ndarray | None = None
+        self._cal_pos = 0
         self._canvas_col = 0
         self._canvas_filled = 0
         self._canvas_line = 0
@@ -369,12 +394,13 @@ class Pipeline:
             self._threads.append(thread)
             thread.start()
         if self.camera is not None:
-            logger.info("Pipeline started: live camera %s (free-running), %d workers, %d buffers",
-                        self.sources[0].name, self._n_workers, len(self._buffers))
+            logger.info("Pipeline started: live camera %s (free-running, read in its own %s), %d workers, "
+                        "%d buffers", self.sources[0].name, 'process' if self._process_reader else 'thread',
+                        self._n_workers, self._n_buffers)
         else:
             logger.info("Pipeline started: %s lines/s target, %d workers, %d buffers, overrun=%s",
                         'max' if self._fps == 0 else f"{self._fps:g}", self._n_workers,
-                        len(self._buffers), self.config.camera.overrun)
+                        self._n_buffers, self.config.camera.overrun)
 
     def stop(self, timeout: float = 3.0) -> bool:
         """Stop all threads; returns False if one is still busy after ``timeout``.
@@ -382,9 +408,12 @@ class Pipeline:
         A live camera is closed by its own thread on the way out; if the pipeline never started,
         it is closed here. ``timeout`` is at least one ``live.read_timeout_ms`` read plus 1 s, so a
         read in progress can end. A camera thread still blocked in the SDK after that keeps the
-        camera (closing it from this thread could crash the SDK): call ``stop`` again.
+        camera (closing it from this thread could crash the SDK): call ``stop`` again. A camera
+        process never blocks the stop: one stuck in the SDK is terminated (``close_timeout_s``).
         """
-        if self.camera is not None:
+        if self._process_reader:
+            timeout = max(timeout, self.camera.close_timeout_s + 5.0)
+        elif self.camera is not None:
             timeout = max(timeout, self.config.live.read_timeout_ms / 1000.0 + 1.0)
         self._stop.set()
         deadline = time.perf_counter() + timeout
@@ -402,6 +431,10 @@ class Pipeline:
             self._timer = None
         if self.camera is not None and not any(t.name == 'camera' and t.is_alive() for t in self._threads):
             self._close_camera()
+        if self._shared is not None and not any(t.is_alive() for t in self._threads):
+            self._buffers = None                 # the workers are done with the shared frames
+            self._shared.release()
+            self._shared = None
         if self._state in ('running', 'starting'):
             self._state = 'stopped'
         return not any(t.is_alive() for t in self._threads)
@@ -487,6 +520,60 @@ class Pipeline:
         """``{step: bool}`` that the workers currently apply for ``plans[plan_index]``."""
         return _effective(self.plans[plan_index], self._steps)
 
+    def start_calibration_capture(self, max_lines: int = 256) -> None:
+        """Keep the newest ``max_lines`` binned lines *before* the reflectance step.
+
+        For a reflectance calibration drawn on the belt map: :meth:`calibration_capture` returns
+        them by line number (the numbers of ``Snapshot.raw_lines``). Costs one copy per line and
+        ``max_lines x slit x bands x 4`` bytes, only until :meth:`stop_calibration_capture`.
+        """
+        plan = self.plans[0]
+        shape = (int(max_lines), self._slit, plan.n_columns)
+        with self._lock:
+            self._cal_ring = np.zeros(shape, np.float32)
+            self._cal_ids = np.full(int(max_lines), -1, np.int64)
+            self._cal_pos = 0
+        logger.info("Calibration capture: newest %d lines (%.0f MB)", max_lines, self._cal_ring.nbytes / 1e6)
+
+    def calibration_capture(self, first_line: int | None = None, last_line: int | None = None):
+        """``(line numbers, binned lines (n, slit, bands) float32)`` held now, oldest first.
+
+        ``first_line`` / ``last_line`` (inclusive) select a range; nothing captured -> empty arrays.
+        """
+        with self._lock:
+            if self._cal_ring is None:
+                return np.empty(0, np.int64), np.empty((0, self._slit, self.plans[0].n_columns), np.float32)
+            ids = self._cal_ids.copy()
+            keep = ids >= 0
+            if first_line is not None:
+                keep &= ids >= int(first_line)
+            if last_line is not None:
+                keep &= ids <= int(last_line)
+            index = np.flatnonzero(keep)
+            index = index[np.argsort(ids[index])]
+            return ids[index], self._cal_ring[index].copy()
+
+    def calibration_count(self) -> int:
+        """Lines the calibration capture holds now (0 = not capturing)."""
+        ids = self._cal_ids
+        return 0 if ids is None else int((ids >= 0).sum())
+
+    def stop_calibration_capture(self) -> None:
+        with self._lock:
+            self._cal_ring = self._cal_ids = None
+
+    def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0) -> None:
+        """Use new reflectance factors from the next line on and switch the step on."""
+        plan = self.plans[plan_index]
+        factors = np.asarray(factors, np.float32)
+        if factors.shape[-1] != plan.n_columns or (factors.ndim == 2 and factors.shape[0] != self._slit):
+            raise ValueError(f"factors {factors.shape} do not fit ({self._slit}, {plan.n_columns})")
+        plan.reflectance_factors = factors          # one reference swap: a worker sees old or new
+        plan.reflectance_placeholder = False
+        plan.steps['reflectance'] = {'available': True, 'on': True, 'why': label}
+        plan.provenance['reflectance'] = (label, 'drawn on RAW')
+        self.set_steps(reflectance=True)
+
     def _backend_note(self) -> str:
         if self.plans[0].stage == 'binned':
             return ''
@@ -531,13 +618,15 @@ class Pipeline:
             rs, cs = max(1, int(step[0])), max(1, int(step[1]))
             offsets = np.arange(n - 1, -1, -cs)[::-1]              # from the oldest; the newest is kept
             canvas = self._canvas[::rs, columns[offsets]]
-            raw_canvas = self._raw_canvas[::rs, columns[offsets[offsets >= n - int(raw_columns)]]]
+            raw_columns_idx = columns[offsets[offsets >= n - int(raw_columns)]]
+            raw_canvas = self._raw_canvas[::rs, raw_columns_idx]
+            raw_lines = self._canvas_lines[raw_columns_idx]
             snap = Snapshot(
                 state=self._state, error=self._error, elapsed_s=time.perf_counter() - self._t0,
                 target_fps=self._fps, camera_fps=self._camera_fps, processed_fps=self._processed_fps,
                 frames_delivered=self._delivered, lines_processed=self._processed, lines_lost=self._lost,
                 schedule_slips=self._slips,
-                buffers_in_use=len(self._buffers) - self._free.qsize(), buffer_frames=len(self._buffers),
+                buffers_in_use=self._n_buffers - self._free.qsize(), buffer_frames=self._n_buffers,
                 latency_ms=latency, stage_ms=dict(self._stage_ms), backend=self.backend_name,
                 stage_stats={b: {'avg': {n: t / c for n, (t, c) in st.items() if c},
                                  'peak': dict(self._stage_peak.get(b, {}))}
@@ -549,13 +638,16 @@ class Pipeline:
                 raw_frame=self._raw_frame, position=self._position,
                 source_kind='file' if self.camera is None else 'camera',
                 lines_lost_camera=self._lost_camera, grab_timeouts=self._grab_timeouts,
-                line_clock=self._line_clock)
+                line_clock=self._line_clock, raw_lines=raw_lines,
+                calibration_lines=0 if self._cal_ids is None else int((self._cal_ids >= 0).sum()))
         return snap
 
     # --------------------------------------------------------------------------- camera ---
 
     def _camera_loop(self) -> None:
-        if self.camera is not None:
+        if self._process_reader:
+            self._live_process_loop()
+        elif self.camera is not None:
             self._live_loop()
         else:
             self._playback_loop()
@@ -750,6 +842,64 @@ class Pipeline:
             for _ in range(self._n_workers):
                 self._work.put(None)
 
+    def _live_process_loop(self) -> None:
+        """Take the frames a camera process wrote into the shared buffers (``live.reader = "process"``).
+
+        The camera process (``camera_process.py``) reads the camera with :meth:`_live_loop`'s
+        rules - a free buffer before each read, overruns and camera gaps counted as lost lines -
+        and announces each frame with a job record. This thread turns the records into jobs and
+        copies the process's counters into the statistics. Nothing here can slow the camera: if
+        this process is busy, frames wait in the buffers, and only when all are full does the
+        camera process count overruns.
+        """
+        camera = self.camera
+        rate_t, rate_n, rate_received = time.perf_counter(), 0, 0
+        received = 0
+
+        def update_counters(now, rates=True):
+            nonlocal rate_t, rate_n, rate_received, received
+            c = camera.counters()
+            received = c['received']
+            self._lost, self._lost_camera = c['lost'], c['lost_camera']
+            self._grab_timeouts, self._line_clock = c['timeouts'], c['line_clock']
+            if rates and now - rate_t >= _RATE_PERIOD_S:
+                self._camera_fps = rate_n / (now - rate_t)
+                self._fps = (received - rate_received) / (now - rate_t)
+                rate_t, rate_n, rate_received = now, 0, received
+
+        try:
+            if not self._wait_workers_ready():
+                return
+            if not camera.start_stream(self._shared, self._stop):
+                logger.info("Camera start abandoned: stop requested")
+                return
+            self._t0 = time.perf_counter()
+            self._state = 'running'
+            rate_t = next_check = time.perf_counter()
+            while not self._stop.is_set():
+                job = camera.next_job(timeout=0.05)     # waits (gives the GIL away) only when idle
+                now = time.perf_counter()
+                if job is not None:
+                    seq, line, slot, t_sensor, t_arrival = job
+                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival))
+                    self._delivered = seq + 1
+                    rate_n += 1
+                if job is None or now >= next_check:
+                    next_check = now + 0.1
+                    camera.check()                       # raises the camera process's error
+                    update_counters(now)
+        except Exception as exc:
+            self._fail('camera', exc)
+        finally:
+            self._camera_done = True
+            self._close_camera()                         # ends the camera process
+            update_counters(time.perf_counter(), rates=False)
+            self._camera_fps = 0.0
+            logger.info("Camera process ended after %d frames (%d lost in the camera, %d read timeouts)",
+                        received, self._lost_camera, self._grab_timeouts)
+            for _ in range(self._n_workers):
+                self._work.put(None)
+
     def _wait_slot(self):
         while not self._stop.is_set():
             try:
@@ -795,6 +945,7 @@ class Pipeline:
                             inverted=on['flip'], profiler=prof)
                     else:
                         binned = frame
+                    pre = binned.astype(np.float32, copy=True) if self._cal_ring is not None else None
                     if on['reflectance']:                             # last step before the model
                         with prof.time('reflectance'):
                             binned = apply_reflectance(binned, plan.reflectance_factors)
@@ -807,7 +958,7 @@ class Pipeline:
                     self._display_t = now
                     self._raw_frame = frame.copy()
                 self._free.put(job.slot)                       # buffer back to the camera
-                self._results.put((job, ids, intensity))
+                self._results.put((job, ids, intensity, pre))
         except Exception as exc:
             self._fail(f'worker-{k}', exc)
         finally:
@@ -871,9 +1022,9 @@ class Pipeline:
                 elif item:
                     pending[item[0].seq] = item
                 while next_seq in pending:
-                    job, ids, intensity = pending.pop(next_seq)
+                    job, ids, intensity, pre = pending.pop(next_seq)
                     next_seq += 1
-                    self._account(job, ids, job.line - last_line - 1, intensity)
+                    self._account(job, ids, job.line - last_line - 1, intensity, pre)
                     last_line = job.line
                     rate_n += 1
 
@@ -917,19 +1068,26 @@ class Pipeline:
             if self._state in ('running', 'starting'):
                 self._state = 'stopped' if self._stop.is_set() else 'finished'
 
-    def _account(self, job: _Job, ids: np.ndarray, gap: int, intensity: np.ndarray | None = None) -> None:
+    def _account(self, job: _Job, ids: np.ndarray, gap: int, intensity: np.ndarray | None = None,
+                 pre: np.ndarray | None = None) -> None:
         """One line, in order. ``gap`` lines before it were lost to overrun."""
         counts = np.bincount(ids, minlength=256)
         t_done = time.perf_counter()
         with self._lock:
             if gap > 0:
                 self._draw_lost(gap)
+            if pre is not None and self._cal_ring is not None and pre.shape == self._cal_ring.shape[1:]:
+                k = self._cal_pos % self._cal_ring.shape[0]
+                self._cal_ring[k] = pre
+                self._cal_ids[k] = self._canvas_line
+                self._cal_pos += 1
             self._counts += counts
             self._counted_lines += 1
             self._processed += 1
             if self._canvas_line % self._stride == 0:
                 self._canvas[:, self._canvas_col] = ids
                 self._raw_canvas[:, self._canvas_col] = np.nan if intensity is None else intensity
+                self._canvas_lines[self._canvas_col] = self._canvas_line
                 self._advance_canvas(1)
             self._canvas_line += 1
             self._latency[self._latency_n % _LATENCY_WINDOW] = (t_done - job.t_sensor) * 1000.0
@@ -945,6 +1103,7 @@ class Pipeline:
         for _ in range(min(columns, width)):
             self._canvas[:, self._canvas_col] = LOST_CLASS
             self._raw_canvas[:, self._canvas_col] = np.nan
+            self._canvas_lines[self._canvas_col] = -1
             self._advance_canvas(1)
 
     def _advance_canvas(self, n: int) -> None:

@@ -28,3 +28,6 @@ data/
 
 *.csv
 *.joblib
+# Reflectance factors made at run time (white_reference folder, GUI history backups)
+reflectance/from_white/
+reflectance/history/

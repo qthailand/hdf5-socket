@@ -161,9 +161,12 @@ def train_smart_bands_sgd(num_selected_bands: int = 30, hdr_path: str = 'dataset
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Train the linear (SGD) model on a labelled ENVI cube.')
-    parser.add_argument('--hdr', default='dataset/first.bip.hdr', help='ENVI header of the training cube')
-    parser.add_argument('--labels', default='dataset/first.bip.json', help='COCO polygons of that cube')
+    parser = argparse.ArgumentParser(
+        description='Train the linear (SGD) model on a labelled ENVI cube.')
+    parser.add_argument('--hdr', default='dataset/poa.bip.hdr',
+                        help='ENVI header of the training cube')
+    parser.add_argument('--labels', default='dataset/poa.bip.json',
+                        help='COCO polygons of that cube')
     parser.add_argument('--out', default='rf_coco_model.joblib', help='model artifact to write')
     parser.add_argument('--bands', type=int, default=30, help='bands kept by SelectKBest')
     args = parser.parse_args()

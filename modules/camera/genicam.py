@@ -9,7 +9,10 @@ Data conventions:
     vendor ``SensorPixelSize`` node (``SensorBpp8/10/12``, from ``sensor_pixel_size``; the
     original code always used 10). How many bits each pixel carries is taken from the
     transmitted ``PixelFormat`` (or the buffer's ``data_format``) when it names 8/10/12/14 bits;
-    when it is ``Mono16``/unknown, from the ``SensorPixelSize`` read back; else 12:
+    when it is ``Mono16``/unknown, from the ``SensorPixelSize`` read back; else 12. Buffers are
+    ``Mono12Packed`` (the SVS fxo992's only format besides ``Mono8``) buffers are fetched raw and
+    unpacked by :func:`unpack_mono12packed` in one pass instead of harvesters' expansion (7-10 ms
+    per 1024 x 1280 frame, which capped the reader below the camera's 121.6 fps):
 
     * 8 bits  -> values unchanged (0..255), ``bit_depth`` 8;
     * 10/12/14 bits -> shifted left into the 16-bit range (10 ``<< 6``, 12 ``<< 4``,
@@ -43,6 +46,60 @@ try:
     _WRITABLE_ACCESS = (int(EAccessMode.RW), int(EAccessMode.WO))
 except Exception:                       # older genicam package: writability found by trying
     _WRITABLE_ACCESS = None
+
+try:
+    from harvesters.util.pfnc import dict_by_ints as _PFNC_NAMES   # PFNC value -> name, as harvesters
+except Exception:
+    _PFNC_NAMES = {}
+
+#: Unpacked formats read in place from the raw buffer: name -> bytes per pixel.
+_UNPACKED_BYTES = {"Mono8": 1, "Mono10": 2, "Mono12": 2, "Mono14": 2, "Mono16": 2}
+
+
+def _unpack_mono12packed_numpy(src, out, shift):
+    """Mono12Packed rows ``src`` (uint8, 3 bytes per 2 pixels) -> ``out`` (uint16) << ``shift``."""
+    h, w = out.shape
+    b = src[:, :3 * (w // 2)].reshape(h, w // 2, 3)
+    mid = b[..., 1].astype(np.uint16)
+    out[:, 0::2] = ((b[..., 0].astype(np.uint16) << 4) | (mid & 0xF)) << shift
+    out[:, 1::2] = ((b[..., 2].astype(np.uint16) << 4) | (mid >> 4)) << shift
+
+
+try:
+    import numba
+
+    @numba.njit(nogil=True, cache=True)
+    def _unpack_mono12packed_numba(src, out, shift):
+        h, w = out.shape
+        for y in range(h):
+            for i in range(w // 2):
+                b0 = np.uint16(src[y, 3 * i])
+                b1 = np.uint16(src[y, 3 * i + 1])
+                b2 = np.uint16(src[y, 3 * i + 2])
+                out[y, 2 * i] = ((b0 << 4) | (b1 & 15)) << shift
+                out[y, 2 * i + 1] = ((b2 << 4) | (b1 >> 4)) << shift
+except Exception:                       # no numba: numpy (about as slow as harvesters' expansion)
+    _unpack_mono12packed_numba = None
+
+
+def unpack_mono12packed(src, out, shift):
+    """GigE Vision ``Mono12Packed`` -> ``uint16`` in one pass, values as harvesters' PFNC expansion.
+
+    Two pixels in three bytes: ``b0`` = p0[11:4], ``b1`` = p1[3:0] << 4 | p0[3:0], ``b2`` = p1[11:4].
+    harvesters expands it with about ten numpy passes (7-10 ms for 1024 x 1280: with it the reader
+    of an fxo992 tops out near 99 of 121.6 fps); with numba this writes the 16-bit-scaled values
+    (``<< shift``) straight into ``out`` in ~1.5 ms and releases the GIL meanwhile. Without numba a
+    numpy version runs, about as slow as harvesters'.
+
+    Args:
+        src: ``(height, >= 3 * width / 2)`` ``uint8`` rows of the raw buffer (padding allowed).
+        out: ``(height, width)`` C-contiguous ``uint16`` destination; ``width`` must be even.
+        shift: Left shift applied to the 12-bit values (4 -> full 16-bit scale).
+    """
+    if _unpack_mono12packed_numba is not None:
+        _unpack_mono12packed_numba(src, out, shift)
+    else:
+        _unpack_mono12packed_numpy(src, out, shift)
 
 faulthandler.enable()
 
@@ -150,6 +207,9 @@ class GenICamBackend(AbstractCameraBackend):
         self._gain_range = (0, 255)
         self._supported_bins = ()
         self._source_bits = 12              # transmitted bits per pixel (see pixel_format_bits)
+        # buffer data_format -> bits, worked out on the first frame of each format so _fetch reads
+        # no camera node per frame (a node read is a GigE round trip); emptied by _refresh_info
+        self._bits_by_format: dict = {}
         self._target_temp_node: str | None = None    # writable TEC set-point found at open
         self._cooler_enable_node: str | None = None
         self._cooling_state_node: str | None = None
@@ -327,6 +387,7 @@ class GenICamBackend(AbstractCameraBackend):
         height = int(self._read_node("Height") or 0)
         pixel_format = self._read_node("PixelFormat")
         self._source_bits = self._bits_for(pixel_format)
+        self._bits_by_format = {}           # format or SensorPixelSize may have changed
         self._info = CameraBackendInfo(
             camera_id=self.camera_index,
             bit_depth=8 if self._source_bits <= 8 else 16,
@@ -583,6 +644,8 @@ class GenICamBackend(AbstractCameraBackend):
                 self.set_bin(int(self.default_bin))
             except Exception as e:
                 print(f"[GenICam] Warning: could not apply default_bin={self.default_bin}: {e}")
+        # compile (or load from numba's cache) the Mono12Packed unpacker now, not on the first frame
+        unpack_mono12packed(np.zeros((1, 3), np.uint8), np.zeros((1, 2), np.uint16), 4)
 
     def _close_device(self) -> None:
         """Set the stop event and destroy the acquirer and Harvester; errors are swallowed."""
@@ -661,7 +724,7 @@ class GenICamBackend(AbstractCameraBackend):
             scaled to 16 bits otherwise - or ``None`` on timeout, incomplete buffer, size mismatch
             with ``info``, error or stop event.
         """
-        return self._fetch(timeout_ms, self._convert)
+        return self._fetch(timeout_ms, None)
 
     def read_frame_raw_into(self, provide, timeout_ms: int = 1000) -> np.ndarray | None:
         """``read_frame_raw`` that writes the converted frame into a caller-supplied buffer.
@@ -680,13 +743,25 @@ class GenICamBackend(AbstractCameraBackend):
             The provided buffer (overwritten by the next call), a new array when
             ``provide`` gave none, or ``None`` as for ``read_frame_raw``.
         """
-        return self._fetch(timeout_ms, lambda data, bits: self._convert_into(data, bits, provide))
+        return self._fetch(timeout_ms, provide)
 
-    def _fetch(self, timeout_ms, convert):
-        """Fetch one complete buffer of the expected size and return ``convert(data2d, bits)``.
+    def _fetch(self, timeout_ms, provide):
+        """Fetch one complete buffer of the expected size and return it converted.
+
+        Args:
+            timeout_ms: Maximum wait in milliseconds.
+            provide: ``read_frame_raw_into``'s callable, or ``None`` for a new array.
 
         Sets ``last_fetch_timing`` to ``(cam_wait_ms, convert_ms)``: the wait for the
         buffer, then the checks and conversion; ``None`` when no frame is returned.
+
+        With ``PixelFormat`` ``Mono12Packed`` the buffer is fetched raw (:meth:`_fetch_raw`):
+        harvesters' own expansion of that format costs 7-10 ms per 1024 x 1280 frame. Every
+        other format goes through harvesters' payload (:meth:`_fetch_payload`). The values are
+        the same either way.
+
+        Camera nodes are read only when the frame size differs from ``info`` or on the first
+        frame of a pixel format (its bits are then kept in ``_bits_by_format``), not per frame.
         """
         self.last_fetch_timing = None
         self.last_frame_info = None
@@ -696,6 +771,32 @@ class GenICamBackend(AbstractCameraBackend):
         if self._stop_event is not None and self._stop_event.is_set():
             return None
 
+        if self._info.image_format == "Mono12Packed":
+            return self._fetch_raw(timeout_ms, provide)
+        return self._fetch_payload(timeout_ms, provide)
+
+    def _frame_size_ok(self, h, w) -> bool:
+        """``(h, w)`` matches ``info`` (re-read once: info may be stale right after a bin change)."""
+        if self._info.height > 0 and self._info.width > 0:
+            if h != self._info.height or w != self._info.width:
+                self._refresh_info()
+                if h != self._info.height or w != self._info.width:
+                    return False
+        return True
+
+    def _bits_of(self, data_format) -> int:
+        """Bits per pixel of a buffer's format; nodes are read on its first frame only."""
+        if data_format is None:
+            return self._source_bits
+        bits = self._bits_by_format.get(data_format)
+        if bits is None:
+            if data_format != self._info.image_format:
+                self._refresh_info()               # format changed on the camera: follow it
+            bits = self._bits_by_format[data_format] = self._bits_for(data_format)
+        return bits
+
+    def _fetch_payload(self, timeout_ms, provide):
+        """harvesters' payload path: it expands the pixels, ``_convert``/``_convert_into`` scale them."""
         try:
             start = time.perf_counter()
             with self._ia.fetch(timeout=timeout_ms / 1000.0) as buffer:   # harvesters takes seconds
@@ -705,19 +806,12 @@ class GenICamBackend(AbstractCameraBackend):
 
                 comp = buffer.payload.components[0]
                 h, w = comp.height, comp.width
+                if not self._frame_size_ok(h, w):
+                    return None
 
-                if self._info.height > 0 and self._info.width > 0:
-                    if h != self._info.height or w != self._info.width:
-                        # Info may simply be stale (e.g. right after a bin change).
-                        self._refresh_info()
-                        if h != self._info.height or w != self._info.width:
-                            return None
-
-                data_format = getattr(comp, "data_format", None)
-                if data_format is not None and data_format != self._info.image_format:
-                    self._refresh_info()               # format changed on the camera: follow it
-                bits = self._bits_for(data_format) if data_format is not None else self._source_bits
-                frame = convert(comp.data.reshape(h, w), bits)
+                bits = self._bits_of(getattr(comp, "data_format", None))
+                data = comp.data.reshape(h, w)
+                frame = self._convert(data, bits) if provide is None else self._convert_into(data, bits, provide)
                 self.last_fetch_timing = ((received - start) * 1000.0, (time.perf_counter() - received) * 1000.0)
                 self.last_frame_info = (self._camera_ns(getattr(buffer, 'timestamp', None)),
                                         getattr(buffer, 'frame_id', None))
@@ -725,6 +819,89 @@ class GenICamBackend(AbstractCameraBackend):
 
         except Exception:
             return None
+
+    def _fetch_raw(self, timeout_ms, provide):
+        """The raw GenTL buffer (no harvesters payload), converted by :meth:`_convert_raw` and queued back."""
+        try:
+            start = time.perf_counter()
+            raw = self._ia.fetch(timeout=timeout_ms / 1000.0, is_raw=True)   # harvesters takes seconds
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        received = time.perf_counter()
+        try:
+            if getattr(raw, 'is_incomplete', False):
+                return None
+            h, w = int(raw.height), int(raw.width)
+            if not self._frame_size_ok(h, w):
+                return None
+            data_format = self._format_of(raw)
+            bits = self._bits_of(data_format)
+            frame = self._convert_raw(raw, h, w, data_format, bits, provide)
+            if frame is None:
+                return None
+            self.last_fetch_timing = ((received - start) * 1000.0, (time.perf_counter() - received) * 1000.0)
+            self.last_frame_info = (self._camera_ns(self._timestamp_of(raw)), getattr(raw, 'frame_id', None))
+            return frame
+        except Exception:
+            return None
+        finally:
+            try:
+                raw.parent.queue_buffer(raw)       # back to the acquisition pool
+            except Exception:
+                pass
+
+    def _convert_raw(self, raw, h, w, data_format, bits, provide):
+        """The converted frame of a raw GenTL buffer, or ``None`` if it holds too few bytes."""
+        try:
+            padding = int(raw.padding_x)
+        except Exception:
+            padding = 0
+        if data_format == "Mono12Packed" and w % 2 == 0:
+            line = w * 3 // 2 + padding
+            data = np.frombuffer(raw.raw_buffer, dtype=np.uint8)
+            if data.size < h * line:
+                return None
+            out = provide((h, w)) if provide is not None else None
+            if out is None:
+                out = np.empty((h, w), np.uint16)
+            unpack_mono12packed(data[:h * line].reshape(h, line), out, 16 - int(bits) if 8 < bits < 16 else 0)
+            return out
+        size = _UNPACKED_BYTES.get(data_format)
+        if size is not None:
+            line = w * size + padding
+            data = np.frombuffer(raw.raw_buffer, dtype=np.uint8)
+            if data.size < h * line:
+                return None
+            pixels = data[:h * line].reshape(h, line)[:, :w * size]
+            data2d = pixels if size == 1 else pixels.view(np.uint16)
+        else:                                      # format changed under us: harvesters' own expansion
+            from harvesters.core import Buffer
+            payload = Buffer(module=raw, node_map=self._ia.remote_device.node_map, acquire=self._ia).payload
+            comp = payload.components[0]
+            data2d = comp.data.reshape(h, w)
+        if provide is not None:
+            return self._convert_into(data2d, bits, provide)
+        return self._convert(data2d, bits)
+
+    def _format_of(self, raw):
+        """Pixel format name of a raw buffer (``PixelFormat`` from ``info`` if it has none)."""
+        try:
+            value = raw.pixel_format
+        except Exception:
+            return self._info.image_format
+        return _PFNC_NAMES.get(value, self._info.image_format)
+
+    @staticmethod
+    def _timestamp_of(raw):
+        """The value harvesters' ``Buffer.timestamp`` gives: ``timestamp_ns``, else ticks, else 0."""
+        for name in ("timestamp_ns", "timestamp"):
+            try:
+                return getattr(raw, name)
+            except Exception:
+                continue
+        return 0
 
     def _camera_ns(self, ticks):
         """Camera timestamp ticks -> nanoseconds (``None`` without a tick frequency or value)."""
