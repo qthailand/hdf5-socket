@@ -26,7 +26,9 @@ class SensorDialog(QDialog):
         self._config = config
         self._backend = plan.camera_backend or config.acquisition.camera_backend
         self._config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
-        folder = config.calibration_dir / 'dark_frames' / self._backend
+        from sim_config import calibration_folder
+        self._plan = plan
+        folder, self._dark_where = calibration_folder(config, plan, 'dark')
         self._library = DarkFrameLibrary(str(folder)) if folder.is_dir() else None
         self._darks = self._library.list_keys() if self._library else []
 
@@ -50,11 +52,12 @@ class SensorDialog(QDialog):
         for key in sorted(self._darks, key=lambda k: (k['bin'], k['exposure'], k['gain'])):
             self.preset.addItem(f"bin {key['bin']} · {key['exposure']:g} ms · gain {key['gain']:g}  ({key['filename']})",
                                 (key['bin'], key['exposure'], key['gain']))
-        self.preset.setToolTip("Values for which a dark frame is stored (calibration/dark_frames/"
-                               f"{self._backend}/)")
+        self.preset.setToolTip(f"Values for which a dark frame is stored ({self._dark_where})")
         self.preset.currentIndexChanged.connect(self._use_preset)
         self.dark_note = QLabel("")
         self.dark_note.setWordWrap(True)
+        self.refl_note = QLabel("")
+        self.refl_note.setWordWrap(True)
         self.rate_note = QLabel("")
         self.rate_note.setObjectName("metricCaption")
         self.save_box = QCheckBox(f"Save to {self._config_path.name}")
@@ -72,6 +75,7 @@ class SensorDialog(QDialog):
         form.addRow("Gain", self.gain)
         form.addRow("Bin", self.camera_bin)
         form.addRow("Dark frame", self.dark_note)
+        form.addRow("Reflectance", self.refl_note)
         form.addRow("", self.rate_note)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
         buttons.addButton("Apply (restart)", QDialogButtonBox.AcceptRole)
@@ -105,7 +109,19 @@ class SensorDialog(QDialog):
             self.dark_note.setText(f"⚠ no dark for bin {values['camera_bin']}, {values['exposure_ms']:g} ms, gain "
                                    f"{values['gain']:g}: the Dark step will be off and reflectance will be wrong. "
                                    "Record a dark for these values or pick a stored one.")
+        self.refl_note.setText(self._reflectance_text(values))
         self.rate_note.setText(f"max line rate by exposure: {1000.0 / values['exposure_ms']:,.0f} lines/s")
+
+    def _reflectance_text(self, values) -> str:
+        from dataclasses import replace
+        from sim_config import profile_reflectance_path
+        if self._plan.camera_id is None:
+            return "camera has no model/serial: reflectance/<source>.npy is used"
+        path = profile_reflectance_path(replace(self._plan, camera_bin=values['camera_bin'], gain=values['gain']))
+        if path is not None and path.is_file():
+            return f"✓ {path.name} (scaled to the exposure)"
+        return (f"⚠ no {path.name if path else 'factors'} for bin {values['camera_bin']}, gain {values['gain']:g}: "
+                "Reflectance will be off until you calibrate (Reflectance...)")
 
     def values(self) -> dict:
         return {'exposure_ms': float(self.exposure.value()), 'gain': float(self.gain.value()),

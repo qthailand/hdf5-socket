@@ -145,6 +145,7 @@ class _Job:
     index: int
     cycle: int
     t_queued: float     # perf_counter time the line entered the buffers (queue wait starts here)
+    model: tuple = None  # (generation, classifier, columns per plan) this line is classified with
 
 
 @dataclass
@@ -184,6 +185,8 @@ class Snapshot:
     line_clock: str = 'schedule'     # sensor time = file: 'schedule'; live: 'camera' timestamps or 'arrival'
     raw_lines: np.ndarray | None = None   # line number of each raw_canvas column (-1 = none yet)
     calibration_lines: int = 0       # lines held by the calibration capture (0 = not capturing)
+    model_generation: int = 0        # counts and canvas belong to this model (see Pipeline.set_classifier)
+    canvas_lines: np.ndarray | None = None   # line number of each canvas column (-1 = lost / none yet)
 
 
 # ----------------------------------------------------------------------------- pipeline ---
@@ -223,7 +226,7 @@ def build_pipeline(config) -> 'Pipeline':
 
 
 def _bind_pipeline(config, sources, camera) -> 'Pipeline':
-    from inference_engine import PushbroomLineClassifier, SpeedTestClassifier
+    from inference_engine import SpeedTestClassifier, load_classifier
     from sim_config import build_plan
 
     src_cfg = config.source
@@ -231,12 +234,12 @@ def _bind_pipeline(config, sources, camera) -> 'Pipeline':
         classifier = SpeedTestClassifier()
         logger.warning("model.path = none: %s", classifier.path)
     else:
-        classifier = PushbroomLineClassifier(config.resolve(config.model.path))
+        classifier = load_classifier(config.resolve(config.model.path))
     plans = []
     for src in sources:
         plan = build_plan(config, src)
-        plan.columns, binding = classifier.bind(plan.wavelengths, plan.n_columns, config.model.band_tolerance_nm)
-        plan.provenance['model bands'] = (binding, os.path.basename(classifier.path))
+        plan.columns, binding = classifier.bind(plan.wavelengths, plan.n_columns, config.model.band_tolerance_nm,
+                                                config.model.resample)
         if camera is not None:
             plan.provenance['input'] = (f"live camera {src.name} {src.frame_shape} {np.dtype(src.dtype).name}, "
                                         f"read timeout {config.live.read_timeout_ms} ms", 'source.kind = camera')
@@ -247,24 +250,27 @@ def _bind_pipeline(config, sources, camera) -> 'Pipeline':
                 f"cache={src_cfg.cache}")
         if src.storage == 'stream':
             logger.warning("%s is streamed: its decoding competes with the workers, timing is pessimistic", src.name)
-        refl_on = plan.steps.get('reflectance', {}).get('on', False)
-        units = classifier.input_units
-        if units == 'any':
-            plan.provenance['model input'] = ('any (speed-only model)', 'model.path = none')
-            plans.append(plan)
-            logger.info("%s: %s %s %s\n%s", src.name, _frames_text(src), src.frame_shape, src.dtype,
-                        plan.summary())
-            continue
-        plan.provenance['model input'] = (
-            f"{units}" + ("" if (units == 'reflectance') == refl_on else
-                          f" — WARNING: reflectance step is {'on' if refl_on else 'off'}"),
-            'model artifact' if classifier.input_units_declared else 'assumed (artifact has no input_units)')
-        if (units == 'reflectance') != refl_on:
-            logger.warning("%s: model expects %s but the reflectance step is %s", src.name, units,
-                           'on' if refl_on else 'off')
+        _describe_model(plan, classifier, binding, src.name)
         logger.info("%s: %s %s %s\n%s", src.name, _frames_text(src), src.frame_shape, src.dtype, plan.summary())
         plans.append(plan)
     return Pipeline(config, sources, plans, classifier, camera=camera)
+
+
+def _describe_model(plan, classifier, binding: str, source_name: str) -> None:
+    """Write the model lines of ``plan.provenance`` (band binding, input units against the plan)."""
+    plan.provenance['model bands'] = (binding, os.path.basename(classifier.path))
+    refl_on = plan.steps.get('reflectance', {}).get('on', False)
+    units = classifier.input_units
+    if units == 'any':
+        plan.provenance['model input'] = ('any (speed-only model)', 'model.path = none')
+        return
+    plan.provenance['model input'] = (
+        f"{units}" + ("" if (units == 'reflectance') == refl_on else
+                      f" — WARNING: reflectance step is {'on' if refl_on else 'off'}"),
+        'model artifact' if classifier.input_units_declared else 'assumed (artifact has no input_units)')
+    if (units == 'reflectance') != refl_on:
+        logger.warning("%s: model expects %s but the reflectance step is %s", source_name, units,
+                       'on' if refl_on else 'off')
 
 
 def _frames_text(src) -> str:
@@ -295,6 +301,10 @@ class Pipeline:
         self.sources = sources
         self.plans = plans
         self.classifier = classifier
+        # The model of a line travels with the line (the camera thread stamps it), so
+        # set_classifier() changes it at one line: (generation, classifier, columns per plan).
+        self._model = (0, classifier, [plan.columns for plan in plans])
+        self._drawn_generation = 0               # generation of the lines in counts / canvas (lock)
         self.camera = camera
         cam, disp = config.camera, config.display
         # A live camera free-runs; its measured rate takes the place of the simulated line clock.
@@ -364,9 +374,18 @@ class Pipeline:
         self._cal_ring: np.ndarray | None = None
         self._cal_ids: np.ndarray | None = None
         self._cal_pos = 0
+        # Spectrum preview (GUI: click on the belt map): the newest lines as the model received
+        # them, by line number, kept only while switched on (see start_spectrum_history).
+        self._spec_ring: np.ndarray | None = None
+        self._spec_ids: np.ndarray | None = None
         self._canvas_col = 0
         self._canvas_filled = 0
         self._canvas_line = 0
+        # Per-line class counts of the newest lines (ring by line number): snapshot() can leave out
+        # the lines still in the GUI's raw zone, so the statistics follow the classified zone.
+        recent = int(np.ceil(disp.canvas_width * disp.canvas_line_stride * disp.raw_zone_fraction)) + 1
+        self._recent_counts = np.zeros((recent, 256), np.int32)
+        self._recent_counted = np.zeros(recent, bool)
         self._position = (sources[0].name, 0, sources[0].n_frames, 0)
         self._stage_ms: dict[str, float] = {}
         self._stage_totals: dict[str, dict[str, list]] = {}   # backend -> stage -> [ms sum, n]
@@ -456,11 +475,52 @@ class Pipeline:
             self._stage_totals.clear()
             self._stage_peak.clear()
 
-    def reset_counts(self) -> None:
-        """Start a new batch: class counts restart from zero (throughput counters keep running)."""
+    def _held(self, lines: int) -> tuple[np.ndarray, int]:
+        """(class counts, counted lines) of the newest ``lines`` belt lines. Lock held."""
+        ring = len(self._recent_counted)
+        hold = min(int(lines), ring, self._canvas_line)
+        if hold <= 0:
+            return np.zeros(256, np.int64), 0
+        held = (self._canvas_line - 1 - np.arange(hold)) % ring
+        return self._recent_counts[held].sum(axis=0, dtype=np.int64), int(self._recent_counted[held].sum())
+
+    def reset_counts(self, pending_lines: int = 0) -> None:
+        """Start a new batch: class counts restart from zero (throughput counters keep running).
+
+        The newest ``pending_lines`` lines (the GUI's raw zone: not shown as counted yet) belong
+        to the new batch; they are counted as they cross into the classified zone.
+        """
         with self._lock:
-            self._counts[:] = 0
-            self._counted_lines = 0
+            counts, lines = self._held(pending_lines)
+            self._counts[:] = counts
+            self._counted_lines = lines
+
+    def set_classifier(self, classifier, tolerance_nm: float | None = None) -> int:
+        """Classify with another model from the next camera line on, while running.
+
+        The model is bound to every plan first (``classifier.bind``); if it does not fit one of
+        them, ``ValueError`` is raised and nothing changes. Lines already in the buffers are still
+        classified with the previous model. At the first line of the new model the class counts
+        restart and the belt map's class history is cleared (class ids of two models do not mean
+        the same): ``Snapshot.model_generation`` then takes the returned value, which is when a
+        display should change its class names and colours.
+
+        Returns:
+            The generation of the new model.
+        """
+        if tolerance_nm is None:
+            tolerance_nm = self.config.model.band_tolerance_nm
+        bound = [classifier.bind(plan.wavelengths, plan.n_columns, tolerance_nm, self.config.model.resample)
+                 for plan in self.plans]
+        with self._lock:
+            generation = self._model[0] + 1
+            for plan, src, (columns, binding) in zip(self.plans, self.sources, bound):
+                plan.columns = columns
+                _describe_model(plan, classifier, binding, src.name)
+            self.classifier = classifier
+            self._model = (generation, classifier, [columns for columns, _ in bound])   # one reference swap
+        logger.info("Model -> %s (generation %d)", classifier.path, generation)
+        return generation
 
     def set_backend(self, name: str) -> None:
         """Switch the correction backend (``auto``, ``cpu``, ``cupy_cuda``, ``opencv_cuda``) while running.
@@ -562,6 +622,44 @@ class Pipeline:
         with self._lock:
             self._cal_ring = self._cal_ids = None
 
+    def start_spectrum_history(self, max_mb: float | None = None) -> int:
+        """Keep the newest lines as the model receives them (after every step that is on).
+
+        For the GUI's spectrum preview: :meth:`spectrum_at` returns one pixel's spectrum by line
+        number (the numbers of ``Snapshot.canvas_lines``). Costs one copy per line and at most
+        ``max_mb`` MB (default ``display.spectrum_history_mb``), only until
+        :meth:`stop_spectrum_history`. Returns the number of lines kept.
+        """
+        budget = self.config.display.spectrum_history_mb if max_mb is None else max_mb
+        per_line = self._slit * self.plans[0].n_columns * 4
+        lines = int(max(1, min(budget * 1e6 // per_line, self._canvas.shape[1] * self._stride)))
+        with self._lock:
+            self._spec_ids = np.full(lines, -1, np.int64)
+            self._spec_ring = np.zeros((lines, self._slit, self.plans[0].n_columns), np.float32)
+        logger.info("Spectrum history: newest %d lines (%.0f MB)", lines, lines * per_line / 1e6)
+        return lines
+
+    def stop_spectrum_history(self) -> None:
+        with self._lock:
+            self._spec_ring = self._spec_ids = None
+
+    @property
+    def spectrum_lines(self) -> int:
+        """Lines the spectrum history can hold (0 = off)."""
+        ids = self._spec_ids
+        return 0 if ids is None else len(ids)
+
+    def spectrum_at(self, line: int, row: int) -> np.ndarray | None:
+        """Model-input spectrum (bands,) float32 of slit pixel ``row`` in ``line``; ``None`` when
+        that line is not kept (history off, lost line, or older than the history)."""
+        with self._lock:
+            if self._spec_ring is None or line < 0 or not 0 <= row < self._slit:
+                return None
+            k = int(line) % len(self._spec_ids)
+            if self._spec_ids[k] != line:
+                return None
+            return self._spec_ring[k, int(row)].copy()
+
     def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0) -> None:
         """Use new reflectance factors from the next line on and switch the step on."""
         plan = self.plans[plan_index]
@@ -597,8 +695,11 @@ class Pipeline:
         return '/'.join(sorted(names)) or 'uninitialized'
 
     def snapshot(self, canvas_columns: int | None = None, raw_columns: int = 0,
-                 step: tuple[int, int] = (1, 1)) -> Snapshot:
+                 step: tuple[int, int] = (1, 1), count_delay_lines: int = 0) -> Snapshot:
         """State for one refresh.
+
+        ``count_delay_lines`` leaves the newest N belt lines out of ``counts`` / ``counted_lines``:
+        the GUI passes its raw zone, so a line is counted when it crosses into the classified zone.
 
         ``canvas_columns`` limits the belt map to the newest N columns; ``raw_columns`` returns
         the model-input intensity of the newest M of them (the GUI's pre-classification zone).
@@ -621,6 +722,12 @@ class Pipeline:
             raw_columns_idx = columns[offsets[offsets >= n - int(raw_columns)]]
             raw_canvas = self._raw_canvas[::rs, raw_columns_idx]
             raw_lines = self._canvas_lines[raw_columns_idx]
+            counts, counted_lines = self._counts.copy(), self._counted_lines
+            if count_delay_lines > 0:       # leave out the newest lines (still in the raw zone)
+                held_counts, held_lines = self._held(count_delay_lines)
+                # never below zero when the zone was resized after a reset
+                counts = np.maximum(counts - held_counts, 0)
+                counted_lines = max(counted_lines - held_lines, 0)
             snap = Snapshot(
                 state=self._state, error=self._error, elapsed_s=time.perf_counter() - self._t0,
                 target_fps=self._fps, camera_fps=self._camera_fps, processed_fps=self._processed_fps,
@@ -633,13 +740,15 @@ class Pipeline:
                              for b, st in self._stage_totals.items()},
                 workers=self._n_workers, steps=dict(self._steps),
                 requested_backend=self._requested_backend, backend_note=self._backend_note(),
-                counts=self._counts.copy(), counted_lines=self._counted_lines,
+                counts=counts, counted_lines=counted_lines,
                 canvas=canvas, raw_canvas=raw_canvas, canvas_filled=self._canvas_filled,
                 raw_frame=self._raw_frame, position=self._position,
                 source_kind='file' if self.camera is None else 'camera',
                 lines_lost_camera=self._lost_camera, grab_timeouts=self._grab_timeouts,
                 line_clock=self._line_clock, raw_lines=raw_lines,
-                calibration_lines=0 if self._cal_ids is None else int((self._cal_ids >= 0).sum()))
+                canvas_lines=self._canvas_lines[columns[offsets]],
+                calibration_lines=0 if self._cal_ids is None else int((self._cal_ids >= 0).sum()),
+                model_generation=self._drawn_generation)
         return snap
 
     # --------------------------------------------------------------------------- camera ---
@@ -711,7 +820,7 @@ class Pipeline:
                             if slot is None:
                                 return
                         np.copyto(self._buffers[slot], frames[i])
-                        self._work.put(_Job(seq, line, slot, t_sensor, src_i, i, cycle, t_sensor))
+                        self._work.put(_Job(seq, line, slot, t_sensor, src_i, i, cycle, t_sensor, self._model))
                         seq += 1
                         line += 1
                         self._delivered = seq
@@ -825,7 +934,7 @@ class Pipeline:
                 else:
                     if frame is not target:
                         np.copyto(target, frame)
-                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival))
+                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival, self._model))
                     seq += 1
                     line += 1
                     self._delivered = seq
@@ -881,7 +990,7 @@ class Pipeline:
                 now = time.perf_counter()
                 if job is not None:
                     seq, line, slot, t_sensor, t_arrival = job
-                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival))
+                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival, self._model))
                     self._delivered = seq + 1
                     rate_n += 1
                 if job is None or now >= next_check:
@@ -912,7 +1021,6 @@ class Pipeline:
 
     def _worker_loop(self, k: int) -> None:
         prof = self._profilers[k]
-        classifier = self.classifier
         runtime = None
         raw = self.plans[0].stage == 'raw'
         try:
@@ -949,8 +1057,11 @@ class Pipeline:
                     if on['reflectance']:                             # last step before the model
                         with prof.time('reflectance'):
                             binned = apply_reflectance(binned, plan.reflectance_factors)
+                    # spectrum preview: what the model receives (a copy: the buffers are reused)
+                    spec = binned.astype(np.float32, copy=True) if self._spec_ring is not None else None
                     with prof.time('predict'):
-                        ids = classifier.predict(binned, plan.columns)
+                        _, classifier, columns = job.model
+                        ids = classifier.predict(binned, columns[job.source])
                 # display only: brightness of what the model saw, one value per slit pixel
                 intensity = binned.mean(axis=1, dtype=np.float32)
                 now = time.perf_counter()
@@ -958,7 +1069,7 @@ class Pipeline:
                     self._display_t = now
                     self._raw_frame = frame.copy()
                 self._free.put(job.slot)                       # buffer back to the camera
-                self._results.put((job, ids, intensity, pre))
+                self._results.put((job, ids, intensity, pre, spec))
         except Exception as exc:
             self._fail(f'worker-{k}', exc)
         finally:
@@ -1022,9 +1133,9 @@ class Pipeline:
                 elif item:
                     pending[item[0].seq] = item
                 while next_seq in pending:
-                    job, ids, intensity, pre = pending.pop(next_seq)
+                    job, ids, intensity, pre, spec = pending.pop(next_seq)
                     next_seq += 1
-                    self._account(job, ids, job.line - last_line - 1, intensity, pre)
+                    self._account(job, ids, job.line - last_line - 1, intensity, pre, spec)
                     last_line = job.line
                     rate_n += 1
 
@@ -1069,11 +1180,19 @@ class Pipeline:
                 self._state = 'stopped' if self._stop.is_set() else 'finished'
 
     def _account(self, job: _Job, ids: np.ndarray, gap: int, intensity: np.ndarray | None = None,
-                 pre: np.ndarray | None = None) -> None:
+                 pre: np.ndarray | None = None, spec: np.ndarray | None = None) -> None:
         """One line, in order. ``gap`` lines before it were lost to overrun."""
         counts = np.bincount(ids, minlength=256)
         t_done = time.perf_counter()
         with self._lock:
+            if job.model is not None and job.model[0] != self._drawn_generation:
+                # first line of another model: its class ids are new, so the history starts again
+                self._drawn_generation = job.model[0]
+                self._counts[:] = 0
+                self._counted_lines = 0
+                self._recent_counts[:] = 0
+                self._recent_counted[:] = False
+                self._canvas[:] = 0
             if gap > 0:
                 self._draw_lost(gap)
             if pre is not None and self._cal_ring is not None and pre.shape == self._cal_ring.shape[1:]:
@@ -1081,8 +1200,15 @@ class Pipeline:
                 self._cal_ring[k] = pre
                 self._cal_ids[k] = self._canvas_line
                 self._cal_pos += 1
+            if spec is not None and self._spec_ring is not None and spec.shape == self._spec_ring.shape[1:]:
+                k = self._canvas_line % len(self._spec_ids)
+                self._spec_ring[k] = spec
+                self._spec_ids[k] = self._canvas_line
             self._counts += counts
             self._counted_lines += 1
+            k = self._canvas_line % len(self._recent_counted)
+            self._recent_counts[k] = counts
+            self._recent_counted[k] = True
             self._processed += 1
             if self._canvas_line % self._stride == 0:
                 self._canvas[:, self._canvas_col] = ids
@@ -1097,6 +1223,10 @@ class Pipeline:
 
     def _draw_lost(self, gap: int) -> None:
         first = self._canvas_line
+        ring = len(self._recent_counted)
+        lost = np.arange(first, first + min(gap, ring)) % ring       # lost lines count nothing
+        self._recent_counts[lost] = 0
+        self._recent_counted[lost] = False
         self._canvas_line += gap
         columns = len(range(-(-first // self._stride) * self._stride, self._canvas_line, self._stride))
         width = self._canvas.shape[1]

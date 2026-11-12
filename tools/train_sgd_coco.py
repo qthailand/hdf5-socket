@@ -58,7 +58,7 @@ def fit_temperature(scores: np.ndarray, y_index: np.ndarray) -> float:
 
 
 def train_smart_bands_sgd(num_selected_bands: int = 30, hdr_path: str = 'dataset/first.bip.hdr',
-                          json_path: str = 'dataset/first.bip.json', model_output: str = 'rf_coco_model.joblib'):
+                          json_path: str = 'dataset/first.bip.json', model_output: str = 'models/rf_coco_model.joblib'):
 
     print("Loading Pre-binned Datacube...")
     img_obj = spy.open_image(hdr_path)
@@ -167,7 +167,7 @@ if __name__ == '__main__':
                         help='ENVI header of the training cube')
     parser.add_argument('--labels', default='dataset/poa.bip.json',
                         help='COCO polygons of that cube')
-    parser.add_argument('--out', default='rf_coco_model.joblib', help='model artifact to write')
+    parser.add_argument('--out', default='models/rf_coco_model.joblib', help='model artifact to write')
     parser.add_argument('--bands', type=int, default=30, help='bands kept by SelectKBest')
     args = parser.parse_args()
     train_smart_bands_sgd(args.bands, args.hdr, args.labels, args.out)

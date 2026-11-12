@@ -7,7 +7,7 @@ labelled ENVI cube and its COCO polygons, and prints a reliability table: per co
 pixel count, mean confidence and how many of those pixels are actually right, plus the ECE
 (expected calibration error) and per-class accuracy.
 
-    python tools/check_calibration.py                                   # sgd_first_reflectance.joblib
+    python tools/check_calibration.py                                   # models/sgd_first_reflectance.joblib
     python tools/check_calibration.py rf_model.joblib --hdr dataset/first.hdr --labels dataset/first.bip.json
     python tools/check_calibration.py --temperature 1.0                 # the uncalibrated model
 
@@ -30,7 +30,7 @@ from sklearn.model_selection import train_test_split
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from inference_engine import PushbroomLineClassifier  # noqa: E402
-from train_sgd_coco import load_coco_masks  # noqa: E402
+from tools.train_sgd_coco import load_coco_masks  # noqa: E402
 
 
 def reliability(confidence, correct, edges):
@@ -56,7 +56,7 @@ def _existing(path):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('model', nargs='?', default='sgd_first_reflectance.joblib')
+    p.add_argument('model', nargs='?', default='models/sgd_first_reflectance.joblib')
     p.add_argument('--hdr', help="labelled cube (default: the artifact's training_header)")
     p.add_argument('--labels', help='COCO polygons of that cube (default: <cube data file>.json)')
     p.add_argument('--split', choices=('test', 'train', 'all'), default='test',

@@ -59,7 +59,10 @@
     ]
   },
   "model": {
-    "path": "rf_coco_model.joblib",
+    "path": "models/rf_coco_model.joblib",
+    "folders": [
+      "models"
+    ],
     "band_tolerance_nm": 0.5
   },
   "optics": {

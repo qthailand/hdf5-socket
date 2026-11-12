@@ -113,10 +113,15 @@ class ClassLegendWidget(QWidget):
         self.grid_layout.setVerticalSpacing(6)
         self.grid_layout.setColumnStretch(2, 1)
         content.addWidget(key_panel)
+        self._content = content
         content.addStretch()
 
         self.scroll_area.setWidget(self.container_widget)
         main_layout.addWidget(self.scroll_area)
+
+    def add_section(self, widget: QWidget) -> None:
+        """Put ``widget`` below the class key (above the stretch), e.g. the model selector."""
+        self._content.insertWidget(self._content.count() - 1, widget)
 
     def setup_classes_from_model(self, category_names: dict[int, str], lut: np.ndarray, classes: np.ndarray,
                                  hidden=HIDDEN_BY_DEFAULT) -> None:

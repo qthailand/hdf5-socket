@@ -319,6 +319,11 @@ def open_envi(path, *, stage: str = 'auto', scan_axis: str = 'samples',
         stage = 'binned' if wavelengths is not None else 'raw'
     metadata = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in header.items()}
     metadata.update(envi_scan_axis=scan_axis, envi_interleave=interleave)
+    # hsi writes the camera identity as 'camera model' / 'camera serial number' (cube_io.writers):
+    # the same keys as the HDF5 attributes, so a raw ENVI cube finds its camera profile too.
+    for key, field in (('camera_model', 'camera model'), ('camera_serial', 'camera serial number')):
+        if metadata.get(field) not in (None, '') and key not in metadata:
+            metadata[key] = str(metadata[field]).strip()
 
     if view.flags.c_contiguous and dtype.isnative:
         frames = view

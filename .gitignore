@@ -17,6 +17,8 @@ data/
 *.h5
 *.hdf5
 
+models/
+
 # Archives and generated reports
 *.zip
 *.npz

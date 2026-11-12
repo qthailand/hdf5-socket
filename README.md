@@ -24,8 +24,7 @@ python simulate.py --live --seconds 30 --set acquisition.exposure_ms=2
 ```
 
 `--set SECTION.KEY=VALUE` (`gui.py` and `simulate.py`) overrides any `simulation.json` value
-(JSON values; `null` clears one). The socket streamer `python . send/recv` (`__main__.py`) is a
-separate tool.
+(JSON values; `null` clears one).
 
 ## Input
 
@@ -81,11 +80,11 @@ wavelength files, as the attributes of a recording do (origin `camera:...` in th
 
 | Key | Live meaning |
 |---|---|
-| `acquisition.camera_backend` | `poa`, `genicam` or `ximea`; also the `calibration/*/<backend>/` folder |
+| `acquisition.camera_backend` | `poa`, `genicam` or `ximea`; also the `calibration/*/<backend>/` folder for a camera without a profile |
 | `acquisition.camera_bin` | hardware bin set on the camera (an unsupported bin is an error) |
 | `acquisition.exposure_ms`, `gain` | required; applied to the camera, and the values it applied pick the dark |
 | `acquisition.raw_inverted` | slit flip, as for files |
-| `acquisition.wavelength_profile` | `auto`: `calibration/wavelength/<backend>/wavelength_bin<bin>.json` is **required** (a camera carries no m/c of its own; starting without it is an error rather than another camera's axis); `"none"` uses `m_nm_per_px_bin1` / `c_nm` on purpose |
+| `acquisition.wavelength_profile` | `auto`: `wavelength_bin<bin>.json` (camera profile, else `calibration/wavelength/<backend>/`) is **required** (a camera carries no m/c of its own; starting without it is an error rather than another camera's axis); `"none"` uses `m_nm_per_px_bin1` / `c_nm` on purpose |
 | `live.camera_index` | device index (GenICam, XIMEA; POA opens its first camera) |
 | `live.cti_path` | GenICam GenTL producer; `null` = the SVS producer (`sv_gev_tl_x64.cti`, `libsv_gev_tl_x64.cti`) in one of the `GENICAM_GENTL64_PATH` folders; a missing file is an error naming the path |
 | `live.sensor_pixel_size` | GenICam `SensorPixelSize` 8/10/12 bits: must be what the darks were recorded with (it changes the value scaling) |
@@ -123,13 +122,35 @@ How it runs (`Pipeline._live_loop`, `camera_source.py`):
 
 ## Acquisition calibration (no link to the hsi project at run time)
 
-`calibration/` mirrors the hsi layout; copy new files from hsi into the same place:
+Calibration belongs to one physical camera, so each camera has a **profile** named after the
+model and serial it reports (a live camera, or the `camera_model` / `camera_serial` attributes
+hsi writes into a recording):
+
+```
+profiles/<model>-<serial>/                 e.g. profiles/Apollo-M-MAX-CAMP7161A470A1209000/
+  profile.json                             backend, model, serial
+  dark/dark_b<bin>_e<exp>_g<gain>[_t<temp>].npz
+  smile/smile_model_bin<bin>.npz           (+ history/)
+  wavelength/wavelength_bin<bin>.json      (+ resolution_bin<bin>.json, history/)
+  reflectance/refl_b<bin>_g<gain>.npy      (+ .wavelength.npy, .json, history/)
+```
+
+When a profile has a folder (`dark/`, `smile/`, `wavelength/`), only that folder is searched,
+so files of another camera of the same backend are never used. A camera without model/serial,
+or a profile without that folder, uses the hsi layout per backend (GenICam and XIMEA files are
+still there):
 
 ```
 calibration/dark_frames/<backend>/dark_b<bin>_e<exp>_g<gain>[_t<temp>].npz
 calibration/smile_maps/<backend>/smile_model_bin<bin>.npz
 calibration/wavelength/<backend>/wavelength_bin<bin>.json
 ```
+
+`tools/migrate_profiles.py --from-recording <a recording of the camera> [--apply]` moves one
+backend's files into a camera's profile, including its old `reflectance/live_<backend>.npy` as
+`refl_b<bin>_g<gain>.npy`. Without `--apply` it only prints the plan. The calibration files
+carry no serial, so only move them for the camera they were made with. The POA Apollo-M MAX
+(CAMP7161A470A1209000) was moved on 2026-11-10. `corrections.profiles_dir` moves the folder.
 
 Each value comes from the recorded file first (`acquisition.use_file_metadata`; HSI writes
 `camera_bin`, `exposure_ms`, `gain`, `raw_inverted`, `m_nm_per_px_bin1`, `c_nm`,
@@ -156,16 +177,16 @@ preprocessing files (dark etc.); the simulated line rate is separate (`camera.fp
 changeable live in the GUI). Full chain on this CPU (i9-12900K, 4 workers, frames in RAM): ~2.4 ms per line
 at 250/s; maximum ~460 lines/s (6 workers ~500/s), Smile is ~60 % of the time.
 
-**Model: `sgd_first_reflectance.joblib`** (classes mango, pradoo, katom, spectralon, bg; 30 bands
+**Model: `models/sgd_first_reflectance.joblib`** (classes mango, pradoo, katom, spectralon, bg; 30 bands
 934.7–1079.8 nm; `input_units: reflectance`), trained with
-`python train_sgd_coco.py --hdr dataset/first.hdr --labels dataset/first.bip.json --out sgd_first_reflectance.joblib`
+`python tools/train_sgd_coco.py --hdr dataset/first.hdr --labels dataset/first.bip.json --out models/sgd_first_reflectance.joblib`
 on `dataset/first.bip`, which is the hsi reflectance cube of the same scan (it equals this
 simulator's chain + Reflectance step: correlation 0.999+). Through the simulator on the
 labelled pixels of `first.h5`: 92.0 % (spectralon/bg 100 %, katom 99 %, pradoo 83 %,
 mango 33 % - mostly taken for katom: a data/label question, the counts model does the same).
-`rf_coco_model.joblib` (your model) was trained on the earlier **counts** version of
+`models/rf_coco_model.joblib` (your model) was trained on the earlier **counts** version of
 `first.bip` (feature std ~11 000): it works with Reflectance **off** (92.3 %) and answers `bg`
-everywhere with Reflectance on. `train_sgd_coco.py` now writes `input_units` from the cube
+everywhere with Reflectance on. `tools/train_sgd_coco.py` now writes `input_units` from the cube
 (float ≤ ~5 → reflectance), and the GUI warns when model and Reflectance step disagree.
 `model.path: "none"` gives a speed-only stand-in on all bands.
 
@@ -182,10 +203,80 @@ for bit from `spectrogram02.h5` (cube column *j* = frame 2*j*+1), which
 ## Model binding
 
 The model artifact carries `band_wavelengths`. The selected bands are matched to the input
-by wavelength (`model.band_tolerance_nm`); a calibration that does not match the training
-data stops the start instead of feeding wrong bands. Add the wavelengths to an older
+by wavelength (`model.band_tolerance_nm`), so wrong bands are never fed to the model.
+
+**After a new wavelength calibration** the camera's bands lie a little beside the bands an older
+model was trained on. Such a model stays usable: the input is interpolated onto the model's
+bands (linear, by wavelength; `model.resample`, default `true`). The binding line then reads
+`resampled to the model's bands ... nearest input band up to 1.17 nm away`, and the model's tile
+in the GUI shows `resampled 1.2 nm` in the warning colour. It applies when the input covers the
+model's bands (the first or last may lie up to half a band outside: it is extrapolated) and has the training data's band spacing (0.8-1.25 times); another spectral
+resolution or a range that does not cover the model is still refused, with the reason.
+The cost is about 0.1 ms per line for a package model and nothing for a linear one (the
+interpolation is folded into its weights). Interpolating assumes the new calibration describes
+the same spectra more accurately; check a resampled model on known material, and retrain it when
+the result matters. `model.resample: false` refuses such models as before. Add the wavelengths to an older
 artifact with `python tools/add_band_wavelengths.py model.joblib dataset/dataset.bip.hdr`;
-`train_sgd_coco.py` now stores them.
+`tools/train_sgd_coco.py` now stores them.
+
+## Models trained in HSI MLOps (`.hsipkg`)
+
+The classification models of this project are trained elsewhere (HSI MLOps, `hsi_lab_core`) and
+delivered as a package: `*.hsipkg`, usually inside a `.zip`. `model.path` takes either file
+directly; nothing has to be converted and `hsi_lab_core` is not needed:
+
+```bash
+python simulate.py --set model.path=models/Kratom_adulteration_1794300998.hsipkg
+python hsi_package.py models/*.hsipkg        # what a package holds, and whether it is accepted
+```
+
+**Switching the model while running.** Put the model files (`.joblib`, `.hsipkg`, or the `.zip`
+around a package) into the `models` folder. The **Materials** tab shows one tile per file of that
+folder only (`model.folders`, default `["models"]`) below the class list; ↻ looks again. The
+tile of the model in use is highlighted. Clicking another tile switches at the next camera
+line: nothing stops, no line is lost, and the class statistics and the belt map start again. A
+model that does not fit the input (other bands, another calibration) is shown greyed out with
+the reason in its tooltip. `model.path` is still the model loaded at start; one
+outside `models` runs but is not offered in the list.
+
+The model runs as its training software runs it (`inference_engine.HsiPackageClassifier`):
+reflectance → SNV per pixel over **all** training bands → the package's selected bands → its
+StandardScaler → Gaussian maximum likelihood (MLC, per class a mean and a full covariance).
+What makes that trustworthy without the training software:
+
+* `hsi_package.py` reads the arrays out of the package's joblib pickles with a restricted
+  unpickler (numpy arrays and attribute holders only: no code of the package runs) and checks
+  the manifest's `sha256` of every file it reads.
+* The package carries the class means of its training spectra after preprocessing
+  (`training_spectral_reference.json`). The loader passes them through its own band selection
+  and scaler and requires the model's class means to come out (they do, to 1e-14, for both
+  delivered packages) and the SNV convention to match (population SD over all bands).
+* A package using a step that is not implemented (another preprocessing, PCA, spectral
+  indices, resampling, another algorithm) is refused by name. Implemented today: SNV, band
+  selection, StandardScaler, MLC with full covariances.
+* The classes are the arg max of float64 `log prior + Gaussian log-density`; `predict` computes
+  it in float32 and stops a class as soon as it has lost (same result: 61 440 pixels of
+  `first.bip` agree with a float64 `scipy` reference, and `tests/test_hsi_package.py` checks it).
+
+Things to know:
+
+* **Bands.** SNV needs every training band, so the input must supply all 159 (not only the
+  137 the model uses) within `model.band_tolerance_nm`. `Kratom_adulteration` was trained on
+  this camera's grid (904.65–1695.29 nm, offset 0.005 nm). `MLC_874171` was trained on another
+  wavelength calibration (905.06–1694.12 nm: up to 1.17 nm off): it runs on the input resampled
+  onto its bands (see *Model binding*).
+* **Input.** The package declares reflectance, so the Reflectance step must be on (the GUI
+  warns otherwise). SNV removes brightness and offset per pixel; a wrong white reference still
+  changes the spectral shape.
+* **Classes and colours** come from the package (ids from 0; `Background` is hidden in the
+  shares by `display.hidden_classes`). A pixel with a constant or non-finite spectrum (dead
+  pixel, the all-zero warm-up frame) has no SNV and gets the package's background class.
+* **Speed** (i9-12900K, slit 1024, frames in RAM): model 0.9–1.1 ms per line against 0.3 ms for
+  the linear model; the full chain still reaches ~730 lines/s with 4–6 workers.
+* **Not verified here:** the result was not compared with `hsi_lab_core` itself (it is not on
+  this machine). The check that remains is one cube classified in HSI MLOps and here.
+  `predict_confidence` is the Gaussian posterior, which the package itself calls uncalibrated;
+  `tools/check_calibration.py` still expects a joblib artifact.
 
 ## Confidence and calibration (offline)
 
@@ -202,22 +293,22 @@ artifact through `PushbroomLineClassifier.predict_confidence` on the labelled pi
 training cube (`training_header`, COCO polygons `<cube>.json`) and prints a reliability table
 (per confidence bin: pixels, mean confidence, actual accuracy), the ECE, the accuracy below and
 above `--min-confidence` and per class accuracy, precision and mean confidence. By default it
-uses the 20 % held-out pixels of `train_sgd_coco.py` (the split depends only on the labels, so
+uses the 20 % held-out pixels of `tools/train_sgd_coco.py` (the split depends only on the labels, so
 it is reproduced exactly; `--split train|all`, `--temperature 1` for the uncalibrated model).
 
 ```bash
-python tools/check_calibration.py                       # sgd_first_reflectance.joblib
+python tools/check_calibration.py                       # models/sgd_first_reflectance.joblib
 ```
 
 The plain SGD model is **under-confident**: on the held-out pixels of `first` it is right 92.0 %
 of the time but reports 77.4 % on average (pixels reported at 80-90 % are right 99 % of the
-time; ECE 0.146). `train_sgd_coco.py` therefore fits a **temperature** T on the held-out pixels
+time; ECE 0.146). `tools/train_sgd_coco.py` therefore fits a **temperature** T on the held-out pixels
 (the one scalar that minimises their log loss) and stores it in the artifact;
 `predict_confidence` divides the scores by T before the sigmoid (T < 1 sharpens). The class
 (`predict`, argmax) does not change. For `first` T = 0.474: mean confidence 90.4 % for 92.0 %
 accuracy, ECE 0.016 (0.015-0.017 when T is fitted on one half of the held-out pixels and
 checked on the other). Artifacts without `temperature` keep T = 1.0 (sklearn's value); retrain
-to add it (`python train_sgd_coco.py --hdr dataset/first.hdr --out sgd_first_reflectance.joblib`
+to add it (`python tools/train_sgd_coco.py --hdr dataset/first.hdr --out models/sgd_first_reflectance.joblib`
 gives the same weights).
 
 * One T fixes the overall scale, not every class: mango pixels assigned to mango are right 98 %
@@ -338,7 +429,7 @@ They are the files hsi writes with `save_factor_profile` (see `reflectance/READM
 
 `corrections.reflectance_dir` moves the folder. A profile with other bands, or row-wise factors
 with another slit row count, is refused (logged; the switch stays disabled with the reason).
-The model artifact may declare `input_units` (`counts` or `reflectance`; `train_sgd_coco.py`
+The model artifact may declare `input_units` (`counts` or `reflectance`; `tools/train_sgd_coco.py`
 writes `counts`; the current model has none, so `counts` is assumed). When the Reflectance
 step does not match, the GUI shows **⚠ model expects …** next to the steps: speed numbers stay
 valid, the classes do not. Cost on this CPU: ~0.13 ms per line.
@@ -362,11 +453,25 @@ Until a holder keeps the Spectralon under the slit, calibrate on the running vie
    **Draw again** or **Cancel**.
 
 **Apply & Save** uses the factors from the next line on and switches Reflectance on. It writes
-`reflectance/<source>.npy` (`live_poa.npy` for the live POA), and the JSON beside it holds the
-camera values (backend, bin, `exposure_ms`, `gain`, sensor temperature), area, reference and
+`profiles/<camera>/reflectance/refl_b<bin>_g<gain>.npy` (a camera without model/serial:
+`reflectance/<source>.npy`), and the JSON beside it holds the camera values (backend, bin, `exposure_ms`, `gain`, sensor temperature), area, reference and
 quality report. The previous profile is moved to `reflectance/history/<name>_<time>.*`.
 At every start a profile made at another exposure is scaled to the camera's exposure (counts
 are linear in exposure). Another gain is flagged in the step's tooltip and the log, not scaled.
+
+**Binding to the camera values:**
+
+| value | rule |
+|---|---|
+| bin, gain | must match: one file per bin/gain in the profile; another bin/gain is refused (Reflectance off, reason in the tooltip) |
+| exposure | scaled to the camera's exposure (counts are linear in it after dark) |
+| sensor temperature | flagged when more than `corrections.reflectance_max_dtemp_c` (5 °C) from the calibration |
+| age | flagged after `corrections.reflectance_max_age_h` (24 h): the lamp drifts |
+| dark step | flagged when the factors were made with dark on and dark is off now |
+
+A name-based `reflectance/<source>.npy` must record its bin/gain in its JSON when the camera is
+identified, otherwise it is refused. The **Sensor…** dialog shows ✓/⚠ for both the dark and the
+reflectance of the values you pick.
 
 ### White reference from a folder (`white_reference`)
 
@@ -389,7 +494,7 @@ The white's own exposure/gain select its dark. A white recorded at another expos
 the data is scaled to the data's exposure. Configured now: `reflectance/spectralon-20.h5`
 with `Spectralon_ref-020.xlsx`, `slit_offset` 453. That is the GenICam SWIR white (bin 2), so
 it serves a GenICam source and gives the same factors as `first.npy` (difference 0.0). The
-live POA camera skips it and keeps `live_poa.npy`. Put a POA white recording into
+live POA camera skips it and keeps its profile's `refl_b2_g1.0.npy`. Put a POA white recording into
 `reflectance/` (or point `path` at a folder) to have POA factors made at start.
 
 ### Making the factors: white reference through the same chain
@@ -682,7 +787,9 @@ python -m pytest -q tests
 covers sources, calibration resolution, model binding, confidence = sklearn `predict_proba`,
 temperature scaling, lossless ordering, overrun counting
 the bit-exact reproduction of the training cube, live backend switching and that the
-processing code is still identical to hsi; `test_live_camera.py` runs the live camera source
+processing code is still identical to hsi; `test_hsi_package.py` builds an HSI MLOps package and
+checks reading without `hsi_lab_core`, the classes against a float64 reference, binding of all
+training bands, dead pixels, refusals and that a package's pickle runs no code; `test_live_camera.py` runs the live camera source
 against a fake camera backend (no hardware: configuration, calibration from the camera's
 values, frame-id gaps and overruns, timestamps, stop/close); `test_themes.py` checks the themes;
 `test_focus.py` the focus score and the focus card.

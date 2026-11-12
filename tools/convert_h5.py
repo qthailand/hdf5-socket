@@ -9,7 +9,7 @@ transpose - no dark/hot pixel/flip/Smile/binning. BIP on disk is (lines, samples
 = (slit, frame, spectral), i.e. ``spectrogram.transpose(1, 0, 2)``, the same axes HSI
 writes (lines = slit, samples = scan, bands = wavelength).
 
-    python convert_h5.py data/first.h5 dataset/first_raw.bip
+    python tools/convert_h5.py data/first.h5 dataset/first_raw.bip
 """
 import argparse
 from pathlib import Path

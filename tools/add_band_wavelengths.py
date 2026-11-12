@@ -4,7 +4,7 @@
 The simulator then feeds the model by wavelength instead of by band index, and refuses an
 input whose calibration does not match the training data.
 
-    python tools/add_band_wavelengths.py rf_coco_model.joblib dataset/dataset.bip.hdr
+    python tools/add_band_wavelengths.py models/rf_coco_model.joblib dataset/dataset.bip.hdr
 
 The weights are not touched; ``band_wavelengths``, ``n_bands`` and ``training_header`` are
 added and the artifact is written back (``--out`` writes a new file instead).

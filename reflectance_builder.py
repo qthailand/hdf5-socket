@@ -351,9 +351,14 @@ def find_white(config, plan) -> tuple[Path | None, str]:
     where = f"{root.name}/{wr.pattern or '*.h5'}" if root.is_dir() else root.name
     if not files:
         return None, f"no white reference in {where}"
+    from sim_config import camera_profile_name
     skipped = []
     for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
         meta = _white_metadata(path)
+        white_id = camera_profile_name(meta.get('camera_model'), meta.get('camera_serial'))
+        if plan.camera_id and white_id and white_id != plan.camera_id:
+            skipped.append(f"{path.name}: camera {white_id}")
+            continue
         if plan.stage == 'raw':
             backend, camera_bin = meta.get('camera_backend'), meta.get('camera_bin')
             if ((backend is not None and str(backend).lower() != str(plan.camera_backend).lower())
@@ -412,7 +417,7 @@ def ensure_white_profile(config, plan, name: str) -> tuple[Path | None, str]:
         'slit_offset': wr.slit_offset, 'frame_shape': [int(v) for v in plan.frame_shape],
         'bands': int(plan.n_columns),
         'wavelength_nm': [round(float(wl[0]), 4), round(float(wl[-1]), 4)] if wl is not None else None,
-        'exposure_ms': plan.exposure_ms,
+        'exposure_ms': plan.exposure_ms, 'gain': plan.gain, 'camera_id': plan.camera_id,
         'steps': {k: bool(plan.steps.get(k, {}).get('on')) for k in ('dark', 'flip', 'smile')},
     }
     if out.is_file() and profile_info(out).get('signature') == signature:
@@ -472,7 +477,10 @@ def ensure_white_profile(config, plan, name: str) -> tuple[Path | None, str]:
             'table': table.name, 'kind': wr.kind, 'rows': list(rows) if rows else 'all',
             'frames': list(span) if span else 'all', 'frames_averaged': white.n_frames,
             'steps': _clean_steps(white.steps), 'exposure_scale': scale, 'notes': notes,
-            'quality': report, 'signature': signature}
+            'quality': report, 'signature': signature,
+            # bound like a drawn calibration: the data's bin/gain; already scaled to its exposure
+            'camera_bin': plan.camera_bin, 'gain': plan.gain, 'exposure_ms': plan.exposure_ms,
+            'camera_id': plan.camera_id}
     if crop:
         info['slit_crop'] = {'raw_rows': [crop[0], crop[0] + crop[1]], 'sensor_rows': crop[2]}
     save_profile(out.parent, [name], factors, white.wavelengths, info)

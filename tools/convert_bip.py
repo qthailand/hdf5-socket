@@ -10,7 +10,7 @@ Header fields become root attributes (``camera bin`` -> ``camera_bin``), so a BI
 ``wavelength`` list (e.g. a corrected, binned HSI cube) also gets ``wavelength_nm``, which
 ``sources.py`` reads as stage ``'binned'``.
 
-    python convert_bip.py data/first.bip data/first_from_bip.h5
+    python tools/convert_bip.py data/first.bip data/first_from_bip.h5
 """
 import argparse
 import re

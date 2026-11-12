@@ -29,7 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-FULL_CHAIN = ['--set', 'corrections.dark=calibration/dark_frames/poa/dark_b2_e1.0_g1.0.npz',
+FULL_CHAIN = ['--set', 'corrections.dark=profiles/Apollo-M-MAX-CAMP7161A470A1209000/dark/dark_b2_e1.0_g1.0.npz',
               '--set', 'corrections.smile=auto', '--set', 'acquisition.raw_inverted=true']
 
 

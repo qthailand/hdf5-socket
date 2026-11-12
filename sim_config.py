@@ -6,12 +6,17 @@ The simulator re-runs the HSI acquisition pipeline on recorded frames::
     raw sensor frame -> dark subtraction -> hot-pixel repair -> slit flip (raw_inverted)
                      -> Smile remap -> lambda binning (m * camera_bin, c, resolution) -> model
 
-exactly as ``hsi/modules/acquisition/engine.py`` does, with the calibration files copied
-into ``calibration/`` (same layout as the HSI project, no link to it at run time)::
+exactly as ``hsi/modules/acquisition/engine.py`` does. Calibration belongs to one physical
+camera, so it lives in a profile per camera, named from the model and serial the camera (or
+the recording's metadata) reports::
 
-    calibration/dark_frames/<backend>/dark_b<bin>_e<exp>_g<gain>[_t<temp>].npz
-    calibration/smile_maps/<backend>/smile_model_bin<bin>.npz
-    calibration/wavelength/<backend>/wavelength_bin<bin>.json
+    profiles/<model>-<serial>/dark/dark_b<bin>_e<exp>_g<gain>[_t<temp>].npz
+    profiles/<model>-<serial>/smile/smile_model_bin<bin>.npz
+    profiles/<model>-<serial>/wavelength/wavelength_bin<bin>.json
+    profiles/<model>-<serial>/reflectance/refl_b<bin>_g<gain>.npy (+ .wavelength.npy, .json)
+
+A camera without model/serial, or a profile without that kind of file, uses the HSI layout
+per backend (``calibration/dark_frames|smile_maps|wavelength/<backend>/``).
 
 Every acquisition value is taken from the recorded file's metadata (HDF5 attributes written
 by HSI) when ``use_file_metadata`` is on and the file has it, else from this config. Paths in
@@ -106,6 +111,9 @@ class CorrectionConfig:
     smile: str = 'none'                  # none | auto | path to smile_model_bin<N>.npz
     reflectance: str = 'none'            # none | auto | path: counts x factor, last step before the model
     reflectance_dir: str = 'reflectance' # <dir>/<source name>.npy (+ .wavelength.npy), see reflectance/README.md
+    profiles_dir: str = 'profiles'       # <dir>/<model>-<serial>/{dark,smile,wavelength,reflectance}/
+    reflectance_max_age_h: float = 24.0  # older factors are flagged (lamp drift); 0 = never
+    reflectance_max_dtemp_c: float = 5.0 # sensor temperature this far from the calibration's is flagged
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,8 @@ class DisplayConfig:
                                          # target stays round; measure: target width in lines / height in rows)
     raw_zone_fraction: float = 1 / 3    # right part of the belt map showing the newest lines before
                                          # classification (grey: model-input intensity); 0 = off
+    spectrum_history_mb: float = 512.0   # spectrum preview (click on the belt map): memory for the
+                                         # newest model-input lines, used only while the panel is shown
     theme: str = 'dark'                  # themes/<name>.json or a path to a theme JSON
     hidden_classes: tuple = ('bg', 'background')   # Materials chart: hidden until ticked
                                          # (class names, case-insensitive)
@@ -173,8 +183,15 @@ class OpticsConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    path: str = 'rf_coco_model.joblib'  # "none": speed-only stand-in model (no trained weights)
+    # a joblib artifact or an HSI MLOps package (.hsipkg / the .zip around it);
+    # "none": speed-only stand-in model (no trained weights)
+    path: str = 'models/rf_coco_model.joblib'
+    # folders whose models the GUI offers for switching while running (only these)
+    folders: tuple = ('models',)
     band_tolerance_nm: float = 0.5       # max distance between a model band and an input band
+    # A model whose bands are further away than that (the wavelength calibration was redone after
+    # it was trained) is fed the input interpolated onto its bands; false: such a model is refused.
+    resample: bool = True
 
 
 @dataclass(frozen=True)
@@ -238,6 +255,8 @@ class SimulationConfig:
             raise ValueError("camera.buffer_frames must be >= 2")
         if self.acquisition.camera_bin < 1:
             raise ValueError("acquisition.camera_bin must be >= 1")
+        if not isinstance(self.model.resample, bool):       # "False"/"off" are text, and text is true
+            raise ValueError(f"model.resample must be true or false, got {self.model.resample!r}")
         if self.acquisition.resolution_nm <= 0 or self.acquisition.m_nm_per_px_bin1 <= 0:
             raise ValueError("acquisition.m_nm_per_px_bin1 and resolution_nm must be > 0")
         if self.corrections.backend not in ('auto', 'cpu_fused', 'cpu', 'cupy_cuda', 'opencv_cuda'):
@@ -248,6 +267,8 @@ class SimulationConfig:
             raise ValueError("display.canvas_line_stride >= 1 and canvas_width >= 16")
         if not self.display.line_aspect > 0:
             raise ValueError("display.line_aspect must be > 0")
+        if not self.display.spectrum_history_mb > 0:
+            raise ValueError("display.spectrum_history_mb must be > 0")
         if not 0.0 <= self.display.raw_zone_fraction < 1.0:
             raise ValueError("display.raw_zone_fraction must be in [0, 1)")
         white = self.white_reference
@@ -362,6 +383,11 @@ class AcquisitionPlan:
     reflectance_placeholder: bool = False           # factors marked placeholder in reflectance/<name>.json
     exposure_ms: float | None = None             # of the frames: a white of another exposure is scaled to it
     gain: float | None = None
+    temperature_c: float | None = None           # sensor temperature (selects the dark; flags reflectance)
+    camera_id: str | None = None                 # '<model>-<serial>' (None: not reported)
+    profile_dir: Path | None = None              # profiles/<camera_id> (may not exist yet)
+    reflectance_max_age_h: float = 0.0           # from corrections (0 = no age check)
+    reflectance_max_dtemp_c: float = 0.0
     #: per step: {'available': bool, 'on': bool, 'why': str} for dark (+hot pixel), flip, smile, binning
     steps: dict = field(default_factory=dict)
     binner: LambdaBinner | None = None
@@ -415,6 +441,8 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
     """
     shape = source.frame_shape
     plan = AcquisitionPlan(stage=source.stage, frame_shape=shape)
+    plan.reflectance_max_age_h = float(config.corrections.reflectance_max_age_h or 0)
+    plan.reflectance_max_dtemp_c = float(config.corrections.reflectance_max_dtemp_c or 0)
     prov = plan.provenance
     if source.stage == 'binned':
         plan.wavelengths = source.wavelengths
@@ -438,6 +466,12 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
 
     plan.camera_backend, o = pick(('camera_backend',), acq.camera_backend, str)
     prov['camera_backend'] = (plan.camera_backend, o)
+    # identity, not a setting: always from the metadata (use_file_metadata does not apply)
+    plan.camera_id = camera_profile_name(meta.get('camera_model'), meta.get('camera_serial'))
+    plan.profile_dir = profiles_root(config) / plan.camera_id if plan.camera_id else None
+    prov['camera profile'] = (
+        (f"{plan.camera_id}" + ('' if plan.profile_dir.is_dir() else ' (no profile folder yet)'))
+        if plan.camera_id else 'none: no camera_model/camera_serial (calibration/<backend>/ is used)', origin)
     plan.camera_bin, o = pick(('camera_bin',), acq.camera_bin, int)
     prov['camera_bin'] = (plan.camera_bin, o)
     plan.raw_inverted, o = pick(('raw_inverted',), acq.raw_inverted, bool)
@@ -448,15 +482,17 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
     # the dark the recording used was captured at dark_temperature_c (HSI picks the nearest one)
     temperature, _ = pick(('temperature_c', 'dark_temperature_c', 'sensor_temperature_c_start', 'temperature'),
                           acq.temperature_c, float)
+    plan.temperature_c = temperature
 
     # Wavelength axis: recorded values > wavelength profile > config numbers.
     m1, c, o_m = acq.m_nm_per_px_bin1, acq.c_nm, 'config'
-    profile = _wavelength_profile_path(config, plan.camera_backend, plan.camera_bin)
+    profile = _wavelength_profile_path(config, plan)
     if profile is None and origin == 'camera' and acq.wavelength_profile == 'auto':
         # A recording carries its own m/c; a live camera does not. The config numbers belong to
         # one camera, so a missing profile must not silently put another camera's axis under the model.
+        folder, _ = calibration_folder(config, plan, 'wavelength')
         raise ValueError(
-            f"no wavelength profile calibration/wavelength/{plan.camera_backend}/wavelength_bin{plan.camera_bin}.json "
+            f"no wavelength profile {folder}/wavelength_bin{plan.camera_bin}.json "
             f"for the live {plan.camera_backend} camera at bin {plan.camera_bin}: add it (hsi wavelength "
             "calibration), set acquisition.wavelength_profile to a file, or to \"none\" to use "
             "acquisition.m_nm_per_px_bin1 / c_nm on purpose")
@@ -577,6 +613,90 @@ def optics_summary(optics, camera_bin: int, m_nm_per_px_bin1: float, resolution_
             f"bins {resolution_nm:g} nm = {resolution_nm / bandwidth:.2f} x that{belt}")
 
 
+#: calibration kind in a profile -> its folder in the HSI layout ``calibration/<folder>/<backend>``
+CALIBRATION_KINDS = {'dark': 'dark_frames', 'smile': 'smile_maps', 'wavelength': 'wavelength'}
+
+
+def camera_profile_name(model, serial) -> str | None:
+    """``<model>-<serial>`` as a folder name (spaces and other unsafe characters become ``-``)."""
+    import re
+    if isinstance(model, bytes):
+        model = model.decode(errors='replace')
+    if isinstance(serial, bytes):
+        serial = serial.decode(errors='replace')
+    if model is None or serial is None or not re.search(r'[A-Za-z0-9]', str(model)) \
+            or not re.search(r'[A-Za-z0-9]', str(serial)):
+        return None                                   # both are needed: a blank one names no unit
+    name = re.sub(r'[^A-Za-z0-9._]+', '-', f"{str(model).strip()}-{str(serial).strip()}").strip('-.')
+    return name or None
+
+
+def profiles_root(config) -> Path:
+    """``corrections.profiles_dir`` as a path."""
+    return config.resolve(config.corrections.profiles_dir) or Path(config.base_dir) / 'profiles'
+
+
+def calibration_folder(config, plan, kind: str) -> tuple[Path, str]:
+    """Folder of one calibration ``kind`` (dark, smile, wavelength) for the plan's camera.
+
+    The camera's profile when it has that folder, else the HSI layout per backend. A profile
+    folder is never mixed with another camera's files: when it exists it is the only place
+    looked in.
+    """
+    if plan.profile_dir is not None and (plan.profile_dir / kind).is_dir():
+        return plan.profile_dir / kind, f"profile {plan.camera_id}"
+    legacy = CALIBRATION_KINDS[kind]
+    folder = config.calibration_dir / legacy / plan.camera_backend
+    if plan.profile_dir is None and not folder.is_dir():
+        # No model/serial (old recording, camera without a serial) and the backend's files were
+        # moved into a profile: the only profile of this backend is the camera they came from.
+        only = backend_profile(config, plan.camera_backend)
+        if only is not None and (only / kind).is_dir():
+            return only / kind, f"profile {only.name} (only {plan.camera_backend} profile; no serial)"
+    return folder, f"calibration/{legacy}/{plan.camera_backend}"
+
+
+def backend_profile(config, backend) -> Path | None:
+    """The one profile whose ``profile.json`` names ``backend`` (None: none, or several)."""
+    root = profiles_root(config)
+    found = []
+    for record in sorted(root.glob('*/profile.json')) if root.is_dir() else []:
+        try:
+            if str(json.loads(record.read_text(encoding='utf-8')).get('camera_backend', '')).lower() == \
+                    str(backend).lower():
+                found.append(record.parent)
+        except (OSError, ValueError):
+            continue
+    return found[0] if len(found) == 1 else None
+
+
+def _where(path) -> str:
+    """``profile <id>`` or ``calibration`` for a provenance label."""
+    parts = Path(path).parts
+    for i, part in enumerate(parts[:-2]):
+        if part == 'profiles' and i + 1 < len(parts):
+            return f"profile {parts[i + 1]}"
+    return 'calibration'
+
+
+def gain_key(gain) -> str:
+    """Gain in a file name: 1 -> '1.0', 1.2 -> '1.2', 1.25 -> '1.25' (the Sensor dialog's 2 decimals)."""
+    text = f"{round(float(gain), 2):.2f}".rstrip('0')
+    return text + '0' if text.endswith('.') else text
+
+
+def profile_reflectance_path(plan) -> Path | None:
+    """``profiles/<camera>/reflectance/refl_b<bin>_g<gain>.npy`` for the plan's camera values."""
+    if plan.profile_dir is None or plan.gain is None:
+        return None
+    return plan.profile_dir / 'reflectance' / f"refl_b{int(plan.camera_bin)}_g{gain_key(plan.gain)}.npy"
+
+
+def reflectance_save_path(config, plan, source) -> Path:
+    """Where a new calibration of ``source`` goes: the camera profile, else ``reflectance/<source>.npy``."""
+    return profile_reflectance_path(plan) or reflectance_folder(config) / f"{source_stem(source)}.npy"
+
+
 def source_stem(source) -> str:
     """Data source name the factors belong to: the file name without its extension."""
     name = Path(source.path).name
@@ -613,7 +733,13 @@ def _reflectance_step(config, plan, source) -> None:
     wanted = choice not in (None, '', 'none')
     n_bands = plan.n_columns
     white_note = ''
-    if config.white_reference.path not in (None, '') and choice in (None, '', 'none', 'auto'):
+    profile_path = profile_reflectance_path(plan) if choice in (None, '', 'none', 'auto') else None
+    if profile_path is not None and (profile_path.is_file() or not path.is_file()):
+        path = profile_path                   # the camera's own factors for this bin/gain
+    own = profile_path is not None and profile_path.is_file()
+    if own and config.white_reference.path not in (None, ''):
+        white_note = 'camera profile used; white_reference folder skipped'
+    if config.white_reference.path not in (None, '') and choice in (None, '', 'none', 'auto') and not own:
         from reflectance_builder import ensure_white_profile
         try:
             built, white_note = ensure_white_profile(config, plan, source_stem(source))
@@ -629,7 +755,9 @@ def _reflectance_step(config, plan, source) -> None:
     if path is None or not path.is_file():
         if wanted and choice != 'auto':
             raise FileNotFoundError(f"Reflectance profile not found: {path}")
-        why = f"no {path.name} in {path.parent.name}/ (name = data source)"
+        why = (f"no {path.name} in profile {plan.camera_id} (bin {plan.camera_bin}, gain {gain_key(plan.gain)}): "
+               "calibrate with Reflectance... in the GUI" if path == profile_path else
+               f"no {path.name} in {path.parent.name}/ (name = data source)")
         plan.steps['reflectance'] = {'available': False, 'on': False,
                                      'why': f"{white_note}; {why}" if white_note else why}
         plan.provenance['reflectance'] = ('none', choice)
@@ -643,6 +771,7 @@ def _reflectance_step(config, plan, source) -> None:
                              f"{plan.frame_shape[0]} slit rows")
         if factors.ndim not in (1, 2) or not np.isfinite(factors).all():
             raise ValueError("factors must be finite (bands,) or (slit rows, bands)")
+        _check_binding(plan, path)
     except (ValueError, OSError) as exc:
         if wanted and choice != 'auto':
             raise ValueError(f"{path.name}: {exc}") from exc
@@ -663,9 +792,9 @@ def _reflectance_step(config, plan, source) -> None:
     if made_exp and plan.exposure_ms and abs(float(made_exp) - float(plan.exposure_ms)) > 1e-9:
         factors = factors * np.float32(float(made_exp) / float(plan.exposure_ms))
         label += f", scaled from {float(made_exp):g} ms to {float(plan.exposure_ms):g} ms"
-    if made_gain is not None and plan.gain is not None and abs(float(made_gain) - float(plan.gain)) > 1e-9:
-        label += f", WARNING made at gain {float(made_gain):g}, camera at {float(plan.gain):g}"
-        logger.warning("Reflectance %s was made at gain %s, frames are at gain %s", path.name, made_gain, plan.gain)
+    for note in _reflectance_warnings(plan, info):
+        label += f", WARNING {note}"
+        logger.warning("Reflectance %s: %s", path.name, note)
     plan.reflectance_placeholder = bool(info.get('placeholder'))
     if plan.reflectance_placeholder:
         label = (f"PLACEHOLDER {label} - stand-in from {info.get('white', '?')}, not a real white reference; "
@@ -674,6 +803,56 @@ def _reflectance_step(config, plan, source) -> None:
     plan.steps['reflectance'] = {'available': True, 'on': wanted,
                                  'why': label if wanted else f"none (available: {label})"}
     plan.provenance['reflectance'] = (label if wanted else f"none (available: {label})", choice)
+
+
+def _check_binding(plan, path) -> None:
+    """Refuse factors made at another bin or gain (counts per pixel differ; gain is not scaled).
+
+    Factors in a camera's profile are keyed by bin/gain already. A name-based file is checked
+    against the bin/gain its JSON records; for an identified camera it must record them (a
+    per-band profile of another bin has the same bands and would pass every other check).
+    """
+    from reflectance_builder import profile_info
+    if plan.stage != 'raw':
+        return
+    info = profile_info(path)
+    made_bin, made_gain = info.get('camera_bin'), info.get('gain')
+    if made_bin is not None and int(made_bin) != int(plan.camera_bin):
+        raise ValueError(f"made at bin {int(made_bin)}, frames are bin {plan.camera_bin}")
+    if made_gain is not None and plan.gain is not None and gain_key(made_gain) != gain_key(plan.gain):
+        raise ValueError(f"made at gain {float(made_gain):g}, camera is at gain {float(plan.gain):g} "
+                         "(gain is not scaled: calibrate again at this gain)")
+    if plan.camera_id and 'signature' not in info and (made_bin is None or made_gain is None):
+        raise ValueError(f"does not record the bin/gain it was made at; camera {plan.camera_id} needs factors "
+                         "bound to its bin/gain (calibrate with Reflectance... or move them into its profile "
+                         "with tools/migrate_profiles.py)")
+
+
+def _reflectance_warnings(plan, info: dict) -> list[str]:
+    """Conditions that do not stop the factors but make them doubtful: age, temperature, dark."""
+    import datetime
+    notes = []
+    created = info.get('created')
+    if created:
+        try:
+            text = str(created).strip()
+            if text[-1:] in ('Z', 'z'):
+                text = text[:-1] + '+00:00'
+            made = datetime.datetime.fromisoformat(text)
+            now = datetime.datetime.now(made.tzinfo) if made.tzinfo else datetime.datetime.now()
+            hours = (now - made).total_seconds() / 3600.0
+            if plan.reflectance_max_age_h and hours > plan.reflectance_max_age_h:
+                notes.append(f"made {hours:.0f} h ago (lamp may have drifted)")
+        except ValueError:
+            notes.append(f"unreadable 'created' {created!r}: age not checked")
+    made_t = info.get('temperature_c')
+    if made_t is not None and plan.temperature_c is not None and plan.reflectance_max_dtemp_c and \
+            abs(float(made_t) - float(plan.temperature_c)) > plan.reflectance_max_dtemp_c:
+        notes.append(f"made at {float(made_t):.1f} °C, sensor at {float(plan.temperature_c):.1f} °C")
+    steps = info.get('steps') or {}
+    if steps.get('dark') is True and plan.steps.get('dark', {}).get('on') is False:
+        notes.append("made with the dark step on, dark is off now")
+    return notes
 
 
 def apply_reflectance(binned: np.ndarray, factors: np.ndarray) -> np.ndarray:
@@ -687,12 +866,13 @@ def apply_reflectance(binned: np.ndarray, factors: np.ndarray) -> np.ndarray:
     return out
 
 
-def _wavelength_profile_path(config, backend, camera_bin):
+def _wavelength_profile_path(config, plan):
     choice = config.acquisition.wavelength_profile
     if choice in (None, '', 'none'):
         return None
     if choice == 'auto':
-        path = config.calibration_dir / 'wavelength' / backend / f'wavelength_bin{camera_bin}.json'
+        folder, _ = calibration_folder(config, plan, 'wavelength')
+        path = folder / f'wavelength_bin{plan.camera_bin}.json'
         if not path.is_file():
             logger.warning("No wavelength profile %s; using configured m/c", path)
             return None
@@ -712,7 +892,7 @@ def _load_wavelength_profile(path, camera_bin, shape):
     frame_shape = data.get('frame_shape')
     if frame_shape and tuple(frame_shape) != tuple(shape):
         raise ValueError(f"{Path(path).name} was fitted on frames {tuple(frame_shape)}, input is {shape}")
-    return float(data['m']) / profile_bin, float(data['c']), f"calibration:{Path(path).name}"
+    return float(data['m']) / profile_bin, float(data['c']), f"{_where(path)}:{Path(path).name}"
 
 
 def _dark_reference(config, plan, exposure, gain, temperature, o_e, o_g, choice=None, quiet=False):
@@ -726,15 +906,15 @@ def _dark_reference(config, plan, exposure, gain, temperature, o_e, o_g, choice=
         if exposure is None or gain is None:
             warn("Dark auto: exposure/gain unknown (no file metadata, not configured); dark bypassed")
             return None, None, 'missing: exposure/gain unknown'
-        folder = config.calibration_dir / 'dark_frames' / plan.camera_backend
-        result = DarkFrameLibrary(str(folder)).load(bin=plan.camera_bin, exposure=exposure, gain=gain,
+        folder, where = calibration_folder(config, plan, 'dark')
+        result = None if not folder.is_dir() else DarkFrameLibrary(str(folder)).load(bin=plan.camera_bin, exposure=exposure, gain=gain,
                                                     temperature=temperature)
         if result is None:
             warn("Dark auto: no file for bin %d, %.1f ms, gain %.1f in %s; dark bypassed",
                            plan.camera_bin, exposure, gain, folder)
             return None, None, f"missing: bin {plan.camera_bin} exp {exposure} gain {gain}"
         mean, hot = result['mean'], result.get('hot_pixel_map')
-        label = (f"{result['filename']} (auto: bin {plan.camera_bin}, {exposure:g} ms [{o_e}], "
+        label = (f"{result['filename']} (auto from {where}: bin {plan.camera_bin}, {exposure:g} ms [{o_e}], "
                  f"gain {gain:g} [{o_g}])")
         if mean.shape != shape:
             warn("Dark auto: reference %s does not match frames %s; dark bypassed", mean.shape, shape)
@@ -763,7 +943,8 @@ def _smile_model(config, plan, choice=None, quiet=False):
     if choice in (None, '', 'none'):
         return None, 'none'
     if choice == 'auto':
-        path = config.calibration_dir / 'smile_maps' / plan.camera_backend / f'smile_model_bin{plan.camera_bin}.npz'
+        folder, where = calibration_folder(config, plan, 'smile')
+        path = folder / f'smile_model_bin{plan.camera_bin}.npz'
         if not path.is_file():
             warn("Smile auto: no %s; Smile bypassed", path)
             return None, f"missing: {path.name}"
@@ -781,7 +962,7 @@ def _smile_model(config, plan, choice=None, quiet=False):
                            model.image_shape, plan.frame_shape)
             return None, f"mismatch: {path.name} {model.image_shape}"
         raise ValueError(f"Smile model {path.name} {model.image_shape} does not match frames {plan.frame_shape}")
-    return model, f"{path.name} ({model.interp})"
+    return model, f"{path.name} ({model.interp}) [{_where(path)}]"
 
 
 def config_as_dict(config: SimulationConfig) -> dict:

@@ -202,3 +202,19 @@ QPushButton#segmentButton:checked { background-color: @surface_hover; color: @te
 /* Badge colour is the class colour, set per widget by the legend. */
 QPushButton#classBadge { border: 1px solid @border_strong; border-radius: 4px; padding: 0; }
 QPushButton#classBadge:hover { border: 2px solid @accent_hover; }
+
+/* Materials: model selector, one tile per model of the models folder (widgets/model_selector.py). */
+QPushButton#modelTile {
+    background-color: @surface_alt;
+    border: 1px solid @border_strong;
+    border-radius: 8px;
+    padding: 0;
+    text-align: left;
+}
+QPushButton#modelTile:hover { background-color: @surface_hover; border-color: @accent_hover; }
+QPushButton#modelTile:checked { background-color: @surface_hover; border: 2px solid @accent; }
+QPushButton#modelTile:disabled { background-color: @surface; border-color: @border; }
+QLabel#modelTileName { background: transparent; font-size: 13px; font-weight: 700; color: @text; }
+QLabel#modelTileKind { background: transparent; font-size: 11px; color: @text_muted; }
+QLabel#modelTileKind[resampled="true"] { color: @warning; }
+QLabel#modelTileName:disabled, QLabel#modelTileKind:disabled { color: @text_faint; }

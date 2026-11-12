@@ -1,4 +1,5 @@
 """Frame sources, acquisition plan, classifier binding and the lossless pipeline."""
+import importlib.util
 import json
 import sys
 import time
@@ -240,7 +241,7 @@ def test_temperature_scales_confidence_not_class(tmp_path):
     """The artifact's ``temperature`` divides the scores before the confidence (what
     train_sgd_coco.py fits), never changes the class, and is recovered from labels drawn at it."""
     import joblib
-    from train_sgd_coco import fit_temperature, ovr_probabilities
+    from tools.train_sgd_coco import fit_temperature, ovr_probabilities
     rng = np.random.default_rng(2)
     W = rng.normal(0.0, 1.0, (4, 3)).astype(np.float32)
     b = np.array([-1.0, 0.5, -0.2], np.float32)
@@ -317,6 +318,20 @@ def test_block_mode_counts_every_line_in_order(tmp_path):
     assert s.state == 'finished' and s.lines_processed == 600 and s.lines_lost == 0
     assert s.counted_lines == 600 and s.counts.sum() == 600 * 4
     np.testing.assert_array_equal(s.canvas[0], frames[:, 0, 0])            # line order restored
+
+
+def test_count_delay_leaves_out_the_raw_zone_lines(tmp_path):
+    pipeline, _ = stub_pipeline(tmp_path, 600, fps=0, overrun='block', buffers=4, workers=3)
+    run_to_end(pipeline)
+    s = pipeline.snapshot(count_delay_lines=100)
+    assert s.counted_lines == 500
+    np.testing.assert_array_equal(s.counts, np.bincount(s.canvas[:, :500].ravel(), minlength=256))
+    pipeline.reset_counts(pending_lines=100)       # the raw-zone lines belong to the new batch
+    s = pipeline.snapshot(count_delay_lines=100)
+    assert s.counted_lines == 0 and s.counts.sum() == 0
+    s = pipeline.snapshot(count_delay_lines=40)    # 60 of them crossed the divider
+    assert s.counted_lines == 60
+    np.testing.assert_array_equal(s.counts, np.bincount(s.canvas[:, 500:560].ravel(), minlength=256))
 
 
 def test_overrun_drops_are_counted_and_drawn(tmp_path):
@@ -1018,9 +1033,151 @@ def test_profile_is_bound_to_the_camera_values_it_was_made_at(tmp_path):
     folder = tmp_path / 'reflectance'
     moved = backup_profile(folder / 'x.npy')
     assert [p.name.split('_')[0] for p in moved] == ['x', 'x'] and not (folder / 'x.npy').exists()
-    save_profile(folder, ['x'], np.full(probe.n_columns, 0.5, np.float32), probe.wavelengths,
-                 {'exposure_ms': 2.0, 'gain': 4.0})                       # made at 2 ms, gain 4
+    factors = np.full(probe.n_columns, 0.5, np.float32)
+    save_profile(folder, ['x'], factors, probe.wavelengths, {'exposure_ms': 2.0, 'gain': 1.0, 'camera_bin': 2})
     plan = build_plan(config, src)                                       # frames at 1 ms, gain 1
     np.testing.assert_allclose(plan.reflectance_factors, 1.0)            # half the exposure: x 2
-    why = plan.steps['reflectance']['why']
-    assert 'scaled from 2 ms to 1 ms' in why and 'WARNING made at gain 4' in why
+    assert 'scaled from 2 ms to 1 ms' in plan.steps['reflectance']['why']
+    for made, refused in (({'gain': 4.0}, 'made at gain 4'), ({'camera_bin': 1}, 'made at bin 1')):
+        save_profile(folder, ['x'], factors, probe.wavelengths, {'exposure_ms': 1.0, 'gain': 1.0, 'camera_bin': 2, **made})
+        step = build_plan(config, src).steps['reflectance']
+        assert not step['available'] and refused in step['why']          # not scaled: refused
+
+
+def camera_src(frames=None, **meta):
+    meta = {'camera_bin': 2, 'exposure_ms': 1.0, 'gain': 1.0, 'camera_model': 'Apollo-M MAX',
+            'camera_serial': 'SN 1', **meta}
+    return FrameSource('run.h5', np.full((3, 6, 40), 100, np.uint16) if frames is None else frames, 'raw',
+                       metadata=meta)
+
+
+def test_camera_profile_holds_its_own_dark_smile_and_reflectance(tmp_path):
+    from reflectance_builder import save_profile
+    from sim_config import profile_reflectance_path
+    calibration_tree(tmp_path, (6, 40))                                  # backend calibration: dark 7
+    config = make_config(tmp_path, corrections=CorrectionConfig(backend='cpu', dark='auto', smile='auto',
+                                                                reflectance='auto'))
+    src = camera_src()
+    plan = build_plan(config, src)
+    assert plan.camera_id == 'Apollo-M-MAX-SN-1'
+    assert 'calibration/dark_frames/poa' in plan.provenance['dark'][0]  # no profile folder yet: backend layout
+    profile = tmp_path / 'profiles' / 'Apollo-M-MAX-SN-1'
+    (profile / 'dark').mkdir(parents=True)
+    np.savez(profile / 'dark' / 'dark_b2_e1.0_g1.0.npz', mean=np.full((6, 40), 20, np.uint16),
+             hot_pixel_map=np.zeros((6, 40), np.uint8), bin=np.int32(2), exposure=np.float32(1),
+             gain=np.float32(1), n_frames=np.int32(5))
+    (profile / 'smile').mkdir()                                          # empty: never another camera's model
+    plan = build_plan(config, src)
+    assert 'profile Apollo-M-MAX-SN-1' in plan.provenance['dark'][0] and int(plan.dark_mean[0, 0]) == 20
+    assert plan.smile_model is None and 'smile_model_bin2.npz' in plan.provenance['smile'][0]
+    path = profile_reflectance_path(plan)
+    assert path == profile / 'reflectance' / 'refl_b2_g1.0.npy'
+    assert not plan.steps['reflectance']['available'] and 'Reflectance...' in plan.steps['reflectance']['why']
+    save_profile(path.parent, ['refl_b2_g1.0'], np.full(plan.n_columns, 0.25, np.float32), plan.wavelengths,
+                 {'camera_bin': 2, 'gain': 1.0, 'exposure_ms': 1.0})
+    plan = build_plan(config, src)
+    assert plan.steps['reflectance']['on'] and plan.steps['reflectance']['why'].startswith('refl_b2_g1.0.npy')
+    other_gain = build_plan(config, camera_src(gain=2.0)).steps['reflectance']   # other gain: other file
+    assert not other_gain['available'] and 'refl_b2_g2.0.npy' in other_gain['why']
+
+
+def test_identified_camera_refuses_unbound_name_based_factors(tmp_path):
+    from modules.radiometric import save_factor_profile
+    calibration_tree(tmp_path, (6, 40))
+    config = make_config(tmp_path, corrections=CorrectionConfig(backend='cpu', dark='auto', reflectance='auto'))
+    probe = build_plan(config, camera_src())
+    (tmp_path / 'reflectance').mkdir()
+    save_factor_profile(tmp_path / 'reflectance' / 'run.npy', np.ones(probe.n_columns, np.float32), probe.wavelengths)
+    step = build_plan(config, camera_src()).steps['reflectance']
+    assert not step['available'] and 'does not record the bin/gain' in step['why']
+    anonymous = camera_src(camera_serial=None)                           # no identity: as before
+    assert build_plan(config, anonymous).steps['reflectance']['available']
+
+
+def test_reflectance_warns_on_age_temperature_and_dark(tmp_path):
+    from reflectance_builder import save_profile
+    calibration_tree(tmp_path, (6, 40))
+    config = make_config(tmp_path, corrections=CorrectionConfig(backend='cpu', dark='none', reflectance='auto'))
+    probe = build_plan(config, camera_src(temperature_c=30.0))
+    save_profile(tmp_path / 'profiles' / 'Apollo-M-MAX-SN-1' / 'reflectance', ['refl_b2_g1.0'],
+                 np.ones(probe.n_columns, np.float32), probe.wavelengths,
+                 {'camera_bin': 2, 'gain': 1.0, 'temperature_c': 20.0, 'steps': {'dark': True}})
+    info = tmp_path / 'profiles' / 'Apollo-M-MAX-SN-1' / 'reflectance' / 'refl_b2_g1.0.json'
+    data = json.loads(info.read_text())
+    data['created'] = '2020-01-01T00:00:00+07:00'
+    info.write_text(json.dumps(data))
+    why = build_plan(config, camera_src(temperature_c=30.0)).steps['reflectance']['why']
+    assert 'h ago' in why and 'made at 20.0 °C, sensor at 30.0 °C' in why and 'dark is off now' in why
+
+
+# ------------------------------------------------------------- review fixes (profiles) ---
+
+def test_camera_without_serial_uses_the_only_profile_of_its_backend(tmp_path):
+    shape = (6, 40)
+    profile = tmp_path / 'profiles' / 'Apollo-M-MAX-SN-1'
+    (profile / 'dark').mkdir(parents=True)
+    np.savez(profile / 'dark' / 'dark_b2_e1.0_g1.0.npz', mean=np.full(shape, 20, np.uint16),
+             hot_pixel_map=np.zeros(shape, np.uint8), bin=np.int32(2), exposure=np.float32(1),
+             gain=np.float32(1), n_frames=np.int32(5))
+    (profile / 'profile.json').write_text(json.dumps({'camera_backend': 'poa'}))
+    config = make_config(tmp_path, corrections=CorrectionConfig(backend='cpu', dark='auto'))
+    plan = build_plan(config, camera_src(camera_serial=None))           # calibration/dark_frames/poa is gone
+    assert plan.camera_id is None and int(plan.dark_mean[0, 0]) == 20
+    assert 'only poa profile' in plan.provenance['dark'][0]
+    (tmp_path / 'profiles' / 'Other-SN-2').mkdir()
+    (tmp_path / 'profiles' / 'Other-SN-2' / 'profile.json').write_text(json.dumps({'camera_backend': 'poa'}))
+    assert build_plan(config, camera_src(camera_serial=None)).dark_mean is None   # ambiguous: not guessed
+
+
+def test_white_of_another_unit_is_skipped_and_own_profile_wins(tmp_path):
+    from reflectance_builder import find_white, save_profile
+    config, data = white_folder_setup(tmp_path, attrs={'camera_backend': 'poa', 'camera_bin': 2, 'exposure_ms': 1.0,
+                                                       'gain': 1.0, 'camera_model': 'Apollo-M MAX',
+                                                       'camera_serial': 'OTHER'})
+    data = camera_src(frames=data.frames)
+    plan = build_plan(config, data)
+    assert find_white(config, plan)[0] is None and 'camera Apollo-M-MAX-OTHER' in plan.steps['reflectance']['why']
+    own = tmp_path / 'profiles' / 'Apollo-M-MAX-SN-1' / 'reflectance'
+    save_profile(own, ['refl_b2_g1.0'], np.full(plan.n_columns, 0.3, np.float32), plan.wavelengths,
+                 {'camera_bin': 2, 'gain': 1.0, 'exposure_ms': 1.0})
+    step = build_plan(config, data).steps['reflectance']
+    assert step['why'].startswith('refl_b2_g1.0.npy') and 'white_reference folder skipped' in step['why']
+
+
+def test_gain_key_keeps_two_decimals_and_existing_names():
+    from sim_config import gain_key
+    assert [gain_key(g) for g in (1, 1.0, 1.2, 1.25, 1.249, 30)] == ['1.0', '1.0', '1.2', '1.25', '1.25', '30.0']
+
+
+def test_envi_header_identity_finds_the_profile(tmp_path):
+    hdr = tmp_path / 'cube.hdr'
+    (tmp_path / 'cube').write_bytes(np.zeros((4, 6, 40), np.uint16).tobytes())
+    hdr.write_text('ENVI\nsamples = 6\nlines = 4\nbands = 40\nheader offset = 0\nfile type = ENVI Standard\n'
+                   'data type = 12\ninterleave = bip\nbyte order = 0\ncamera model = Apollo-M MAX\n'
+                   'camera serial number = SN 1\n')
+    src = open_envi(hdr, stage='raw', scan_axis='lines')
+    assert src.metadata['camera_model'] == 'Apollo-M MAX' and src.metadata['camera_serial'] == 'SN 1'
+
+
+def test_created_with_z_suffix_is_aged(tmp_path):
+    from sim_config import _reflectance_warnings
+    config, src, plan = dark_plan(tmp_path, dark='auto')
+    plan.reflectance_max_age_h = 1.0
+    assert any('h ago' in n for n in _reflectance_warnings(plan, {'created': '2020-01-01T00:00:00Z'}))
+    assert any('unreadable' in n for n in _reflectance_warnings(plan, {'created': 'yesterday'}))
+
+
+def test_migrate_binds_a_reflectance_without_json(tmp_path):
+    spec = importlib.util.spec_from_file_location('migrate_profiles', ROOT / 'tools' / 'migrate_profiles.py')
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    calibration_tree(tmp_path, (6, 40))
+    (tmp_path / 'reflectance').mkdir()
+    np.save(tmp_path / 'reflectance' / 'live_poa.npy', np.ones(5, np.float32))
+    (tmp_path / 'simulation.json').write_text('{}')
+    rc = tool.main(['--backend', 'poa', '--model', 'M', '--serial', 'S', '--bin', '2', '--gain', '1',
+                    '--config', str(tmp_path / 'simulation.json'), '--apply'])
+    info = json.loads((tmp_path / 'profiles' / 'M-S' / 'reflectance' / 'refl_b2_g1.0.json').read_text())
+    assert rc == 0 and info['camera_bin'] == 2 and info['gain'] == 1.0
+    assert (tmp_path / 'profiles' / 'M-S' / 'dark' / 'dark_b2_e1.0_g1.0.npz').is_file()
+    assert not (tmp_path / 'calibration' / 'dark_frames' / 'poa').exists()
