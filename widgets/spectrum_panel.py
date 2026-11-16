@@ -42,6 +42,29 @@ class SpectrumPoint:
     label: str = ''             # class the model gave this pixel
 
 
+@dataclass
+class TrainingBand:
+    """The training spectra of one class: drawn as a band mean ± SD behind the clicked curves."""
+    label: str
+    colour: str                 # '#RRGGBB' (the class colour of the belt map)
+    mean: np.ndarray            # (bands,)
+    sd: np.ndarray              # (bands,)
+    n_spectra: int = 0
+
+
+def snv(values: np.ndarray, use: np.ndarray | None = None) -> np.ndarray:
+    """Standard normal variate as the model package applies it: mean 0, population SD 1.
+
+    ``use`` (bool mask) picks the bands the mean and SD are taken over (the training range).
+    All NaN when those bands are not finite or constant.
+    """
+    values = np.asarray(values, np.float64)
+    part = values if use is None else values[use]
+    if not part.size or not np.isfinite(part).all() or part.std() == 0:
+        return np.full(values.shape, np.nan)
+    return (values - part.mean()) / part.std()
+
+
 def nice_ticks(lo: float, hi: float, count: int = 4) -> list[float]:
     """About ``count`` round tick values inside ``lo .. hi``."""
     span = hi - lo
@@ -95,6 +118,24 @@ class SpectrumPanel(QFrame):
         self.note_label.setObjectName("metricCaption")
         self.note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # never widens the panel
         header.addWidget(self.note_label, stretch=1)
+        self._training_wavelengths = np.zeros(0)
+        self._training: dict = {False: [], True: []}        # SNV view? -> [TrainingBand]
+        self.training_button = QPushButton("Model reference")
+        self.training_button.setToolTip(
+            "Draw the model's training spectra behind the clicked ones: per class a band mean ± 1 SD\n"
+            "(from the model package). Use these to compare shape, scale and noise.\n"
+            "A point outside mean ± 1 SD alone does not prove a wrong prediction.")
+        self.snv_button = QPushButton("SNV")
+        self.snv_button.setToolTip(
+            "Show the spectra after SNV (mean 0, SD 1 over the training bands): what the model compares.\n"
+            "Brightness differences vanish here; shape and noise remain.")
+        for button in (self.training_button, self.snv_button):
+            button.setObjectName("toggleButton")
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setEnabled(False)
+            button.toggled.connect(lambda _on: self.plot.update())
+            header.addWidget(button)
         self.clear_button = QPushButton("Clear")
         self.clear_button.setObjectName("presetButton")
         self.clear_button.setToolTip("Remove every spectrum and its mark on the belt map")
@@ -104,6 +145,10 @@ class SpectrumPanel(QFrame):
         header.addWidget(self.clear_button)
         layout.addLayout(header)
         self.plot = _SpectrumPlot(self)
+        self.reference_label = QLabel("No training reference supplied by this model")
+        self.reference_label.setObjectName("metricCaption")
+        self.reference_label.setWordWrap(True)
+        layout.addWidget(self.reference_label)
         layout.addWidget(self.plot, stretch=1)
 
     # ------------------------------------------------------------------------ public ---
@@ -125,6 +170,51 @@ class SpectrumPanel(QFrame):
     def set_note(self, text: str) -> None:
         """One short line beside the caption (why a click gave no spectrum, or what was added)."""
         self.note_label.setText(text)
+
+    def set_training(self, wavelengths=None, bands=(), snv_bands=()) -> None:
+        """The training spectra of the model in use (``None`` / empty: the model brings none).
+
+        Args:
+            wavelengths: (bands,) nm of the training axis.
+            bands: :class:`TrainingBand` per class in the units of the model input.
+            snv_bands: the same after SNV; empty when the model does not use SNV (no SNV view).
+        """
+        had = bool(self._training[False])
+        self._training_wavelengths = np.zeros(0) if wavelengths is None else np.asarray(wavelengths, np.float64)
+        self._training = {False: list(bands), True: list(snv_bands)}
+        self.reference_label.setText(
+            f"Model reference: {len(bands)} classes · shaded mean ± 1 SD · dashed mean · solid clicked spectra"
+            if bands else "No training reference supplied by this model · captured spectra remain available")
+        self.training_button.setEnabled(bool(bands))
+        self.snv_button.setEnabled(bool(snv_bands))
+        if not snv_bands:
+            self.snv_button.setChecked(False)
+        if not bands:
+            self.training_button.setChecked(False)
+        elif not had:
+            self.training_button.setChecked(True)          # a model with training spectra: show them
+        self.plot.update()
+
+    @property
+    def snv_shown(self) -> bool:
+        return self.snv_button.isChecked()
+
+    def shown_training(self) -> tuple[np.ndarray, list[TrainingBand]]:
+        """``(wavelengths, bands)`` drawn now (no bands when ``Training`` is off)."""
+        if not self.training_button.isChecked():
+            return self._training_wavelengths, []
+        return self._training_wavelengths, self._training[self.snv_shown]
+
+    def shown_values(self, point: SpectrumPoint) -> np.ndarray:
+        """The curve of ``point`` in the current view (as received, or after SNV)."""
+        if not self.snv_shown:
+            return point.values
+        wl = self._training_wavelengths
+        if not wl.size:
+            return snv(point.values)
+        half = (wl[-1] - wl[0]) / max(1, wl.size - 1) / 2
+        use = (point.wavelengths >= wl[0] - half) & (point.wavelengths <= wl[-1] + half)
+        return snv(point.values, use)
 
     def add_point(self, wavelengths, values, line: int, row: int, label: str = '') -> SpectrumPoint:
         """Add one curve; the oldest goes when there are more than :attr:`MAX_POINTS`."""
@@ -186,10 +276,12 @@ class _SpectrumPlot(QWidget):
     def paintEvent(self, event) -> None:
         self._tokens = QApplication.instance().property('theme_tokens') or {}
         points = self._panel.points
+        train_wl, bands = self._panel.shown_training()
+        curves = [self._panel.shown_values(pt) for pt in points]
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        if not points:
+        if not points and not bands:
             p.setPen(self._colour('text_faint'))
             p.setFont(self._font(11))
             p.drawText(QRectF(0, 0, w, h), Qt.AlignCenter | Qt.TextWordWrap, EMPTY_TEXT)
@@ -200,9 +292,11 @@ class _SpectrumPlot(QWidget):
         left, bottom = 44, 15 if h >= 60 else 0
         area = QRectF(left, 3, max(10.0, w - left - key - 6), max(8.0, h - bottom - 5))
 
-        finite = [(pt.wavelengths[np.isfinite(pt.values)], pt.values[np.isfinite(pt.values)]) for pt in points]
-        xs = np.concatenate([pt.wavelengths for pt in points])
-        ys = np.concatenate([v for _, v in finite]) if any(v.size for _, v in finite) else np.zeros(1)
+        xs = np.concatenate([pt.wavelengths for pt in points] + ([train_wl] if bands else []))
+        ys = np.concatenate([v[np.isfinite(v)] for v in curves]
+                            + [np.concatenate((b.mean - b.sd, b.mean + b.sd)) for b in bands] + [np.zeros(0)])
+        if not ys.size:
+            ys = np.zeros(1)
         x0, x1 = float(xs.min()), float(xs.max())
         y0, y1 = min(0.0, float(ys.min())), float(ys.max())
         if x1 <= x0:
@@ -239,16 +333,40 @@ class _SpectrumPlot(QWidget):
         p.setPen(QPen(self._colour('border_strong'), 1))
         p.setBrush(Qt.NoBrush)
         p.drawRect(area)
-        if self._panel.unit:
+        unit = "SNV of the model input" if self._panel.snv_shown else self._panel.unit
+        if unit:
             p.setPen(self._colour('text_muted'))
             p.drawText(QRectF(area.left() + 5, area.top() + 2, area.width() - 10, 14),
-                       Qt.AlignLeft | Qt.AlignVCenter, self._panel.unit)
+                       Qt.AlignLeft | Qt.AlignVCenter, unit)
+
+        p.setClipRect(area.adjusted(-1, -1, 1, 1))
+        # training spectra: band mean ± SD and the mean (dashed), behind the clicked curves
+        for band in bands:
+            colour = self._band_colour(band)
+            upper = [at(x, y) for x, y in zip(train_wl, band.mean + band.sd)]
+            lower = [at(x, y) for x, y in zip(train_wl, band.mean - band.sd)]
+            outline = QPainterPath()
+            outline.moveTo(upper[0])
+            for q in upper[1:] + lower[::-1]:
+                outline.lineTo(q)
+            outline.closeSubpath()
+            fill = QColor(colour)
+            fill.setAlpha(46)
+            p.setPen(Qt.NoPen)
+            p.setBrush(fill)
+            p.drawPath(outline)
+            centre = QPainterPath()
+            centre.moveTo(at(train_wl[0], band.mean[0]))
+            for x, y in zip(train_wl[1:], band.mean[1:]):
+                centre.lineTo(at(x, y))
+            p.setPen(QPen(colour, 1.2, Qt.DashLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(centre)
 
         # curves: a gap where a value is NaN / inf
-        p.setClipRect(area.adjusted(-1, -1, 1, 1))
-        for pt in points:
+        for pt, values in zip(points, curves):
             path, pen_down = QPainterPath(), False
-            for x, y in zip(pt.wavelengths, pt.values):
+            for x, y in zip(pt.wavelengths, values):
                 if not np.isfinite(y):
                     pen_down = False
                     continue
@@ -282,4 +400,26 @@ class _SpectrumPlot(QWidget):
                 text = f"{pt.label} · row {pt.row}" if pt.label else f"row {pt.row}"
                 text = p.fontMetrics().elidedText(text, Qt.ElideRight, int(key - offset - 8))
                 p.drawText(QRectF(x + offset, y, key - offset - 6, self.KEY_ROW), Qt.AlignLeft | Qt.AlignVCenter, text)
+            # ... then the training bands (a bar, not a dot)
+            p.setFont(self._font(11))
+            for i, band in enumerate(bands, start=len(points)):
+                y = 3 + i * self.KEY_ROW
+                if y + self.KEY_ROW > h:
+                    break
+                fill = self._band_colour(band)
+                fill.setAlpha(150)
+                p.setPen(Qt.NoPen)
+                p.setBrush(fill)
+                p.drawRect(QRectF(x, y + self.KEY_ROW / 2 - 3, 9, 6))
+                p.setPen(self._colour('text_muted'))
+                text = f"{band.label} train" + (f" · n {band.n_spectra:,}" if band.n_spectra else "")
+                text = p.fontMetrics().elidedText(text, Qt.ElideRight, int(key - 21))
+                p.drawText(QRectF(x + 13, y, key - 19, self.KEY_ROW), Qt.AlignLeft | Qt.AlignVCenter, text)
         p.end()
+
+    def _band_colour(self, band: TrainingBand) -> QColor:
+        """The class colour; one too close to the panel background becomes the muted text colour."""
+        colour, back = QColor(band.colour), self._colour('surface_alt')
+        if abs(colour.lightness() - back.lightness()) < 40 and colour.saturation() < 60:
+            return self._colour('text_muted')
+        return colour

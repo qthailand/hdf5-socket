@@ -128,6 +128,13 @@ QLabel#statusLabel { padding: 6px 8px; font-size: 13px; font-weight: 600; color:
 QLabel#statusLabel[accent="warn"]  { color: @warning; }
 QLabel#statusLabel[accent="error"] { color: @danger; }
 
+QLabel#operationState { padding: 6px 12px; font-size: 14px; font-weight: 600; }
+QLabel#operationState[accent="error"] { color: @danger; }
+QLabel#operationState[accent="warn"] { color: @warning; }
+QLabel#operationContext { padding: 4px 8px; color: @text_muted; }
+QTabWidget#workspaceTabs::pane { border: none; background: @bg; }
+QTabWidget#workspaceTabs::tab-bar { left: 0; }
+
 QLabel#backendLabel { padding: 4px 8px; font-size: 12px; color: @text_muted; }
 QLabel#backendLabel[accent="warn"] { color: @warning; }
 
@@ -214,7 +221,60 @@ QPushButton#modelTile {
 QPushButton#modelTile:hover { background-color: @surface_hover; border-color: @accent_hover; }
 QPushButton#modelTile:checked { background-color: @surface_hover; border: 2px solid @accent; }
 QPushButton#modelTile:disabled { background-color: @surface; border-color: @border; }
+/* a model trained in this session (quick model): not a file, gone when the program closes */
+QPushButton#modelTile[session="true"] { border-style: dashed; }
+QPushButton#modelTile[session="true"]:checked { border: 2px dashed @accent; }
 QLabel#modelTileName { background: transparent; font-size: 13px; font-weight: 700; color: @text; }
 QLabel#modelTileKind { background: transparent; font-size: 11px; color: @text_muted; }
 QLabel#modelTileKind[resampled="true"] { color: @warning; }
 QLabel#modelTileName:disabled, QLabel#modelTileKind:disabled { color: @text_faint; }
+
+/* ------------------------------------------------ calibration dialogs --- */
+
+QDoubleSpinBox {
+    background-color: @surface_alt;
+    color: @text;
+    border: 1px solid @border;
+    border-radius: 6px;
+    padding: 3px 6px;
+}
+QDoubleSpinBox:focus, QComboBox:focus { border-color: @accent; }
+
+QPushButton#primaryButton {
+    background-color: @accent;
+    color: @on_accent;
+    border-color: @accent;
+    font-weight: 600;
+    padding: 6px 18px;
+}
+QPushButton#primaryButton:hover { background-color: @accent_hover; border-color: @accent_hover; }
+QPushButton#primaryButton:disabled { background-color: @surface_alt; color: @text_faint; border-color: @border; }
+QPushButton#quietButton { padding: 6px 14px; }
+QPushButton#quietButton:disabled { color: @text_faint; }
+
+QGraphicsView#referenceView { background-color: @image_bg; border: 1px solid @border; border-radius: 6px; }
+
+QLabel#dialogTitle { background: transparent; font-size: 17px; font-weight: 700; color: @text; }
+QLabel#fieldLabel { background: transparent; color: @text_muted; font-size: 11px; }
+QLabel#rowName { background: transparent; color: @text; font-size: 12px; font-weight: 600; }
+QLabel#rowSource { background: transparent; color: @text_muted; font-size: 11px; }
+QLabel#issueList { background: transparent; color: @text_muted; font-size: 11px; }
+
+/* state pill: ON / OFF / IN FACTORS ... */
+QLabel#chip {
+    background-color: @surface_hover;
+    color: @text_muted;
+    border: 1px solid @border_strong;
+    border-radius: 9px;
+    padding: 0;
+    font-size: 10px;
+    font-weight: 700;
+}
+QLabel#chip[state="ok"]    { color: @success; border-color: @success; }
+QLabel#chip[state="warn"]  { color: @warning; border-color: @warning; }
+QLabel#chip[state="error"] { color: @danger;  border-color: @danger; }
+
+QLabel#verdict { background: transparent; font-size: 16px; font-weight: 700; color: @text_muted; }
+QLabel#verdict[state="ok"]    { color: @success; }
+QLabel#verdict[state="warn"]  { color: @warning; }
+QLabel#verdict[state="error"] { color: @danger; }

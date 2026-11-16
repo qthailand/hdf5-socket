@@ -110,7 +110,7 @@ How it runs (`Pipeline._live_loop`, `camera_source.py`):
 * **Latency** starts at the camera timestamp for GenICam (camera clock latched to the host and
   re-latched every 30 s; implausible stamps trigger one immediate re-latch, then fall back to
   the arrival time), otherwise at the frame's arrival (`Snapshot.line_clock`: `camera` /
-  `arrival`). *Queue wait* in the Performance tab is always the time in the buffers.
+  `arrival`). *Queue wait* in Diagnostics is always the time in the buffers.
 * Gain, exposure and bin stay fixed while running, because they select the calibration: change
   them in `simulation.json` or with `--set` and start again. The pipeline's camera thread owns the
   camera and closes it when the pipeline stops. If a read hangs inside the SDK, closing the
@@ -200,6 +200,22 @@ m 0.2903, c 399.791, 2 nm, no flip, no dark, no Smile) reproduce `dataset/datase
 for bit from `spectrogram02.h5` (cube column *j* = frame 2*j*+1), which
 `tests/test_simulation.py::test_raw_pipeline_reproduces_the_training_cube` checks.
 
+## Portable Flat-field profiles
+
+Copy an HSI `flat_YYYYMMDD_HHMMSS` profile folder into
+`profiles/<model>-<serial>/flatfield/` on this computer. Keep `flatfield.json`,
+`profile.npy` and `profile.wavelength.npy` together; copying the whole folder is recommended.
+Startup creates missing `profiles` and camera `flatfield` folders automatically.
+The newest compatible profile is loaded automatically; the **Flat-field** checkbox
+in Processing steps enables or disables it. There is no profile selection button or
+dependency on the acquisition computer. See [profiles/README.md](profiles/README.md)
+for matching rules and integrated **Flat-field + reference** calibration.
+
+`corrections.flatfield: "auto"` and `corrections.flatfield_enabled: false` are the
+defaults. Set the latter to `true` for the initial enabled state (the calibrated
+Dark/Flip/Smile settings must match). Flat-field is applied after binning and before
+Reflectance and the classifier.
+
 ## Model binding
 
 The model artifact carries `band_wavelengths`. The selected bands are matched to the input
@@ -268,6 +284,16 @@ Things to know:
 * **Input.** The package declares reflectance, so the Reflectance step must be on (the GUI
   warns otherwise). SNV removes brightness and offset per pixel; a wrong white reference still
   changes the spectral shape.
+* **Noise (`model.mlc_reg_covar`).** A full covariance over 137 bands has directions with almost
+  no training variance, so the model tolerates very little noise the training cubes did not
+  have: on the class means of `Kratom_adulteration` plus white noise, 0.005 reflectance per band
+  already turns the leaves into `Pradu`/`Background` and 0.01 turns everything into
+  `Background` (the widest covariance). `model.mlc_reg_covar` is added to the diagonal of every
+  class covariance when the package is loaded; `0` (default) is the model exactly as trained.
+  In that simulation 0.03 / 0.1 / 1.0 keep the classes up to a noise of 0.005 / 0.01 / 0.02.
+  The binding line and the model's tooltip then say `covariance + ...: not as trained`. It is a
+  workaround: the cure is retraining (larger `reg_covar`, fewer features, more cubes per class),
+  and a raised value must be checked on known material.
 * **Classes and colours** come from the package (ids from 0; `Background` is hidden in the
   shares by `display.hidden_classes`). A pixel with a constant or non-finite spectrum (dead
   pixel, the all-zero warm-up frame) has no SNV and gets the package's background class.
@@ -446,11 +472,22 @@ Until a holder keeps the Spectralon under the slit, calibrate on the running vie
 2. **Reflectance…**: pick the white standard (a table in `reflectance/`, e.g.
    `Spectralon_ref-020.xlsx`, or **Constant reflectance (%)**), choose per-band or row-wise
    factors, and check the camera values the result will be bound to. While the dialog is open
-   the pipeline keeps the newest 256 binned lines from before the reflectance step.
-3. **Draw on RAW**: the belt map freezes (lines that weren't kept are dimmed). Drag a
-   rectangle over the standard in the RAW zone, and **Esc** cancels. The summary shows white
-   counts, % of full scale, spread, factor range and weak bands. Then choose **Apply & Save**,
-   **Draw again** or **Cancel**.
+   the pipeline keeps the newest 256 binned lines from before Flat-field and Reflectance.
+3. **Grab image**: freeze the newest captured lines inside the same settings window.
+   Scroll the mouse wheel to zoom; right/middle drag to pan; left drag to draw a rectangle
+   over the standard. **Fit image** restores the full view; **Grab image** takes a new
+   snapshot and clears the old ROI. The belt display and camera keep running.
+4. **Review calibration…** shows white counts, % of full scale, spread, factor range and
+   weak bands. Choose **Apply & Save**, **Draw again** or **Cancel**. Drawing again returns
+   to the same image and zoom in the settings window; cancelling the window changes nothing.
+
+The review includes a **Captured ROI check**: target reflectance, calibrated ROI mean and
+maximum band-mean error. This verifies the calculation on the captured ROI, not a new live
+measurement. Applying factors clears old Spectrum probes/history, including in-flight results
+from the previous processing version. Click a newly acquired reference pixel to verify live data.
+When a compatible flat-field profile is loaded, **Flat-field + reference** folds its spatial
+response into the reflectance factors (HSI convention); standalone Flat-field stays off so it
+is not divided twice. Ordinary per-band factors are also calibrated on pre-flat counts.
 
 **Apply & Save** uses the factors from the next line on and switches Reflectance on. It writes
 `profiles/<camera>/reflectance/refl_b<bin>_g<gain>.npy` (a camera without model/serial:
@@ -664,7 +701,7 @@ A row of cards under the belt map, visible whatever side tab is open: **Camera F
 target line rate), **Processed FPS** (lines classified per second), **Capacity (est.)** (workers ×
 1000 / ms per line, with headroom over the target), **Lost lines** and **Latency p50 / p99**. The
 stripe turns orange/red when processing falls behind, headroom drops below 1.3× / 1×, or lines are
-lost. The Performance tab has the details per stage.
+lost. Diagnostics has the details per stage.
 
 Measured with the final setup (GenICam 1024 × 1280, full chain incl. reflectance and the
 30-band model, frames from the disk cache, i9-12900K CPU):
@@ -681,7 +718,7 @@ this CPU (more workers compete with OpenCV's own threads). Smile is the largest 
 
 ## Real-time performance panel
 
-The side panel has two tabs. **Performance** measures speed and efficiency of the pipeline
+The **Diagnostics** workspace measures speed and efficiency of the pipeline
 (not accuracy) — what a real sorter with camera and belt must guarantee:
 
 | Element | Meaning |
@@ -694,23 +731,30 @@ The side panel has two tabs. **Performance** measures speed and efficiency of th
 **Reset** restarts averages and peaks (do it after changing backend, workers or corrections).
 At 1600 lines/s with the full chain on this CPU the panel shows the cause directly: Flip + Smile
 3.2 ms, Total 4.1 ms over a 2.5 ms budget, capacity ~950/s, queue wait ~270 ms, lines lost.
-Chart colours are the `chart_*` tokens of the theme. **Materials** is the former class panel.
+Chart colours are the `chart_*` tokens of the theme. **Materials** remains in the Operation
+side panel, alongside the default **Composition** view.
 
 ## Window layout
 
-The left side is one vertical splitter: **raw spectrogram + focus | belt map | bottom pane**
-(backend selector, status line, provenance info).
-
-* Upper handle, or the **Spectrogram** button: shrink or fully collapse the real-time raw
-  spectrogram preview. While collapsed it is not rendered at all (saves GUI time at high rates).
-* **Focus** button: the focus aid beside the preview (below); hidden = no score computed.
-* Lower handle: drag down to give the belt map more height; the info panel shrinks to nothing,
-  the backend row and status line stay visible.
-* Vertical handle between the images and **Material Analytics**, or the **Analytics** button:
-  change the panel width or hide it completely; the images get the freed width.
-* The layout is remembered between runs (Windows registry,
-  `HKCU\Software\NARIT-TSC\PushbroomSortingSimulation`); delete that key to get the default
-  1:2 split back.
+* **Operation** keeps the original CLASSIFIED/RAW belt map above **Spectrum**, with
+  **Composition** (stacked shares, real-time/accumulated table and donut) on the right.
+  **Materials** still contains the class controls, Reset Batch and model selector.
+  Throughput KPIs remain visible below the images.
+* Drag the horizontal handle to change the belt/Spectrum proportions. The **Spectrum**
+  button hides the lower pane and releases its history buffer; it does not open the raw preview.
+* **Model reference** overlays the loaded package's training mean ± 1 SD in each class colour,
+  behind clicked spectra. **SNV** compares preprocessed curves when the package supplies them.
+  Models without training-reference arrays explicitly show that no reference is available;
+  no reference is fabricated. Leaving the envelope alone does not prove a wrong prediction.
+* **Setup & Calibration** contains Sensor, Reflectance, Train, processing checkboxes,
+  backend/line-rate controls, camera provenance, raw spectrogram and Focus. Technical camera
+  previews are rendered and focus is scored only while that workspace is visible.
+* **Diagnostics** contains the performance charts and detailed pipeline status.
+* The **Analytics** button or vertical handle changes the Composition/Materials width or
+  hides it. The freed width goes to both the belt map and Spectrum.
+* Layout preferences are remembered in `HKCU\Software\NARIT-TSC\PushbroomSortingSimulation`.
+  The redesigned panes use new keys so old three-pane layouts cannot hide the new Spectrum.
+  Default image heights are approximately 2:1 (belt:Spectrum).
 
 ## Focusing the camera (focus aid)
 

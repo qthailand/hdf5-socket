@@ -283,6 +283,15 @@ def quality(white: WhiteReference, factors: np.ndarray, reflectance: np.ndarray,
         'weak_bands_nm': [float(white.wavelengths[i]) for i in weak],
         'steps': white.steps,
     }
+    roi_factors = factors[r0:r1] if factors.ndim == 2 else factors
+    checked = (roi * roi_factors).mean(axis=0)
+    relative_error = np.abs(checked - reflectance) / np.maximum(np.abs(reflectance), 1e-12)
+    report['captured_roi_check'] = {
+        'target_mean': float(np.mean(reflectance)),
+        'calibrated_mean': float(checked.mean()),
+        'band_mean_min_max': [float(checked.min()), float(checked.max())],
+        'max_relative_error_pct': float(relative_error.max() * 100),
+    }
     if full_scale:
         report['white_peak_pct_of_full_scale'] = float(100 * roi.max() / full_scale)
     return report
@@ -502,7 +511,7 @@ def reference_values(reference, wavelengths) -> np.ndarray:
 
 def factors_from_lines(lines: np.ndarray, rows: tuple[int, int], reflectance: np.ndarray, wavelengths,
                        kind: str = 'band', avg_window: int = 20, steps: dict | None = None,
-                       source: str = 'drawn on RAW'):
+                     source: str = 'drawn on RAW', flatfield: np.ndarray | None = None):
     """Factors from binned lines ``(n, slit, bands)`` (before reflectance) with the target in ``rows``.
 
     Returns:
@@ -522,7 +531,212 @@ def factors_from_lines(lines: np.ndarray, rows: tuple[int, int], reflectance: np
         raise ValueError("the drawn area has no signal (dark step on? target under the slit?)")
     white = WhiteReference(mean, np.asarray(wavelengths, np.float64), int(lines.shape[0]),
                            dict(steps or {}), source)
+    if kind == 'flatfield':
+        flat = np.asarray(flatfield, np.float64)
+        if flat.shape != mean.shape or not np.isfinite(flat).all() or np.any(flat <= 0):
+            raise ValueError('A matching finite, positive flat-field profile is required')
+        # HSI convention: the small white ROI supplies the band scale; F supplies slit response.
+        normalized = (mean / flat)[r0:r1].mean(axis=0)
+        if not np.isfinite(normalized).all() or np.any(normalized <= 0):
+            raise ValueError('The flat-field corrected ROI has invalid or zero signal')
+        factors = (np.asarray(reflectance) / normalized)[None, :] / flat
+        return factors.astype(np.float32), white
     return factors_from_white(mean, reflectance, kind, (r0, r1), avg_window), white
+
+
+def _pixel_noise(roi: np.ndarray, max_pairs: int = 64) -> np.ndarray:
+    """Noise of one pixel per band ``(bands,)`` from the difference of neighbouring scan lines.
+
+    ``SD(difference) / sqrt(2)``: a gradient along the slit or a slow drift does not count as
+    noise. At most ``max_pairs`` line pairs, spread over the area, are used (bounded time and
+    memory for any area); one line only: neighbouring slit rows; one pixel: NaN.
+    """
+    n, n_rows, bands = roi.shape
+    if n > 1:
+        starts = np.unique(np.linspace(0, n - 2, min(n - 1, max_pairs)).astype(int))
+        pairs = ((roi[i + 1], roi[i]) for i in starts)
+    elif n_rows > 1:
+        pairs = iter([(roi[0, 1:], roi[0, :-1])])
+    else:
+        return np.full(bands, np.nan)
+    total, squares, count = np.zeros(bands), np.zeros(bands), 0
+    for a, b in pairs:
+        diff = np.subtract(a, b, dtype=np.float64)
+        total += diff.sum(axis=0)
+        squares += np.einsum('ij,ij->j', diff, diff)
+        count += diff.shape[0]
+    variance = squares / count - (total / count) ** 2
+    return np.sqrt(np.maximum(variance, 0.0) / 2.0)
+
+
+def signal_check(lines: np.ndarray, rows: tuple[int, int], wavelengths=None, full_scale: float | None = None,
+                 dark_level: float | None = None, clipped: np.ndarray | None = None) -> dict:
+    """Is the light on the drawn standard good enough to calibrate with? (before any factor exists)
+
+    Args:
+        lines: Binned, dark-subtracted lines ``(n, slit, bands)`` of the drawn scan range.
+        rows: Slit rows ``(first, last + 1)`` of the drawn area.
+        wavelengths: ``(bands,)`` nm, to name bands in the messages.
+        full_scale: Sensor full scale in the counts of ``lines`` (``None``: level not judged).
+        dark_level: Dark offset that was subtracted (median of the dark frame), same counts.
+        clipped: ``(n, slit)`` raw pixels per line and slit row that were at full scale before
+            dark, Smile and binning (``Pipeline.calibration_capture(with_clipped=True)``); the
+            binned mean of a band hides them. ``None``: not counted.
+
+    Returns:
+        ``mean`` / ``noise`` / ``snr`` per band (noise of one pixel, from the difference of
+        neighbouring scan lines so that a gradient along the slit does not count as noise),
+        ``peak_pct`` of the range left above the dark, ``slit_spread_pct`` / ``scan_spread_pct``,
+        ``issues`` as ``[(level, text)]`` with level ``'red'`` or ``'yellow'``, ``levels`` per metric
+        (``peak``, ``snr``, ``even``, ``dark``: ``green``/``yellow``/``red``/``grey`` = not judged) and ``status``
+        (``'red'``: do not calibrate, ``'yellow'``: usable with the listed limits, ``'green'``).
+
+    Raises:
+        ValueError: no lines or rows outside the slit.
+    """
+    lines = np.asarray(lines)
+    if lines.ndim != 3 or lines.shape[0] == 0:
+        raise ValueError("no captured lines inside the drawn area")
+    r0, r1 = int(rows[0]), int(rows[1])
+    if not 0 <= r0 < r1 <= lines.shape[1]:
+        raise ValueError(f"rows {r0}:{r1} outside the slit 0:{lines.shape[1]}")
+    # The drawn area can be the whole capture (hundreds of MB as float64): work on the view and
+    # reduce with float64 accumulators, never a float64 copy of the area.
+    roi = lines[:, r0:r1]
+    wl = None if wavelengths is None else np.asarray(wavelengths, np.float64)
+    line_band = roi.mean(axis=1, dtype=np.float64)                       # (lines, bands)
+    mean = line_band.mean(axis=0)
+    noise = _pixel_noise(roi)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        snr = np.where(noise > 0, mean / noise, np.inf)
+    snr = np.where(mean > 0, snr, 0.0)
+    slit, scan = roi.mean(axis=(0, 2), dtype=np.float64), line_band.mean(axis=1)
+
+    def spread(profile):
+        return float(100 * profile.std() / profile.mean()) if profile.size > 1 and profile.mean() > 0 else 0.0
+
+    def at(band):
+        return f"band {band}" if wl is None else f"{wl[band]:.0f} nm"
+
+    issues: list[tuple[str, str]] = []
+    levels = {'peak': 'green' if full_scale else 'grey', 'snr': 'green', 'even': 'green',
+              'dark': 'green' if dark_level else 'grey'}
+
+    def flag(level: str, key: str, text: str) -> None:
+        issues.append((level, text))
+        if level == 'red' or levels[key] != 'red':
+            levels[key] = level
+
+    peak, peak_pct = float(roi.max()), None
+    if not np.isfinite(mean).all() or mean.max() <= 0:
+        flag('red', 'peak', "No signal in the drawn area")
+    if full_scale:
+        peak_pct = 100.0 * peak / max(float(full_scale) - float(dark_level or 0.0), 1.0)
+        if peak_pct >= 98:
+            flag('red', 'peak', f"Saturated ({peak_pct:.0f} % of range)")
+        elif peak_pct > 80:
+            flag('yellow', 'peak', f"Near saturation ({peak_pct:.0f} % of range)")
+        elif peak_pct < 1:
+            flag('red', 'peak', "Signal too low (< 1 % of range; aim at 50-80 %)")
+        elif peak_pct < 10:
+            flag('yellow', 'peak', "Low signal (< 10 % of range; aim at 50-80 %)")
+    clipped_pixels = None
+    if clipped is not None:
+        area = np.asarray(clipped)[:, r0:r1]
+        clipped_pixels = int(area.sum(dtype=np.int64))
+        if clipped_pixels:
+            flag('red', 'peak', f"Saturated: {clipped_pixels:,} raw pixels at ≥ 95 % of full scale, in "
+                                f"{int(np.count_nonzero(area))} of {area.size} line-rows")
+    finite = snr[np.isfinite(snr)]
+    median_snr = float(np.median(snr)) if snr.size else 0.0
+    worst = int(np.argmin(snr))
+    if finite.size and mean.max() > 0:
+        if median_snr < 10:
+            flag('red', 'snr', "SNR < 10: single-pixel spectra are noise")
+        elif median_snr < 50:
+            flag('yellow', 'snr', "SNR < 50")
+        weak = int(np.count_nonzero(snr < 10))
+        if weak and median_snr >= 10:
+            flag('yellow', 'snr', f"{weak}/{snr.size} bands SNR < 10 (worst at {at(worst)})")
+    if dark_level and 0 < mean.max() < float(dark_level):
+        weakest = float(mean[mean > 0].min()) if np.any(mean > 0) else 1.0
+        flag('yellow', 'dark', f"Signal below the dark offset: 1 count of dark drift = {100 / weakest:.0f} % at the weakest band")
+    slit_spread, scan_spread = spread(slit), spread(scan)
+    if slit_spread > 5:
+        flag('yellow', 'even', f"Uneven along the slit (±{slit_spread:.1f} %)")
+    if scan_spread > 3:
+        flag('yellow', 'even', f"Not steady along the scan (±{scan_spread:.1f} %)")
+    for name, profile in (('slit rows', slit), ('scan lines', scan)):
+        if profile.size >= 4 and np.median(profile) > 0 and min(profile[0], profile[-1]) < 0.9 * np.median(profile):
+            flag('yellow', 'even', f"Area touches the edge of the standard ({name})")
+    status = 'red' if any(level == 'red' for level, _ in issues) else 'yellow' if issues else 'green'
+    return {'mean': mean, 'noise': noise, 'snr': snr, 'median_snr': median_snr, 'min_snr': float(snr[worst]),
+            'worst_band': worst, 'peak': peak, 'peak_pct': peak_pct, 'clipped_pixels': clipped_pixels, 'dark_level': dark_level,
+            'slit_spread_pct': slit_spread, 'scan_spread_pct': scan_spread, 'pixels': int(roi.shape[0] * roi.shape[1]),
+            'issues': issues, 'levels': levels, 'status': status}
+
+
+def verify_lines(lines: np.ndarray, rows: tuple[int, int], factors: np.ndarray, reflectance: np.ndarray,
+                 wavelengths=None, tolerance_pct: float = 2.0) -> dict:
+    """Check existing factors on captured lines of a known standard (an independent measurement).
+
+    Args:
+        lines: Binned lines ``(n, slit, bands)`` before the reflectance step (calibration capture).
+        rows: Slit rows ``(first, last + 1)`` where the standard is.
+        factors: The factors in use, ``(bands,)`` or ``(slit, bands)``.
+        reflectance: ``(bands,)`` certified reflectance of the standard.
+        wavelengths: ``(bands,)`` nm, only to name the worst band.
+        tolerance_pct: Band-mean error that still counts as agreement.
+
+    Returns:
+        ``measured`` / ``sd`` (mean and pixel SD per band), ``reference``, ``error_pct`` per band
+        (``100 * (measured - reference) / reference``) and their summary with a ``verdict`` line.
+
+    Raises:
+        ValueError: no lines, rows outside the slit, or factors of another shape.
+    """
+    lines = np.asarray(lines)
+    if lines.ndim != 3 or lines.shape[0] == 0:
+        raise ValueError("no captured lines inside the drawn area")
+    _, slit, bands = lines.shape
+    r0, r1 = int(rows[0]), int(rows[1])
+    if not 0 <= r0 < r1 <= slit:
+        raise ValueError(f"rows {r0}:{r1} outside the slit 0:{slit}")
+    factors = np.asarray(factors, np.float64)
+    reference = np.asarray(reflectance, np.float64)
+    if factors.shape[-1] != bands or (factors.ndim == 2 and factors.shape[0] != slit) or factors.ndim > 2:
+        raise ValueError(f"factors {factors.shape} do not fit the captured lines ({slit}, {bands})")
+    if reference.shape != (bands,):
+        raise ValueError(f"{reference.size} reference values for {bands} bands")
+    # line by line: the area can be the whole capture, which must not be copied as float64
+    scale = factors[r0:r1] if factors.ndim == 2 else factors
+    total, squares = np.zeros(bands), np.zeros(bands)
+    for line in lines[:, r0:r1]:
+        values = line * scale                                # (rows, bands) float64
+        total += values.sum(axis=0)
+        squares += np.einsum('ij,ij->j', values, values)
+    n_pixels = lines.shape[0] * (r1 - r0)
+    measured = total / n_pixels
+    sd = np.sqrt(np.maximum(squares / n_pixels - measured ** 2, 0.0))
+    if not np.isfinite(measured).all():
+        raise ValueError("the drawn area contains invalid values (NaN/inf): draw it inside the valid slit rows")
+    error = 100.0 * (measured - reference) / np.maximum(np.abs(reference), 1e-12)
+    worst = int(np.nanargmax(np.abs(error)))
+    bias, spread, peak = float(np.nanmean(error)), float(np.nanstd(error)), float(np.abs(error[worst]))
+    if peak <= tolerance_pct:
+        verdict = f"OK: every band within ±{tolerance_pct:g} % of the reference"
+    elif abs(bias) > tolerance_pct and spread < 0.5 * abs(bias):
+        verdict = (f"Same offset in every band ({bias:+.1f} %): light level, exposure, gain or the distance/"
+                   "angle of the standard changed since the calibration, or the wrong standard is selected")
+    else:
+        verdict = ("Error changes with wavelength: dark offset, saturation or weak bands, a shifted wavelength "
+                   "axis, or a different lamp spectrum than at the calibration")
+    return {'measured': measured, 'sd': sd, 'reference': reference, 'error_pct': error,
+            'mean_error_pct': bias, 'rms_error_pct': float(np.sqrt(np.nanmean(error ** 2))),
+            'max_abs_error_pct': peak, 'worst_band': worst,
+            'worst_nm': None if wavelengths is None else float(np.asarray(wavelengths)[worst]),
+            'pixels': int(n_pixels), 'rows': [r0, r1], 'lines': int(lines.shape[0]),
+            'tolerance_pct': float(tolerance_pct), 'ok': bool(peak <= tolerance_pct), 'verdict': verdict}
 
 
 def backup_profile(path) -> list[Path]:

@@ -32,6 +32,7 @@ class ModelEntry:
     classifier: object = None       # loaded and ready for Pipeline.set_classifier (usable entries)
     kind: str = ''                  # short second line of a selector tile: what it is, or why not usable
     resampled_nm: float | None = None   # usable through interpolation: largest distance model band - input band
+    session: bool = False           # trained in this session (quick model): in memory only, no file
 
     def same_file(self, other) -> bool:
         return other is not None and _key(self.path) == _key(other)
@@ -94,7 +95,7 @@ def _describe(classifier) -> tuple[str, str]:
     package = getattr(classifier, 'package', None)
     if package is not None:
         kind = f"{package.algorithm} · {len(names)} classes"
-        lines = [package.chain, f"score: {package.metric}", f"hsi_lab_core {package.lab_core_version}, "
+        lines = [getattr(classifier, 'chain', package.chain), f"score: {package.metric}", f"hsi_lab_core {package.lab_core_version}, "
                  f"exported {package.exported_at}"]
     else:
         kind = f"linear · {len(names)} classes"
@@ -105,7 +106,8 @@ def _describe(classifier) -> tuple[str, str]:
     return kind, '\n'.join(lines)
 
 
-def probe_model(path, plans, tolerance_nm: float, classifier=None, resample: bool = True) -> ModelEntry | None:
+def probe_model(path, plans, tolerance_nm: float, classifier=None, resample: bool = True,
+                mlc_reg_covar: float = 0.0) -> ModelEntry | None:
     """Load ``path`` and bind it to every plan.
 
     Args:
@@ -113,6 +115,7 @@ def probe_model(path, plans, tolerance_nm: float, classifier=None, resample: boo
             the input interpolated onto its bands; its entry says so (``resampled_nm``).
         classifier: The already loaded classifier of ``path`` (the pipeline's current model), to
             save loading it again.
+        mlc_reg_covar: ``model.mlc_reg_covar``, for a package that is loaded here.
 
     Returns:
         The entry, or ``None`` for a joblib file that is not a model artifact at all (those
@@ -122,7 +125,7 @@ def probe_model(path, plans, tolerance_nm: float, classifier=None, resample: boo
     path = Path(path)
     try:
         if classifier is None:
-            classifier = load_classifier(path)
+            classifier = load_classifier(path, mlc_reg_covar)
     except (KeyError, TypeError, AttributeError) as exc:
         if path.suffix.lower() == '.joblib':             # some other joblib file, not a model artifact
             logger.debug("%s is not a model artifact (%s: %s)", path.name, type(exc).__name__, exc)
@@ -152,6 +155,17 @@ def probe_model(path, plans, tolerance_nm: float, classifier=None, resample: boo
                       f"{kind} · resampled {shift:.1f} nm", resampled_nm=shift)
 
 
+def session_entry(classifier, config, plans) -> ModelEntry:
+    """The entry of a model trained in this session (``classifier.path`` is its name, not a file)."""
+    entry = probe_model(classifier.path, plans, config.model.band_tolerance_nm, classifier,
+                        getattr(config.model, 'resample', True))
+    entry.session = True
+    if entry.usable:
+        entry.kind = f"{entry.kind} · session"
+    entry.detail += "\n\nTrained in this session: not saved, gone when the program closes."
+    return entry
+
+
 def scan_models(config, plans, current=None) -> list[ModelEntry]:
     """Every model file of :func:`model_folders`, probed against ``plans``.
 
@@ -165,7 +179,8 @@ def scan_models(config, plans, current=None) -> list[ModelEntry]:
     entries = []
     for path in files:
         own = current if current_path and _key(path) == _key(current_path) else None
-        entry = probe_model(path, plans, tolerance, own, getattr(config.model, 'resample', True))
+        entry = probe_model(path, plans, tolerance, own, getattr(config.model, 'resample', True),
+                            getattr(config.model, 'mlc_reg_covar', 0.0))
         if entry is not None:
             entries.append(entry)
     logger.info("Models: %d usable of %d found in %s", sum(e.usable for e in entries), len(entries),

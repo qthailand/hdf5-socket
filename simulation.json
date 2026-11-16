@@ -34,6 +34,8 @@
     ]
   },
   "corrections": {
+    "flatfield": "auto",
+    "flatfield_enabled": false,
     "enabled": true,
     "backend": "auto",
     "dark": "auto",
@@ -63,7 +65,8 @@
     "folders": [
       "models"
     ],
-    "band_tolerance_nm": 0.5
+    "band_tolerance_nm": 0.5,
+    "mlc_reg_covar": 0.0
   },
   "optics": {
     "slit_width_um": 50.0,

@@ -179,9 +179,27 @@ class Resampled:
 class PushbroomLineClassifier:
     """Classify each slit pixel of a binned frame; read-only, so workers can share it."""
 
+    #: True for a model trained in this session (never a file: gone when the program closes)
+    session = False
+
     def __init__(self, model_artifact_path: str) -> None:
-        artifact = joblib.load(model_artifact_path)
-        self.path = str(model_artifact_path)
+        self._load(joblib.load(model_artifact_path), str(model_artifact_path))
+
+    @classmethod
+    def from_artifact(cls, artifact: dict, name: str) -> 'PushbroomLineClassifier':
+        """A classifier of an artifact that is in memory only (``quick_model.train_artifact``).
+
+        ``name`` stands in for the file path wherever the model is named (log, selector tile).
+        """
+        self = cls.__new__(cls)
+        self._load(artifact, str(name))
+        self.session = True
+        return self
+
+    def _load(self, artifact: dict, path: str) -> None:
+        self.path = path
+        if artifact.get('class_colors'):                   # class id -> [r, g, b] for the belt map
+            self.class_colors = {int(k): [int(c) for c in v] for k, v in artifact['class_colors'].items()}
         self.W_fused = np.ascontiguousarray(artifact['W_fused'], dtype=np.float32)
         self.b_fused = np.ascontiguousarray(artifact['b_fused'], dtype=np.float32)
         self.selected_bands = np.asarray(artifact['selected_bands'], dtype=np.intp)
@@ -338,11 +356,15 @@ class PushbroomLineClassifier:
         return self._class_ids[winner], confidence
 
 
-def load_classifier(model_artifact_path) -> PushbroomLineClassifier:
-    """The classifier of a model file: an HSI MLOps package (a zip) or a joblib artifact."""
+def load_classifier(model_artifact_path, mlc_reg_covar: float = 0.0) -> PushbroomLineClassifier:
+    """The classifier of a model file: an HSI MLOps package (a zip) or a joblib artifact.
+
+    ``mlc_reg_covar`` (``model.mlc_reg_covar``) only concerns a package: see
+    :class:`HsiPackageClassifier`.
+    """
     from hsi_package import is_package
     if is_package(model_artifact_path):
-        return HsiPackageClassifier(model_artifact_path)
+        return HsiPackageClassifier(model_artifact_path, mlc_reg_covar)
     return PushbroomLineClassifier(model_artifact_path)
 
 
@@ -361,12 +383,23 @@ class HsiPackageClassifier(PushbroomLineClassifier):
     A pixel whose spectrum is constant (SD 0: a dead or saturated pixel, the all-zero warm-up
     frame) or not finite has no SNV. It gets the package's background class if it has one,
     otherwise the class the model gives the all-zero feature vector; its confidence is 0.
+
+    ``mlc_reg_covar`` (``model.mlc_reg_covar``, default 0 = exactly the trained model) is added to
+    the diagonal of every class covariance (scaled feature units, on top of the training's own
+    ``reg_covar``). A full covariance over many bands has directions with almost no training
+    variance; input a little noisier than the training cubes is then far from every class and
+    falls to the class with the widest covariance (the background). A larger value makes the
+    model tolerate that noise, at the price of no longer being the model that was validated.
     """
 
     _CHUNK = 4096                                 # slit pixels per pass (bounds the scratch arrays)
 
-    def __init__(self, model_artifact_path) -> None:
+    def __init__(self, model_artifact_path, mlc_reg_covar: float = 0.0) -> None:
         from hsi_package import load_package
+        mlc_reg_covar = float(mlc_reg_covar)
+        if not 0.0 <= mlc_reg_covar < float('inf'):
+            raise ValueError(f"mlc_reg_covar must be >= 0, got {mlc_reg_covar!r}")
+        self.mlc_reg_covar = mlc_reg_covar
         package = load_package(model_artifact_path)
         self.package = package
         self.path = str(model_artifact_path)
@@ -397,9 +430,10 @@ class HsiPackageClassifier(PushbroomLineClassifier):
         constants = np.empty(n_classes)
         whitening = np.empty((n_classes, n_features, n_features))
         centers = package.scaler_mean / package.scaler_scale + package.means         # (K, F)
+        extra = mlc_reg_covar * np.eye(n_features)
         for k in range(n_classes):
             try:
-                lower = np.linalg.cholesky(package.covariances[k])
+                lower = np.linalg.cholesky(package.covariances[k] + extra)
             except np.linalg.LinAlgError as exc:
                 raise ValueError(f"{self.path}: the covariance of class {int(self.classes_[k])} is not positive "
                                  "definite") from exc
@@ -427,13 +461,21 @@ class HsiPackageClassifier(PushbroomLineClassifier):
              tolerance_nm: float = 0.5, resample: bool = True) -> tuple[np.ndarray | Resampled, str]:
         """One input column per **training** band (SNV needs them all); see the base class."""
         columns, binding = super().bind(wavelengths, n_columns, tolerance_nm, resample)
+        binding = f"{binding}; {self.chain}"
         if isinstance(columns, Resampled):                 # every training band interpolated
-            return columns, f"{binding}; {self.package.chain}"
+            return columns, binding
         if np.unique(columns).size != columns.size:
             raise ValueError(f"The input's {n_columns} bands cannot supply the model's {self.n_bands} training "
                              "bands one to one (two model bands fall on the same input band): the input must "
                              "have the training data's spectral resolution")
-        return columns, f"{binding}; {self.package.chain}"
+        return columns, binding
+
+    @property
+    def chain(self) -> str:
+        """The package's chain, and what this classifier was told to change of it."""
+        if not self.mlc_reg_covar:
+            return self.package.chain
+        return f"{self.package.chain} (covariance + {self.mlc_reg_covar:g}: model.mlc_reg_covar, not as trained)"
 
     def _scores(self, binned: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``(scores (n, classes) float32, valid (n,) bool)``; an invalid pixel is scored as z = 0."""

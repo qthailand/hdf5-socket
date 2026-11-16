@@ -103,8 +103,13 @@ def build_package(folder, name='model', ddof=0, change=None, wrap=False, steps=(
         'axis_values': WAVELENGTHS.tolist(),
         'classes': [{'class_id': int(k), 'label': LABELS[k], 'n_spectra': int(counts[k]),
                      'mean': z[y == k].mean(axis=0).tolist(), 'sd': z[y == k].std(axis=0, ddof=1).tolist()}
+                    for k in classes]},
+        'raw_wavelength_analysis': {
+        'axis_values': WAVELENGTHS.tolist(),
+        'classes': [{'class_id': int(k), 'label': LABELS[k], 'n_spectra': int(counts[k]),
+                     'mean': x[y == k].mean(axis=0).tolist(), 'sd': x[y == k].std(axis=0, ddof=1).tolist()}
                     for k in classes]}}}
-    axis = {'spectral_axis_kind': 'wavelength_nm', 'spectral_resampling_mode': 'none',
+    axis ={'spectral_axis_kind': 'wavelength_nm', 'spectral_resampling_mode': 'none',
             'selected_source_band_indices': list(range(WAVELENGTHS.size))}
     manifest = {
         'name': 'test model', 'algorithm': 'MLC', 'task_type': 'classification', 'labels': LABELS,
@@ -403,6 +408,43 @@ def test_pipeline_classifies_with_a_package(tmp_path, package_path):
     expected = np.bincount(pipeline.classifier.predict(cube.reshape(-1, WAVELENGTHS.size), columns), minlength=256)
     np.testing.assert_array_equal(s.counts, expected)
     assert expected[0] and expected[1] and expected[2]
+
+
+def test_mlc_reg_covar_widens_the_covariances_and_is_off_by_default(tmp_path, package_path):
+    """model.mlc_reg_covar adds to the diagonal of every class covariance; 0 is the trained model."""
+    from pipeline import build_pipeline
+    from test_simulation import write_envi
+    trained = load_classifier(package_path)
+    assert trained.mlc_reg_covar == 0.0 and trained.chain == trained.package.chain
+    model = load_classifier(package_path, 0.25)
+    columns, how = model.bind(WAVELENGTHS, WAVELENGTHS.size)
+    assert 'covariance + 0.25' in how and 'not as trained' in how
+    rng = np.random.default_rng(3)
+    x, y = training_spectra(rng, n=600)
+    x = (x + rng.normal(0.0, 0.01, x.shape)).astype(np.float32)             # noisier than the training
+    widened = replace(model.package, covariances=model.package.covariances + 0.25 * np.eye(len(SELECTED)))
+    reference = reference_scores(widened, x)
+    np.testing.assert_array_equal(model.predict(x, columns), reference.argmax(axis=1))
+    ids, confidence = model.predict_confidence(x, columns)
+    np.testing.assert_array_equal(ids, reference.argmax(axis=1))
+    posterior = np.exp(reference - reference.max(axis=1, keepdims=True))
+    np.testing.assert_allclose(confidence, posterior.max(axis=1) / posterior.sum(axis=1), atol=1e-3)
+    with pytest.raises(ValueError, match='mlc_reg_covar'):
+        load_classifier(package_path, -0.1)
+    # joblib artifacts ignore it; the configuration carries it to the pipeline's classifier
+    for bad in (-1.0, 'big', True, float('nan')):
+        with pytest.raises(ValueError, match='mlc_reg_covar'):
+            replace(SimulationConfig(base_dir=str(tmp_path)), model=ModelConfig(mlc_reg_covar=bad)).validate()
+    write_envi(tmp_path, x[:120].reshape(8, 15, WAVELENGTHS.size), 'bip', wavelengths=WAVELENGTHS)
+    config = replace(SimulationConfig(base_dir=str(tmp_path)),
+                     source=SourceConfig(path=str(tmp_path / 'cube.bip.hdr'), cache='ram'),
+                     camera=CameraConfig(fps=0, overrun='block', buffer_frames=4, loop=False),
+                     corrections=CorrectionConfig(backend='cpu', reflectance='none'),
+                     processing=ProcessingConfig(workers=1, profile_every_s=0),
+                     model=ModelConfig(path=str(package_path), mlc_reg_covar=0.25)).validate()
+    pipeline = build_pipeline(config)
+    assert pipeline.classifier.mlc_reg_covar == 0.25
+    assert 'covariance + 0.25' in pipeline.plans[0].provenance['model bands'][0]
 
 
 # ------------------------------------------------------------- the delivered packages ---

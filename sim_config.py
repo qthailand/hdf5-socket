@@ -110,6 +110,8 @@ class CorrectionConfig:
     hot_pixel: bool = True               # repair the dark file's hot pixels
     smile: str = 'none'                  # none | auto | path to smile_model_bin<N>.npz
     reflectance: str = 'none'            # none | auto | path: counts x factor, last step before the model
+    flatfield: str = 'auto'              # newest matching copied profile in profiles/<camera>/flatfield/
+    flatfield_enabled: bool = False      # initial checkbox state
     reflectance_dir: str = 'reflectance' # <dir>/<source name>.npy (+ .wavelength.npy), see reflectance/README.md
     profiles_dir: str = 'profiles'       # <dir>/<model>-<serial>/{dark,smile,wavelength,reflectance}/
     reflectance_max_age_h: float = 24.0  # older factors are flagged (lamp drift); 0 = never
@@ -192,6 +194,10 @@ class ModelConfig:
     # A model whose bands are further away than that (the wavelength calibration was redone after
     # it was trained) is fed the input interpolated onto its bands; false: such a model is refused.
     resample: bool = True
+    # .hsipkg (MLC) only: added to the diagonal of every class covariance. 0 = the model exactly as
+    # trained. Raise it (0.03 .. 1) when live data falls to Background: the input is noisier than
+    # the training cubes. Not the validated model any more: check the result on known material.
+    mlc_reg_covar: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -257,6 +263,9 @@ class SimulationConfig:
             raise ValueError("acquisition.camera_bin must be >= 1")
         if not isinstance(self.model.resample, bool):       # "False"/"off" are text, and text is true
             raise ValueError(f"model.resample must be true or false, got {self.model.resample!r}")
+        reg = self.model.mlc_reg_covar
+        if isinstance(reg, bool) or not isinstance(reg, (int, float)) or not 0 <= reg < float('inf'):
+            raise ValueError(f"model.mlc_reg_covar must be a number >= 0, got {reg!r}")
         if self.acquisition.resolution_nm <= 0 or self.acquisition.m_nm_per_px_bin1 <= 0:
             raise ValueError("acquisition.m_nm_per_px_bin1 and resolution_nm must be > 0")
         if self.corrections.backend not in ('auto', 'cpu_fused', 'cpu', 'cupy_cuda', 'opencv_cuda'):
@@ -345,7 +354,9 @@ def load_config(path=None, explicit: dict | None = None, **overrides) -> Simulat
         if bad:
             raise ValueError(f"{path.name}: unknown key(s) {sorted(bad)} in '{name}' (allowed: {sorted(allowed)})")
         sections[name] = cls(**values)
-    return SimulationConfig(**sections, base_dir=str(path.parent)).validate()
+    config = SimulationConfig(**sections, base_dir=str(path.parent)).validate()
+    ensure_profile_structure(config)
+    return config
 
 
 # --------------------------------------------------------------------- acquisition plan ---
@@ -354,7 +365,7 @@ def load_config(path=None, explicit: dict | None = None, **overrides) -> Simulat
 #: subtraction + hot-pixel repair together, like hsi's ``DarkProcessor.set_dark_enabled``
 #: (whether hot pixels are repaired is ``corrections.hot_pixel``). ``reflectance`` is the
 #: last step before inference (hsi ``modules.radiometric``: counts x factor).
-STEP_NAMES = ('dark', 'flip', 'smile', 'binning', 'reflectance')
+STEP_NAMES = ('dark', 'flip', 'smile', 'binning', 'flatfield', 'reflectance')
 
 
 @dataclass
@@ -381,6 +392,7 @@ class AcquisitionPlan:
     smile_model: object = None
     reflectance_factors: np.ndarray | None = None   # (slit, bands) or (bands,) float32, also when offered off
     reflectance_placeholder: bool = False           # factors marked placeholder in reflectance/<name>.json
+    flatfield_profile: object = None               # portable HSI profile; immutable per-frame snapshot
     exposure_ms: float | None = None             # of the frames: a white of another exposure is scaled to it
     gain: float | None = None
     temperature_c: float | None = None           # sensor temperature (selects the dark; flags reflectance)
@@ -469,6 +481,7 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
     # identity, not a setting: always from the metadata (use_file_metadata does not apply)
     plan.camera_id = camera_profile_name(meta.get('camera_model'), meta.get('camera_serial'))
     plan.profile_dir = profiles_root(config) / plan.camera_id if plan.camera_id else None
+    ensure_profile_structure(config, plan.camera_id)
     prov['camera profile'] = (
         (f"{plan.camera_id}" + ('' if plan.profile_dir.is_dir() else ' (no profile folder yet)'))
         if plan.camera_id else 'none: no camera_model/camera_serial (calibration/<backend>/ is used)', origin)
@@ -540,7 +553,7 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
                               'why': 'always on: the model needs wavelength bins'}}
     if not cor.enabled:
         prov['corrections'] = ('disabled (frames go straight to binning)', 'config')
-        for name in ('dark', 'smile', 'reflectance'):
+        for name in ('dark', 'smile', 'flatfield', 'reflectance'):
             plan.steps[name] = {'available': False, 'on': False, 'why': 'corrections.enabled = false'}
         return plan
 
@@ -579,6 +592,8 @@ def build_plan(config: SimulationConfig, source) -> AcquisitionPlan:
                            'why': label if model is not None else
                            f"no Smile model for bin {plan.camera_bin} with frame size {shape}"}
     _reflectance_step(config, plan, source)
+    from flatfield_profile import configure_flatfield
+    configure_flatfield(config, plan)
     prov['correction backend'] = (cor.backend, 'config')
     optics = optics_summary(config.optics, plan.camera_bin, plan.m_nm_per_px_bin1, plan.resolution_nm)
     if optics:
@@ -634,6 +649,17 @@ def camera_profile_name(model, serial) -> str | None:
 def profiles_root(config) -> Path:
     """``corrections.profiles_dir`` as a path."""
     return config.resolve(config.corrections.profiles_dir) or Path(config.base_dir) / 'profiles'
+
+
+def ensure_profile_structure(config, camera_id=None) -> None:
+    """Create portable flat-field folders on startup, without altering calibration lookup."""
+    root = profiles_root(config)
+    root.mkdir(parents=True, exist_ok=True)
+    folders = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith('.')]
+    if camera_id:
+        folders.append(root / camera_id)
+    for folder in folders:
+        (folder / 'flatfield').mkdir(parents=True, exist_ok=True)
 
 
 def calibration_folder(config, plan, kind: str) -> tuple[Path, str]:
@@ -737,9 +763,19 @@ def _reflectance_step(config, plan, source) -> None:
     if profile_path is not None and (profile_path.is_file() or not path.is_file()):
         path = profile_path                   # the camera's own factors for this bin/gain
     own = profile_path is not None and profile_path.is_file()
+    if not own and path is not None and path.is_file():
+        # A calibration the operator drew in the GUI (saved by data source name: camera without a
+        # serial) is newer knowledge than any recorded white: it must survive the next start.
+        from reflectance_builder import profile_info
+        own = str(profile_info(path).get('method', '')).startswith('drawn in Reflectance dialog')
     if own and config.white_reference.path not in (None, ''):
-        white_note = 'camera profile used; white_reference folder skipped'
-    if config.white_reference.path not in (None, '') and choice in (None, '', 'none', 'auto') and not own:
+        white_note = ('camera profile used' if path == profile_path else 'calibration drawn in the GUI used') \
+            + '; white_reference folder skipped'
+    if config.white_reference.path not in (None, '') and not own and config.live_camera:
+        # No default for a live camera: factors hold only for the light, distance and optics the
+        # white was recorded with. Without its own calibration the step stays off and says so.
+        white_note = 'not calibrated (the recorded white in white_reference is not used for a live camera)'
+    elif config.white_reference.path not in (None, '') and choice in (None, '', 'none', 'auto') and not own:
         from reflectance_builder import ensure_white_profile
         try:
             built, white_note = ensure_white_profile(config, plan, source_stem(source))

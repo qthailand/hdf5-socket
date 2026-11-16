@@ -454,7 +454,7 @@ def dark_plan(tmp_path, **corrections):
 
 def test_steps_dark_and_hot_pixel_are_one_switch(tmp_path):
     _, _, plan = dark_plan(tmp_path, dark='auto')
-    assert set(plan.steps) == {'dark', 'flip', 'smile', 'binning', 'reflectance'}
+    assert set(plan.steps) == {'dark', 'flip', 'smile', 'binning', 'flatfield', 'reflectance'}
     assert plan.steps['dark'] == {'available': True, 'on': True, 'why': plan.steps['dark']['why']}
     assert '1 hot pixels repaired' in plan.steps['dark']['why']
     on, off = plan.dark_processor(True), plan.dark_processor(False)
@@ -943,6 +943,35 @@ def test_white_reference_folder_makes_factors_at_start(tmp_path):
     reflectance = apply_reflectance(binned, plan.reflectance_factors)
     np.testing.assert_allclose(reflectance[1:5].mean(axis=0), 0.5, rtol=1e-2)
     assert not (tmp_path / 'reflectance' / 'run.npy').exists()           # hand-made profiles untouched
+
+
+def test_gui_calibration_survives_the_next_start_despite_the_white_folder(tmp_path):
+    """Camera without a serial: the drawn calibration is saved by name and must beat the recorded white."""
+    from reflectance_builder import save_profile
+    config, data = white_folder_setup(tmp_path)
+    plan = build_plan(config, data)
+    assert plan.camera_id is None and 'from white white.h5' in plan.steps['reflectance']['why']
+    drawn = np.full(plan.n_columns, 0.123, np.float32)
+    save_profile(tmp_path / 'reflectance', ['run'], drawn, plan.wavelengths,
+                 {'method': 'drawn in Reflectance dialog (GUI)', 'camera_bin': 2, 'gain': 1.0, 'exposure_ms': 1.0})
+    again = build_plan(config, data)
+    np.testing.assert_array_equal(again.reflectance_factors, drawn)
+    why = again.steps['reflectance']['why']
+    assert why.startswith('run.npy') and 'calibration drawn in the GUI used; white_reference folder skipped' in why
+
+
+def test_live_camera_has_no_default_reflectance_from_a_recorded_white(tmp_path):
+    from reflectance_builder import save_profile
+    config, data = white_folder_setup(tmp_path)
+    assert build_plan(config, data).steps['reflectance']['on']                      # file replay: as before
+    live = replace(config, source=replace(config.source, kind='camera'))
+    plan = build_plan(live, data)
+    step = plan.steps['reflectance']
+    assert not step['available'] and not step['on'] and plan.reflectance_factors is None
+    assert step['why'].startswith('not calibrated')
+    save_profile(tmp_path / 'reflectance', ['run'], np.full(plan.n_columns, 0.123, np.float32), plan.wavelengths,
+                 {'method': 'drawn in Reflectance dialog (GUI)', 'camera_bin': 2, 'gain': 1.0, 'exposure_ms': 1.0})
+    assert build_plan(live, data).steps['reflectance']['on']                        # its own calibration: used
 
 
 def test_white_reference_is_cached_until_the_white_changes(tmp_path):

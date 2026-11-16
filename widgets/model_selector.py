@@ -12,8 +12,8 @@ import re
 from pathlib import Path
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
-from PyQt5.QtWidgets import (QButtonGroup, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
-                             QWidget)
+from PyQt5.QtWidgets import (QButtonGroup, QGridLayout, QHBoxLayout, QLabel, QMenu, QPushButton, QSizePolicy,
+                             QVBoxLayout, QWidget)
 
 #: Tiles per row (the side panel is at least 260 px wide: two tiles keep the names readable).
 COLUMNS = 2
@@ -37,6 +37,7 @@ class ModelTile(QPushButton):
         super().__init__(parent)
         self.entry = entry
         self.setObjectName("modelTile")
+        self.setProperty('session', bool(getattr(entry, 'session', False)))   # dashed border: not a file
         self.setCheckable(True)
         self.setMinimumHeight(TILE_HEIGHT)
         policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
@@ -87,6 +88,8 @@ class ModelSelector(QWidget):
     #: the entry (``model_catalog.ModelEntry``) of the tile the operator clicked
     chosen = pyqtSignal(object)
     rescan_requested = pyqtSignal()
+    #: the entry of a session model the operator wants gone (right click on its tile)
+    remove_requested = pyqtSignal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -142,6 +145,9 @@ class ModelSelector(QWidget):
             if names.count(names[index]) > 1:          # two exports of one model, x.zip beside x.hsipkg
                 tile.set_name(Path(str(entry.path)).name.replace('_', ' '))   # full name, can wrap
             tile.clicked.connect(lambda _=False, t=tile: self._on_clicked(t))
+            if getattr(entry, 'session', False):
+                tile.setContextMenuPolicy(Qt.CustomContextMenu)
+                tile.customContextMenuRequested.connect(lambda pos, t=tile: self._session_menu(t, pos))
             self._group.addButton(tile)
             self._grid.addWidget(tile, index // COLUMNS, index % COLUMNS)
             self.tiles.append(tile)
@@ -165,6 +171,12 @@ class ModelSelector(QWidget):
             running = f"running: {display_name(getattr(classifier, 'path', ''))}"
             self._note.setText(f"{running} (not in models)" if self.tiles else f"{running} · folder models is empty")
             self._note.setToolTip(f"{self._note.text()}\n{getattr(classifier, 'path', '')}")
+
+    def _session_menu(self, tile: ModelTile, pos) -> None:
+        menu = QMenu(self)
+        remove = menu.addAction("Remove this session model")
+        if menu.exec_(tile.mapToGlobal(pos)) is remove:
+            self.remove_requested.emit(tile.entry)
 
     def _on_clicked(self, tile: ModelTile) -> None:
         # the owner decides (and calls set_current): a click alone does not move the highlight

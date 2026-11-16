@@ -41,6 +41,11 @@ import numpy as np
 from modules.preprocessing import PreprocessingRuntime
 from sim_config import STEP_NAMES, apply_reflectance
 
+#: A raw pixel at or above this fraction of the camera's full scale counts as clipped. Below
+#: 1.0 on purpose: a camera that averages its hardware bin (POA) reports less than full scale
+#: when only some of the binned photosites are full.
+CLIP_FRACTION = 0.95
+
 logger = logging.getLogger(__name__)
 
 LOST_CLASS = 255                     # class id drawn for lines lost to overrun
@@ -62,6 +67,11 @@ def _effective(plan, overrides: dict) -> dict:
         if name == 'binning' or wanted is None:
             wanted = info['on']
         result[name] = bool(wanted) and (info['available'] or name == 'binning' and info['on'])
+    flat = getattr(plan, 'flatfield_profile', None)
+    if result.get('flatfield') and flat is not None:
+        result['flatfield'] = (result['dark'] == flat.dark and result['flip'] == flat.flip
+                               and result['smile'] == flat.smile
+                               and not result['reflectance'])
     return result
 
 
@@ -146,6 +156,7 @@ class _Job:
     cycle: int
     t_queued: float     # perf_counter time the line entered the buffers (queue wait starts here)
     model: tuple = None  # (generation, classifier, columns per plan) this line is classified with
+    spectrum_generation: int = 0  # processing/calibration version used by this worker
 
 
 @dataclass
@@ -199,6 +210,8 @@ def build_pipeline(config) -> 'Pipeline':
     (or here, if building the rest fails). With ``live.reader = "process"`` it is opened and read
     in a camera process of its own (``camera_process.py``).
     """
+    from sim_config import ensure_profile_structure
+    ensure_profile_structure(config)
     src_cfg = config.source
     camera = None
     if src_cfg.kind == 'camera':
@@ -234,7 +247,7 @@ def _bind_pipeline(config, sources, camera) -> 'Pipeline':
         classifier = SpeedTestClassifier()
         logger.warning("model.path = none: %s", classifier.path)
     else:
-        classifier = load_classifier(config.resolve(config.model.path))
+        classifier = load_classifier(config.resolve(config.model.path), config.model.mlc_reg_covar)
     plans = []
     for src in sources:
         plan = build_plan(config, src)
@@ -374,10 +387,13 @@ class Pipeline:
         self._cal_ring: np.ndarray | None = None
         self._cal_ids: np.ndarray | None = None
         self._cal_pos = 0
+        self._cal_clip: np.ndarray | None = None       # (lines, slit) clipped raw pixels per slit row
+        self._cal_clip_level: float | None = None      # raw counts; None: unknown full scale / binned input
         # Spectrum preview (GUI: click on the belt map): the newest lines as the model received
         # them, by line number, kept only while switched on (see start_spectrum_history).
         self._spec_ring: np.ndarray | None = None
         self._spec_ids: np.ndarray | None = None
+        self._spectrum_generation = 0
         self._canvas_col = 0
         self._canvas_filled = 0
         self._canvas_line = 0
@@ -569,11 +585,20 @@ class Pipeline:
         """
         unknown = set(switches) - set(STEP_NAMES)
         if unknown or 'binning' in switches:
-            raise ValueError(f"switchable steps are dark, flip, smile, reflectance; got {sorted(switches)}")
+            raise ValueError(f"switchable steps are dark, flip, smile, flatfield, reflectance; got {sorted(switches)}")
         with self._lock:
+            if switches.get('flatfield') is True and switches.get('reflectance') is True:
+                raise ValueError('Use integrated flat-field reflectance factors instead of applying Flat-field twice')
             steps = dict(self._steps)
             steps.update(switches)
+            if switches.get('flatfield') is True:
+                steps['reflectance'] = False
+            elif switches.get('reflectance') is True:
+                steps['flatfield'] = False
+            changed = steps != self._steps
             self._steps = steps
+            if changed:
+                self._invalidate_spectra_locked()
         logger.info("Processing steps: %s", ', '.join(f"{k}={'plan' if v is None else v}" for k, v in steps.items()))
 
     def effective_steps(self, plan_index: int = 0) -> dict:
@@ -589,20 +614,32 @@ class Pipeline:
         """
         plan = self.plans[0]
         shape = (int(max_lines), self._slit, plan.n_columns)
+        meta = self.sources[0].metadata or {}
+        full_scale = meta.get('full_scale') or meta.get('saturation_level')
         with self._lock:
+            # Clipping is only visible in the raw frame: dark, Smile and the wavelength binning
+            # all mix a full pixel with its neighbours.
+            self._cal_clip_level = (CLIP_FRACTION * float(full_scale)
+                                    if full_scale and plan.stage == 'raw' else None)
+            self._cal_clip = np.zeros(shape[:2], np.uint16)
             self._cal_ring = np.zeros(shape, np.float32)
             self._cal_ids = np.full(int(max_lines), -1, np.int64)
             self._cal_pos = 0
         logger.info("Calibration capture: newest %d lines (%.0f MB)", max_lines, self._cal_ring.nbytes / 1e6)
 
-    def calibration_capture(self, first_line: int | None = None, last_line: int | None = None):
+    def calibration_capture(self, first_line: int | None = None, last_line: int | None = None,
+                            with_clipped: bool = False):
         """``(line numbers, binned lines (n, slit, bands) float32)`` held now, oldest first.
 
         ``first_line`` / ``last_line`` (inclusive) select a range; nothing captured -> empty arrays.
+        ``with_clipped`` adds a third item: ``(n, slit) uint16``, the raw pixels of each slit row at
+        or above ``CLIP_FRACTION`` of the camera's full scale (counted before dark, Smile and
+        binning), or ``None`` when the full scale is unknown or the input is already binned.
         """
         with self._lock:
             if self._cal_ring is None:
-                return np.empty(0, np.int64), np.empty((0, self._slit, self.plans[0].n_columns), np.float32)
+                empty = np.empty(0, np.int64), np.empty((0, self._slit, self.plans[0].n_columns), np.float32)
+                return (*empty, None) if with_clipped else empty
             ids = self._cal_ids.copy()
             keep = ids >= 0
             if first_line is not None:
@@ -611,6 +648,9 @@ class Pipeline:
                 keep &= ids <= int(last_line)
             index = np.flatnonzero(keep)
             index = index[np.argsort(ids[index])]
+            if with_clipped:
+                clipped = self._cal_clip[index].copy() if self._cal_clip_level is not None else None
+                return ids[index], self._cal_ring[index].copy(), clipped
             return ids[index], self._cal_ring[index].copy()
 
     def calibration_count(self) -> int:
@@ -620,7 +660,7 @@ class Pipeline:
 
     def stop_calibration_capture(self) -> None:
         with self._lock:
-            self._cal_ring = self._cal_ids = None
+            self._cal_ring = self._cal_ids = self._cal_clip = None
 
     def start_spectrum_history(self, max_mb: float | None = None) -> int:
         """Keep the newest lines as the model receives them (after every step that is on).
@@ -636,12 +676,19 @@ class Pipeline:
         with self._lock:
             self._spec_ids = np.full(lines, -1, np.int64)
             self._spec_ring = np.zeros((lines, self._slit, self.plans[0].n_columns), np.float32)
+            self._invalidate_spectra_locked()
         logger.info("Spectrum history: newest %d lines (%.0f MB)", lines, lines * per_line / 1e6)
         return lines
 
     def stop_spectrum_history(self) -> None:
         with self._lock:
             self._spec_ring = self._spec_ids = None
+
+    def _invalidate_spectra_locked(self) -> None:
+        """Old inputs and in-flight results must not be shown as a new calibration."""
+        self._spectrum_generation += 1
+        if self._spec_ids is not None:
+            self._spec_ids.fill(-1)
 
     @property
     def spectrum_lines(self) -> int:
@@ -660,6 +707,23 @@ class Pipeline:
                 return None
             return self._spec_ring[k, int(row)].copy()
 
+    def spectrum_snapshot(self, max_mb: float = 128.0) -> tuple[np.ndarray, np.ndarray]:
+        """A copy of the newest lines of the spectrum history, oldest first.
+
+        Returns:
+            ``(line numbers (n,), spectra (n, slit, bands) float32)``; at most ``max_mb`` MB, the
+            newest lines. Empty (n = 0) while the history is off or has no line yet.
+        """
+        with self._lock:
+            if self._spec_ring is None:
+                return np.zeros(0, np.int64), np.zeros((0, self._slit, self.plans[0].n_columns), np.float32)
+            ids = self._spec_ids
+            order = np.argsort(ids, kind='stable')
+            order = order[ids[order] >= 0]
+            per_line = self._spec_ring[0].nbytes
+            order = order[-int(max(1, max_mb * 1e6 // per_line)):]
+            return ids[order].copy(), self._spec_ring[order]       # fancy index: a copy
+
     def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0) -> None:
         """Use new reflectance factors from the next line on and switch the step on."""
         plan = self.plans[plan_index]
@@ -671,6 +735,8 @@ class Pipeline:
         plan.steps['reflectance'] = {'available': True, 'on': True, 'why': label}
         plan.provenance['reflectance'] = (label, 'drawn on RAW')
         self.set_steps(reflectance=True)
+        with self._lock:
+            self._invalidate_spectra_locked()
 
     def _backend_note(self) -> str:
         if self.plans[0].stage == 'binned':
@@ -1045,7 +1111,14 @@ class Pipeline:
                 # with timestamps the latency also has exposure and transfer; the queue wait not)
                 prof._record('queue', (time.perf_counter() - job.t_queued) * 1000.0)
                 with prof.time('total'):
+                    job.spectrum_generation = self._spectrum_generation
                     on = _effective(plan, self._steps)                # one consistent set per frame
+                    clip_level, clipped = self._cal_clip_level, None
+                    if clip_level is not None and self._cal_ring is not None and plan.stage == 'raw':
+                        # raw pixels at full scale per slit row, in the row order after the flip
+                        clipped = np.count_nonzero(frame >= clip_level, axis=1)
+                        if on['flip']:
+                            clipped = clipped[::-1]
                     if plan.stage == 'raw':
                         binned, _, _ = runtime.process_binned(
                             frame, plan.dark_processor(on['dark']), plan.binner,
@@ -1054,6 +1127,10 @@ class Pipeline:
                     else:
                         binned = frame
                     pre = binned.astype(np.float32, copy=True) if self._cal_ring is not None else None
+                    flat = getattr(plan, 'flatfield_profile', None)
+                    if on['flatfield'] and flat is not None:
+                        with prof.time('flatfield'):
+                            binned = np.divide(binned, flat.values, dtype=np.float32)
                     if on['reflectance']:                             # last step before the model
                         with prof.time('reflectance'):
                             binned = apply_reflectance(binned, plan.reflectance_factors)
@@ -1069,7 +1146,7 @@ class Pipeline:
                     self._display_t = now
                     self._raw_frame = frame.copy()
                 self._free.put(job.slot)                       # buffer back to the camera
-                self._results.put((job, ids, intensity, pre, spec))
+                self._results.put((job, ids, intensity, pre, spec, clipped))
         except Exception as exc:
             self._fail(f'worker-{k}', exc)
         finally:
@@ -1133,9 +1210,9 @@ class Pipeline:
                 elif item:
                     pending[item[0].seq] = item
                 while next_seq in pending:
-                    job, ids, intensity, pre, spec = pending.pop(next_seq)
+                    job, ids, intensity, pre, spec, clipped = pending.pop(next_seq)
                     next_seq += 1
-                    self._account(job, ids, job.line - last_line - 1, intensity, pre, spec)
+                    self._account(job, ids, job.line - last_line - 1, intensity, pre, spec, clipped)
                     last_line = job.line
                     rate_n += 1
 
@@ -1180,7 +1257,8 @@ class Pipeline:
                 self._state = 'stopped' if self._stop.is_set() else 'finished'
 
     def _account(self, job: _Job, ids: np.ndarray, gap: int, intensity: np.ndarray | None = None,
-                 pre: np.ndarray | None = None, spec: np.ndarray | None = None) -> None:
+                 pre: np.ndarray | None = None, spec: np.ndarray | None = None,
+                 clipped: np.ndarray | None = None) -> None:
         """One line, in order. ``gap`` lines before it were lost to overrun."""
         counts = np.bincount(ids, minlength=256)
         t_done = time.perf_counter()
@@ -1198,9 +1276,12 @@ class Pipeline:
             if pre is not None and self._cal_ring is not None and pre.shape == self._cal_ring.shape[1:]:
                 k = self._cal_pos % self._cal_ring.shape[0]
                 self._cal_ring[k] = pre
+                if self._cal_clip is not None:
+                    self._cal_clip[k] = 0 if clipped is None else np.minimum(clipped, 65535)
                 self._cal_ids[k] = self._canvas_line
                 self._cal_pos += 1
-            if spec is not None and self._spec_ring is not None and spec.shape == self._spec_ring.shape[1:]:
+            if (spec is not None and self._spec_ring is not None and spec.shape == self._spec_ring.shape[1:]
+                    and job.spectrum_generation == self._spectrum_generation):
                 k = self._canvas_line % len(self._spec_ids)
                 self._spec_ring[k] = spec
                 self._spec_ids[k] = self._canvas_line

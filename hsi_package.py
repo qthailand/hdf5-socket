@@ -56,6 +56,16 @@ _MEAN_TOLERANCE = 1e-6                # model class means vs the package's refer
 # ------------------------------------------------------------------------------ package ---
 
 @dataclass
+class TrainingClass:
+    """The training spectra of one class, summarised per band (``training_spectral_reference.json``)."""
+    class_id: int
+    label: str
+    n_spectra: int
+    mean: np.ndarray                 # (B,) on HsiPackage.wavelengths
+    sd: np.ndarray                   # (B,)
+
+
+@dataclass
 class HsiPackage:
     """One trained model as plain arrays (float64, exactly as stored)."""
     path: str
@@ -78,6 +88,9 @@ class HsiPackage:
     exported_at: str
     lab_core_version: str
     checks: list = field(default_factory=list)   # what was verified while loading (text lines)
+    # training spectra per class, for display: {'input': [TrainingClass], 'preprocessed': [TrainingClass]}
+    # ('input' = what the model is given, 'preprocessed' = after SNV); a list is empty when the package lacks it
+    training: dict = field(default_factory=dict)
 
     @property
     def chain(self) -> str:
@@ -160,6 +173,7 @@ def load_package(path) -> HsiPackage:
         input_units=input_units, metric=_metric_text(manifest), exported_at=str(manifest.get('exported_at', '?')),
         lab_core_version=str(manifest.get('hsi_lab_core_version', '?')), checks=checks)
     checks.append(_check_reference(path, package, files.get('training_spectral_reference.json')))
+    package.training = _training_spectra(package, files.get('training_spectral_reference.json'))
     logger.info("Model package loaded\n%s", package.describe())
     return package
 
@@ -519,6 +533,32 @@ def _check_reference(path: Path, package: HsiPackage, blob: bytes | None) -> str
             "after this reader's band selection and scaler: the package's chain is not the one implemented here")
     return (f"training reference ok: class means reproduced to {worst:.1e}"
             + (", SNV = population SD over all bands" if package.snv else ""))
+
+
+_TRAINING_DOMAINS = {'input': 'raw_wavelength_analysis', 'preprocessed': _REFERENCE_DOMAIN}
+
+
+def _training_spectra(package: HsiPackage, blob: bytes | None) -> dict:
+    """Per-class mean and SD of the training spectra, for display only (never raises)."""
+    out = {key: [] for key in _TRAINING_DOMAINS}
+    if blob is None:
+        return out
+    n_bands = package.wavelengths.size
+    for key, name in _TRAINING_DOMAINS.items():
+        try:
+            rows = []
+            for c in json.loads(blob.decode('utf-8'))['domains'][name]['classes']:
+                mean, sd = np.asarray(c['mean'], np.float64), np.asarray(c['sd'], np.float64)
+                if mean.shape != (n_bands,) or sd.shape != (n_bands,):
+                    raise ValueError('band count')
+                cid = int(c['class_id'])
+                rows.append(TrainingClass(cid, package.labels.get(cid, str(c.get('label', cid))),
+                                          int(c.get('n_spectra') or 0), mean, sd))
+            out[key] = rows
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            logger.info("%s: no %s training spectra to display (%s)", Path(package.path).name, name,
+                        type(exc).__name__)
+    return out
 
 
 def main(argv=None) -> int:
