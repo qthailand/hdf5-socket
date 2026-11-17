@@ -10,8 +10,9 @@ The model artifact (``joblib``) holds ``W_fused`` ``(n_selected, n_classes)``, `
 ``category_names``; ``band_wavelengths`` (nm of every training band) is optional.
 
 A trained-model package of HSI MLOps (``.hsipkg``, or a zip around one) is a second kind of
-artifact: :class:`HsiPackageClassifier` runs its own chain (SNV, band selection, StandardScaler,
-Gaussian maximum likelihood) from the arrays ``hsi_package.load_package`` reads.
+artifact: :class:`HsiPackageClassifier` runs its own chain (SNV or a Savitzky-Golay first
+derivative, band selection, StandardScaler, Gaussian maximum likelihood) from the arrays
+``hsi_package.load_package`` reads.
 :func:`load_classifier` picks the class from the file.
 
 Binning is not done here: the frame workers bin raw frames exactly like the HSI acquisition
@@ -37,10 +38,13 @@ _MLC_ROWS = 16        # slit pixels per parallel task of the MLC kernel (neighbo
 
 
 @njit(parallel=True, fastmath={'reassoc', 'contract'}, cache=True, nogil=True)
-def _mlc_classify(x, columns, selected, snv, inv_scale, centers, whiten, constants, class_ids, invalid, out):
+def _mlc_classify(x, columns, tap_count, tap_index, taps, snv, inv_scale, centers, whiten, constants, class_ids,
+                  invalid, out):
     """Gaussian maximum-likelihood class of every row of ``x`` (see :class:`HsiPackageClassifier`).
 
-    Per row: SNV over ``columns`` (population SD), features ``z[selected] * inv_scale``, then per
+    Per row: SNV over ``columns`` (population SD) into ``z``, features
+    ``f[j] = sum_t taps[j, t] * z[tap_index[j, t]] * inv_scale[j]`` over ``tap_count[j]`` taps (one
+    tap of 1 = band selection; the Savitzky-Golay window = first derivative of the selected band), then per
     class ``score = constants[k] - 0.5 |whiten[k] @ (features - centers[k])|^2``. ``whiten[k]`` is
     lower triangular, so the squared distance grows row by row: a class is dropped as soon as
     its score is already below the best complete one. The result is the arg max of the full
@@ -50,7 +54,7 @@ def _mlc_classify(x, columns, selected, snv, inv_scale, centers, whiten, constan
     """
     n = x.shape[0]
     n_bands = columns.shape[0]
-    n_features = selected.shape[0]
+    n_features = tap_count.shape[0]
     n_classes = constants.shape[0]
     for task in prange((n + _MLC_ROWS - 1) // _MLC_ROWS):
         features = np.empty(n_features, np.float32)
@@ -77,7 +81,10 @@ def _mlc_classify(x, columns, selected, snv, inv_scale, centers, whiten, constan
                         valid = False
             if valid:
                 for j in range(n_features):
-                    features[j] = (x[r, columns[selected[j]]] - mean) / deviation * inv_scale[j]
+                    value = 0.0
+                    for t in range(tap_count[j]):
+                        value += taps[j, t] * (x[r, columns[tap_index[j, t]]] - mean)
+                    features[j] = value / deviation * inv_scale[j]
             else:
                 for j in range(n_features):
                     features[j] = 0.0
@@ -104,6 +111,94 @@ def _mlc_classify(x, columns, selected, snv, inv_scale, centers, whiten, constan
                 best_k = 0
             guess = best_k
             out[r] = class_ids[best_k] if valid or invalid < 0 else invalid
+
+
+@njit(parallel=True, fastmath={'reassoc', 'contract', 'arcp', 'afn'}, cache=True, nogil=True)
+def _svm_decisions(dots, f_sq, sv_sq, gamma, pair_coef, intercept, out):
+    """One-vs-one decision values of an RBF SVM (see :class:`HsiSvmClassifier`).
+
+    ``out[r, p] = intercept[p] + sum_k pair_coef[k, p] exp(-gamma |f_r - s_k|^2)`` with
+    ``|f - s|^2 = f_sq[r] + sv_sq[k] - 2 dots[r, k]`` (``dots = f @ s.T`` from BLAS). The
+    distance and exponential are float32 (the product's own rounding is larger), the sums
+    float64. No ``nnan``/``ninf``: an overflowing pixel stays NaN/infinite, not a class.
+    """
+    n, n_vectors = dots.shape
+    n_pairs = pair_coef.shape[1]
+    zero = np.float32(0.0)
+    two = np.float32(2.0)
+    for r in prange(n):
+        acc = np.zeros(n_pairs)
+        f_r = f_sq[r]
+        for k in range(n_vectors):
+            d = f_r + sv_sq[k] - two * dots[r, k]
+            kv = math.exp(-gamma * max(d, zero))        # max: rounding at a support vector itself
+            for q in range(n_pairs):
+                acc[q] += kv * pair_coef[k, q]
+        for q in range(n_pairs):
+            out[r, q] = acc[q] + intercept[q]
+
+
+@njit(cache=True, nogil=True)
+def _svm_probability(decisions, prob_a, prob_b, n_classes, out):
+    """libsvm ``svm_predict_probability``: Platt's sigmoid per class pair (clipped to
+    [1e-7, 1 - 1e-7]) coupled into class probabilities (Wu, Lin & Weng 2004, method 2) exactly as
+    libsvm's ``multiclass_probability`` iterates."""
+    k = n_classes
+    r = np.empty((k, k))
+    q_mat = np.empty((k, k))
+    qp = np.empty(k)
+    p = np.empty(k)
+    eps = 0.005 / k
+    max_iter = max(100, k)
+    for row in range(decisions.shape[0]):
+        pair = 0
+        for i in range(k):
+            for j in range(i + 1, k):
+                fapb = decisions[row, pair] * prob_a[pair] + prob_b[pair]
+                if fapb >= 0.0:
+                    value = math.exp(-fapb) / (1.0 + math.exp(-fapb))
+                else:
+                    value = 1.0 / (1.0 + math.exp(fapb))
+                value = min(max(value, 1e-7), 1.0 - 1e-7)
+                r[i, j] = value
+                r[j, i] = 1.0 - value
+                pair += 1
+        if k == 2:
+            out[row, 0] = r[0, 1]
+            out[row, 1] = r[1, 0]
+            continue
+        for t in range(k):
+            p[t] = 1.0 / k
+            q_mat[t, t] = 0.0
+            for j in range(t):
+                q_mat[t, t] += r[j, t] * r[j, t]
+                q_mat[t, j] = q_mat[j, t]
+            for j in range(t + 1, k):
+                q_mat[t, t] += r[j, t] * r[j, t]
+                q_mat[t, j] = -r[j, t] * r[t, j]
+        for _ in range(max_iter):
+            pqp = 0.0
+            for t in range(k):
+                qp[t] = 0.0
+                for j in range(k):
+                    qp[t] += q_mat[t, j] * p[j]
+                pqp += p[t] * qp[t]
+            max_error = 0.0
+            for t in range(k):
+                error = abs(qp[t] - pqp)
+                if error > max_error:
+                    max_error = error
+            if max_error < eps:
+                break
+            for t in range(k):
+                diff = (-qp[t] + pqp) / q_mat[t, t]
+                p[t] += diff
+                pqp = (pqp + diff * (diff * q_mat[t, t] + 2.0 * qp[t])) / (1.0 + diff) / (1.0 + diff)
+                for j in range(k):
+                    qp[j] = (qp[j] + diff * q_mat[t, j]) / (1.0 + diff)
+                    p[j] /= (1.0 + diff)
+        for t in range(k):
+            out[row, t] = p[t]
 
 
 @njit(parallel=True, cache=True, nogil=True)
@@ -362,45 +457,30 @@ def load_classifier(model_artifact_path, mlc_reg_covar: float = 0.0) -> Pushbroo
     ``mlc_reg_covar`` (``model.mlc_reg_covar``) only concerns a package: see
     :class:`HsiPackageClassifier`.
     """
-    from hsi_package import is_package
+    from hsi_package import is_package, load_package
     if is_package(model_artifact_path):
-        return HsiPackageClassifier(model_artifact_path, mlc_reg_covar)
+        package = load_package(model_artifact_path)
+        if package.svm is not None:
+            return HsiSvmClassifier(model_artifact_path, mlc_reg_covar, package=package)
+        return HsiPackageClassifier(model_artifact_path, mlc_reg_covar, package=package)
     return PushbroomLineClassifier(model_artifact_path)
 
 
-class HsiPackageClassifier(PushbroomLineClassifier):
-    """A model trained in HSI MLOps (``.hsipkg``), run as its training software runs it.
-
-    Per slit pixel: SNV over **all** bands of the training axis (mean 0, population SD 1), the
-    package's selected bands, its StandardScaler, then the Gaussian maximum-likelihood classifier
-    (per class a mean and a full covariance C): the class with the largest
-    ``log prior - 0.5 log|C| - 0.5 d C^-1 d``, ``d`` = features minus the class mean.
-
-    The input must therefore supply every training band, not only the selected ones:
-    :meth:`bind` returns one input column per training band. Read-only after construction, so
-    workers can share it (each call allocates its own arrays).
-
-    A pixel whose spectrum is constant (SD 0: a dead or saturated pixel, the all-zero warm-up
-    frame) or not finite has no SNV. It gets the package's background class if it has one,
-    otherwise the class the model gives the all-zero feature vector; its confidence is 0.
-
-    ``mlc_reg_covar`` (``model.mlc_reg_covar``, default 0 = exactly the trained model) is added to
-    the diagonal of every class covariance (scaled feature units, on top of the training's own
-    ``reg_covar``). A full covariance over many bands has directions with almost no training
-    variance; input a little noisier than the training cubes is then far from every class and
-    falls to the class with the widest covariance (the background). A larger value makes the
-    model tolerate that noise, at the price of no longer being the model that was validated.
-    """
+class _HsiPackageBase(PushbroomLineClassifier):
+    """What every HSI MLOps package model shares: classes, colours, binding to every training
+    band, and the per-pixel preprocessing up to the features (see the subclasses)."""
 
     _CHUNK = 4096                                 # slit pixels per pass (bounds the scratch arrays)
 
-    def __init__(self, model_artifact_path, mlc_reg_covar: float = 0.0) -> None:
+    def _setup(self, model_artifact_path, mlc_reg_covar, package):
+        """Set the shared attributes; returns ``to_features`` (F, B) (see below)."""
         from hsi_package import load_package
         mlc_reg_covar = float(mlc_reg_covar)
         if not 0.0 <= mlc_reg_covar < float('inf'):
             raise ValueError(f"mlc_reg_covar must be >= 0, got {mlc_reg_covar!r}")
         self.mlc_reg_covar = mlc_reg_covar
-        package = load_package(model_artifact_path)
+        if package is None:
+            package = load_package(model_artifact_path)
         self.package = package
         self.path = str(model_artifact_path)
         self.classes_ = package.classes
@@ -412,7 +492,7 @@ class HsiPackageClassifier(PushbroomLineClassifier):
         self.temperature = 1.0
         self.input_units = package.input_units
         self.input_units_declared = True
-        # every band of the training axis feeds SNV: bind() matches all of them
+        # every band of the training axis feeds SNV / the derivative: bind() matches all of them
         self.band_wavelengths = package.wavelengths.astype(np.float32)
         self.n_bands = int(package.wavelengths.size)
         self.selected_bands = np.arange(self.n_bands, dtype=np.intp)
@@ -420,6 +500,78 @@ class HsiPackageClassifier(PushbroomLineClassifier):
         self.W_fused = self.b_fused = None                     # not a linear model
         self._snv = package.snv
         self._invalid_class = np.uint8(package.background[0]) if package.background else None
+        self._invalid_id = -1 if self._invalid_class is None else int(self._invalid_class)
+        # features before the scaler, from the (SNV) spectrum z: (z @ to_features.T)[F]. Rows of the
+        # identity = band selection; rows of the Savitzky-Golay matrix = first derivative at those bands
+        return (np.eye(self.n_bands) if package.derivative is None else package.derivative)[package.selected]
+
+    def bind(self, wavelengths: np.ndarray | None, n_columns: int,
+             tolerance_nm: float = 0.5, resample: bool = True) -> tuple[np.ndarray | Resampled, str]:
+        """One input column per **training** band (SNV needs them all); see the base class."""
+        columns, binding = super().bind(wavelengths, n_columns, tolerance_nm, resample)
+        binding = f"{binding}; {self.chain}"
+        if isinstance(columns, Resampled):                 # every training band interpolated
+            return columns, binding
+        if np.unique(columns).size != columns.size:
+            raise ValueError(f"The input's {n_columns} bands cannot supply the model's {self.n_bands} training "
+                             "bands one to one (two model bands fall on the same input band): the input must "
+                             "have the training data's spectral resolution")
+        return columns, binding
+
+    def _spectra(self, binned: np.ndarray, columns: np.ndarray, dtype) -> tuple[np.ndarray, np.ndarray]:
+        """``(z (n, B), valid (n,))``: the training bands of every pixel after SNV (if the package
+        uses it); an invalid pixel (see the subclasses) is all zero."""
+        x = np.take(binned, columns, axis=1).astype(dtype, copy=False)
+        with np.errstate(invalid='ignore', over='ignore'):       # a NaN/inf pixel is handled, not reported
+            if self._snv:
+                x -= x.mean(axis=1, keepdims=True)
+                deviation = np.einsum('ij,ij->i', x, x)
+                deviation /= x.shape[1]
+                np.sqrt(deviation, out=deviation)                # population SD, as the training
+                good = deviation > 0                             # False for 0 and NaN
+                good &= np.isfinite(deviation)
+                deviation[~good] = 1.0
+                x /= deviation[:, None]
+            else:
+                good = np.isfinite(x).all(axis=1)
+        if not good.all():
+            x[~good] = 0.0
+        return x, good
+
+
+class HsiPackageClassifier(_HsiPackageBase):
+    """A model trained in HSI MLOps (``.hsipkg``), run as its training software runs it.
+
+    Per slit pixel: SNV over **all** bands of the training axis (mean 0, population SD 1) or the
+    Savitzky-Golay first derivative (each selected band from its window of neighbours, see
+    ``hsi_package.savgol_derivative_matrix``), the package's selected bands, its StandardScaler,
+    then the Gaussian maximum-likelihood classifier
+    (per class a mean and a full covariance C): the class with the largest
+    ``log prior - 0.5 log|C| - 0.5 d C^-1 d``, ``d`` = features minus the class mean.
+
+    The input must therefore supply every training band, not only the selected ones:
+    :meth:`bind` returns one input column per training band. Read-only after construction, so
+    workers can share it (each call allocates its own arrays).
+
+    With SNV, a pixel whose spectrum is constant (SD 0: a dead or saturated pixel, the all-zero
+    warm-up frame) has no SNV; with or without SNV, neither has a pixel that is not finite. Such a
+    pixel has no features. It gets the package's background class if it has one,
+    otherwise the class the model gives the all-zero feature vector; its confidence is 0.
+
+    ``mlc_reg_covar`` (``model.mlc_reg_covar``, default 0 = exactly the trained model) is added to
+    the diagonal of every class covariance (scaled feature units, on top of the training's own
+    ``reg_covar``). A full covariance over many bands has directions with almost no training
+    variance; input a little noisier than the training cubes is then far from every class and
+    falls to the class with the widest covariance (the background). A larger value makes the
+    model tolerate that noise, at the price of no longer being the model that was validated.
+    """
+
+    def __init__(self, model_artifact_path, mlc_reg_covar: float = 0.0, package=None) -> None:
+        """``package``: the already loaded ``hsi_package.HsiPackage`` of the file (else it is loaded)."""
+        to_features = self._setup(model_artifact_path, mlc_reg_covar, package)
+        package = self.package
+        if package.means is None:
+            raise ValueError(f"{self.path}: {package.algorithm} package, not an MLC (use load_classifier)")
 
         # d C^-1 d = |d @ A|^2 with C = L L^T and A = L^-T. With features f = (z[selected] - m) / s
         # this is |z @ W_k - t_k|^2 per class k: one matrix product gives all classes.
@@ -439,36 +591,29 @@ class HsiPackageClassifier(PushbroomLineClassifier):
                                  "definite") from exc
             whitening[k] = np.tril(np.linalg.inv(lower))                             # L^-1, lower triangular
             part = slice(k * n_features, (k + 1) * n_features)
-            weights[package.selected, part] = whitening[k].T / package.scaler_scale[:, None]
+            weights[:, part] = to_features.T @ (whitening[k].T / package.scaler_scale[:, None])
             offsets[part] = centers[k] @ whitening[k].T
             constants[k] = np.log(package.priors[k]) - np.log(np.diag(lower)).sum()    # -0.5 log|C|
         self._weights = np.ascontiguousarray(weights, dtype=np.float32)
         self._offsets = offsets.astype(np.float32)
         self._constants = constants.astype(np.float32)
-        # the same numbers for the kernel that predict() runs (_mlc_classify)
-        self._selected = np.ascontiguousarray(package.selected, dtype=np.intp)
+        # the same numbers for the kernel that predict() runs (_mlc_classify): the non-zero
+        # entries of every row of to_features as taps
+        rows = [np.flatnonzero(row) for row in to_features]
+        self._tap_count = np.array([row.size for row in rows], dtype=np.intp)
+        self._tap_index = np.zeros((n_features, max(self._tap_count.max(), 1)), dtype=np.intp)
+        self._taps = np.zeros(self._tap_index.shape, dtype=np.float64)
+        for j, row in enumerate(rows):
+            self._tap_index[j, :row.size] = row
+            self._taps[j, :row.size] = to_features[j, row]
         self._inv_scale = (1.0 / package.scaler_scale).astype(np.float32)
         self._centers = np.ascontiguousarray(centers, dtype=np.float32)
         self._whitening = np.ascontiguousarray(whitening, dtype=np.float32)
         self._constants64 = constants
-        self._invalid_id = -1 if self._invalid_class is None else int(self._invalid_class)
         # compile (or load from the Numba cache) now, not on the first camera line
         self.predict(np.zeros((1, self.n_bands), np.float32), self.selected_bands)
         _resample(np.zeros((1, 2), np.float32), np.zeros(1, np.intp), np.ones(1, np.intp), np.zeros(1, np.float32),
                   np.empty((1, 1), np.float32))
-
-    def bind(self, wavelengths: np.ndarray | None, n_columns: int,
-             tolerance_nm: float = 0.5, resample: bool = True) -> tuple[np.ndarray | Resampled, str]:
-        """One input column per **training** band (SNV needs them all); see the base class."""
-        columns, binding = super().bind(wavelengths, n_columns, tolerance_nm, resample)
-        binding = f"{binding}; {self.chain}"
-        if isinstance(columns, Resampled):                 # every training band interpolated
-            return columns, binding
-        if np.unique(columns).size != columns.size:
-            raise ValueError(f"The input's {n_columns} bands cannot supply the model's {self.n_bands} training "
-                             "bands one to one (two model bands fall on the same input band): the input must "
-                             "have the training data's spectral resolution")
-        return columns, binding
 
     @property
     def chain(self) -> str:
@@ -487,21 +632,7 @@ class HsiPackageClassifier(PushbroomLineClassifier):
         valid = np.empty(n, bool)
         for start in range(0, n, self._CHUNK):
             part = slice(start, start + self._CHUNK)
-            x = np.take(binned[part], columns, axis=1).astype(np.float32, copy=False)
-            with np.errstate(invalid='ignore', over='ignore'):       # a NaN/inf pixel is handled, not reported
-                if self._snv:
-                    x -= x.mean(axis=1, keepdims=True)
-                    deviation = np.einsum('ij,ij->i', x, x)
-                    deviation /= x.shape[1]
-                    np.sqrt(deviation, out=deviation)                # population SD, as the training
-                    good = deviation > 0                             # False for 0 and NaN
-                    good &= np.isfinite(deviation)
-                    deviation[~good] = 1.0
-                    x /= deviation[:, None]
-                else:
-                    good = np.isfinite(x).all(axis=1)
-            if not good.all():
-                x[~good] = 0.0
+            x, good = self._spectra(binned[part], columns, np.float32)
             y = x @ self._weights
             y -= self._offsets
             np.square(y, out=y)
@@ -522,9 +653,9 @@ class HsiPackageClassifier(PushbroomLineClassifier):
             binned, columns = columns.apply(binned), self.selected_bands
         x = np.ascontiguousarray(binned, dtype=np.float32)       # one compiled signature; no copy if float32
         out = np.empty(x.shape[0], np.uint8)
-        _mlc_classify(x, np.ascontiguousarray(columns, dtype=np.intp), self._selected, self._snv,
-                      self._inv_scale, self._centers, self._whitening, self._constants64, self._class_ids,
-                      self._invalid_id, out)
+        _mlc_classify(x, np.ascontiguousarray(columns, dtype=np.intp), self._tap_count, self._tap_index, self._taps,
+                      self._snv, self._inv_scale, self._centers, self._whitening, self._constants64,
+                      self._class_ids, self._invalid_id, out)
         return out
 
     def predict_confidence(self, binned: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -547,6 +678,137 @@ class HsiPackageClassifier(PushbroomLineClassifier):
             if self._invalid_class is not None:
                 ids[~valid] = self._invalid_class
         return ids, confidence
+
+
+class HsiSvmClassifier(_HsiPackageBase):
+    """An RBF support vector machine trained in HSI MLOps (``sklearn.svm.SVC`` in a ``.hsipkg``).
+
+    Per slit pixel the package's preprocessing (SNV or the Savitzky-Golay first derivative, see
+    :class:`HsiPackageClassifier`), its selected bands and StandardScaler give the features
+    ``f``; then, as ``SVC.predict`` (libsvm) does: per class pair ``(i, j)`` the decision
+    ``sum_s c_s exp(-gamma |f - s|^2) + b`` over the support vectors of both classes, a vote for
+    ``i`` when it is positive, else for ``j``, and the class with most votes (the lowest on a
+    tie). ``hsi_package.SvmModel`` has the details.
+
+    Cost: every pixel against every support vector (``|f - s|^2 = |f|^2 + |s|^2 - 2 f.s``, the
+    last term one float32 BLAS product per chunk of pixels, then one exponential per pixel and
+    support vector). Far more work per pixel than an MLC with as many features; the float32
+    product changes a decision only within ~1e-4 of zero (a tie of the vote).
+
+    ``mlc_reg_covar`` does not apply (no covariances); a value other than 0 is shown as ignored.
+    Pixels without features (see :class:`HsiPackageClassifier`) get the package's background
+    class (else the class of z = 0) and confidence 0. Read-only after construction (workers share it).
+    """
+
+    _CHUNK = 1024                       # pixels per pass: the (pixels, support vectors) scratch stays small
+
+    def __init__(self, model_artifact_path, mlc_reg_covar: float = 0.0, package=None) -> None:
+        """``package``: the already loaded ``hsi_package.HsiPackage`` of the file (else it is loaded)."""
+        to_features = self._setup(model_artifact_path, mlc_reg_covar, package)
+        package = self.package
+        svm = package.svm
+        if svm is None:
+            raise ValueError(f"{self.path}: {package.algorithm} package, not an SVM (use load_classifier)")
+        # f = z @ affine + shift: the selected bands (or their derivative) through the scaler
+        self._affine = np.ascontiguousarray((to_features / package.scaler_scale[:, None]).T)          # (B, F)
+        self._shift = -package.scaler_mean / package.scaler_scale
+        vectors = svm.support_vectors.astype(np.float32)
+        self._vectors_t = np.ascontiguousarray(vectors.T)                                            # (F, S)
+        self._vector_sq = (vectors.astype(np.float64) ** 2).sum(axis=1).astype(np.float32)   # of the values used
+        self._gamma = np.float32(svm.gamma)
+        pairs = svm.pairs
+        start = np.concatenate([[0], np.cumsum(svm.n_support)])
+        coef = np.zeros((vectors.shape[0], len(pairs)))
+        for p, (i, j) in enumerate(pairs):
+            coef[start[i]:start[i + 1], p] = svm.dual_coef[j - 1, start[i]:start[i + 1]]
+            coef[start[j]:start[j + 1], p] = svm.dual_coef[i, start[j]:start[j + 1]]
+        self._pair_coef = coef.astype(np.float32)
+        self._intercept = np.ascontiguousarray(svm.intercept, dtype=np.float64)
+        self._pair_i = np.array([i for i, _ in pairs], dtype=np.intp)
+        self._pair_j = np.array([j for _, j in pairs], dtype=np.intp)
+        self.n_support_vectors = int(vectors.shape[0])
+        # compile (or load from the Numba cache) now, not on the first camera line
+        self.predict_confidence(np.zeros((1, self.n_bands), np.float32), self.selected_bands)
+        _resample(np.zeros((1, 2), np.float32), np.zeros(1, np.intp), np.ones(1, np.intp), np.zeros(1, np.float32),
+                  np.empty((1, 1), np.float32))
+
+    @property
+    def chain(self) -> str:
+        if not self.mlc_reg_covar:
+            return self.package.chain
+        return f"{self.package.chain} (model.mlc_reg_covar {self.mlc_reg_covar:g} ignored: not an MLC)"
+
+    def _decisions(self, binned: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(decisions (n, class pairs) float64, valid (n,) bool)``; an invalid pixel is z = 0."""
+        if isinstance(columns, Resampled):
+            binned, columns = columns.apply(binned), self.selected_bands
+        n = binned.shape[0]
+        decisions = np.empty((n, self._intercept.size))
+        valid = np.empty(n, bool)
+        for start in range(0, n, self._CHUNK):
+            part = slice(start, start + self._CHUNK)
+            z, good = self._spectra(binned[part], columns, np.float64)
+            with np.errstate(over='ignore', invalid='ignore'):
+                features = z @ self._affine
+                features += self._shift
+                features = features.astype(np.float32)
+                dots = features @ self._vectors_t
+                f_sq = np.einsum('ij,ij->i', features, features)
+            _svm_decisions(dots, f_sq, self._vector_sq, self._gamma, self._pair_coef, self._intercept,
+                           decisions[part])
+            valid[part] = good
+        return decisions, valid
+
+    def _vote(self, decisions: np.ndarray) -> np.ndarray:
+        """Index (into ``classes_``) of the class with most one-vs-one votes, the lowest on a tie."""
+        votes = np.zeros((decisions.shape[0], self.classes_.size), np.int32)
+        rows = np.arange(decisions.shape[0])
+        for p in range(decisions.shape[1]):
+            winner = np.where(decisions[:, p] > 0, self._pair_i[p], self._pair_j[p])
+            votes[rows, winner] += 1
+        return votes.argmax(axis=1)
+
+    def predict(self, binned: np.ndarray, columns: np.ndarray) -> np.ndarray:
+        """Class id (uint8) of every slit pixel of one ``(slit, n_bins)`` frame (``SVC.predict``)."""
+        decisions, valid = self._decisions(binned, columns)
+        ids = self._class_ids[self._vote(decisions)]
+        if self._invalid_class is not None and not valid.all():
+            ids[~valid] = self._invalid_class
+        return ids
+
+    def predict_confidence(self, binned: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(class ids, confidence)``: the ids of :meth:`predict`; the confidence is libsvm's
+        probability of that class (``SVC.predict_proba``, Platt scaling fitted by cross-validation
+        at training: may disagree with the vote near a boundary). Without Platt parameters
+        (trained with ``probability=False``) it is the winner's share of the votes."""
+        decisions, valid = self._decisions(binned, columns)
+        winner = self._vote(decisions)
+        ids = self._class_ids[winner]
+        svm = self.package.svm
+        if svm.prob_a is not None:
+            probability = np.empty((decisions.shape[0], self.classes_.size))
+            _svm_probability(decisions, svm.prob_a, svm.prob_b, self.classes_.size, probability)
+            confidence = probability[np.arange(winner.size), winner].astype(np.float32)
+        else:
+            votes = np.zeros(winner.size, np.float32)
+            for p in range(decisions.shape[1]):
+                votes += np.where(decisions[:, p] > 0, self._pair_i[p], self._pair_j[p]) == winner
+            confidence = votes / max(self.classes_.size - 1, 1)
+        if not valid.all():
+            confidence[~valid] = 0.0
+            if self._invalid_class is not None:
+                ids[~valid] = self._invalid_class
+        return ids, confidence
+
+    def probabilities(self, binned: np.ndarray, columns: np.ndarray) -> np.ndarray:
+        """``(n, classes)`` libsvm probabilities (``SVC.predict_proba``); offline checks only."""
+        svm = self.package.svm
+        if svm.prob_a is None:
+            raise ValueError(f"{self.path}: the SVM was trained without probability estimates")
+        decisions, _ = self._decisions(binned, columns)
+        probability = np.empty((decisions.shape[0], self.classes_.size))
+        _svm_probability(decisions, svm.prob_a, svm.prob_b, self.classes_.size, probability)
+        return probability
 
 
 class SpeedTestClassifier(PushbroomLineClassifier):

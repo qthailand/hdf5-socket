@@ -109,6 +109,41 @@ def test_panel_draws_training_bands_and_the_snv_view():
     np.testing.assert_array_equal(panel.shown_values(point), values)
 
 
+def test_panel_derivative_view_applies_the_package_derivative_on_the_training_axis():
+    pytest.importorskip('PyQt5')
+    from PyQt5.QtWidgets import QApplication
+    from hsi_package import savgol_derivative_matrix
+    from themes import apply_theme
+    from widgets.spectrum_panel import SpectrumPanel, TrainingBand
+    app = QApplication.instance() or QApplication([])
+    apply_theme(app, 'dark')
+    panel = SpectrumPanel()
+    panel.resize(600, 160)
+    step = float(WAVELENGTHS[1] - WAVELENGTHS[0])
+    D = savgol_derivative_matrix(WAVELENGTHS.size, 5, 2, step)
+    mean = np.linspace(0.2, 0.6, WAVELENGTHS.size)
+    raw = [TrainingBand('Leaf', '#22AA44', mean, np.full(mean.size, 0.05), 400)]
+    derived = [TrainingBand('Leaf', '#22AA44', D @ mean, np.full(mean.size, 1e-4), 400)]
+    panel.set_training(WAVELENGTHS, raw, derivative_bands=derived, derivative=D, selected=WAVELENGTHS[[2, 5]])
+    assert panel.derivative_button.isEnabled() and not panel.snv_button.isEnabled()
+    # a point on a finer, wider axis: resampled onto the training axis, then derived
+    fine = np.linspace(WAVELENGTHS[0] - step, WAVELENGTHS[-1] + step, 4 * WAVELENGTHS.size)
+    point = panel.add_point(fine, 3.0 + 0.002 * fine, line=0, row=0)          # offset vanishes, slope stays
+    wl, values = panel.shown_curve(point)
+    np.testing.assert_array_equal(wl, fine)                                    # input view: as received
+    assert panel.selected_wavelengths.size == 0
+    panel.derivative_button.click()
+    assert panel.view == 'derivative' and panel.shown_training()[1] == derived
+    wl, values = panel.shown_curve(point)
+    np.testing.assert_array_equal(wl, WAVELENGTHS)
+    np.testing.assert_allclose(values, 0.002, rtol=1e-9)
+    assert panel.selected_wavelengths.size == 2 and not panel.grab().isNull()
+    short = panel.add_point(WAVELENGTHS[1:], mean[1:], line=1, row=1)          # does not cover the axis
+    assert np.isnan(panel.shown_curve(short)[1]).all() and not panel.grab().isNull()
+    panel.set_training(None)
+    assert not panel.derivative_shown and not panel.derivative_button.isEnabled()
+
+
 def test_gui_click_on_the_belt_map_adds_spectra_and_clear_removes_them(tmp_path):
     pytest.importorskip('PyQt5')
     from PyQt5.QtCore import QPoint, Qt

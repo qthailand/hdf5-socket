@@ -256,9 +256,11 @@ the reason in its tooltip. `model.path` is still the model loaded at start; one
 outside `models` runs but is not offered in the list.
 
 The model runs as its training software runs it (`inference_engine.HsiPackageClassifier`):
-reflectance → SNV per pixel over **all** training bands → the package's selected bands → its
-StandardScaler → Gaussian maximum likelihood (MLC, per class a mean and a full covariance).
-What makes that trustworthy without the training software:
+reflectance → SNV per pixel over **all** training bands (or, if the package says so, the
+Savitzky-Golay first derivative per pixel: `first_derivative`, e.g. window 11 / order 2 /
+delta 4.9941 nm, ends like `scipy.signal.savgol_filter(mode='interp')`) → the package's
+selected bands → its StandardScaler → Gaussian maximum likelihood (MLC, per class a mean and a
+full covariance). What makes that trustworthy without the training software:
 
 * `hsi_package.py` reads the arrays out of the package's joblib pickles with a restricted
   unpickler (numpy arrays and attribute holders only: no code of the package runs) and checks
@@ -266,10 +268,14 @@ What makes that trustworthy without the training software:
 * The package carries the class means of its training spectra after preprocessing
   (`training_spectral_reference.json`). The loader passes them through its own band selection
   and scaler and requires the model's class means to come out (they do, to 1e-14, for both
-  delivered packages) and the SNV convention to match (population SD over all bands).
+  delivered packages) and the SNV convention to match (population SD over all bands). For a
+  first-derivative package the derivative of the raw training class means must give the
+  preprocessed ones (it is linear): `MLC_869291` passes to 3e-14, which pins the window, order,
+  spacing and end handling.
 * A package using a step that is not implemented (another preprocessing, PCA, spectral
-  indices, resampling, another algorithm) is refused by name. Implemented today: SNV, band
-  selection, StandardScaler, MLC with full covariances.
+  indices, resampling, another algorithm) is refused by name. Implemented today: SNV **or** the
+  Savitzky-Golay first derivative (not both), band selection, StandardScaler, MLC with full
+  covariances.
 * The classes are the arg max of float64 `log prior + Gaussian log-density`; `predict` computes
   it in float32 and stops a class as soon as it has lost (same result: 61 440 pixels of
   `first.bip` agree with a float64 `scipy` reference, and `tests/test_hsi_package.py` checks it).
@@ -280,10 +286,13 @@ Things to know:
   137 the model uses) within `model.band_tolerance_nm`. `Kratom_adulteration` was trained on
   this camera's grid (904.65–1695.29 nm, offset 0.005 nm). `MLC_874171` was trained on another
   wavelength calibration (905.06–1694.12 nm: up to 1.17 nm off): it runs on the input resampled
-  onto its bands (see *Model binding*).
+  onto its bands (see *Model binding*); so does `MLC_869291` (same 905.06–1694.12 nm grid). The
+  first derivative needs the neighbours of every band, so it too takes all 159.
 * **Input.** The package declares reflectance, so the Reflectance step must be on (the GUI
   warns otherwise). SNV removes brightness and offset per pixel; a wrong white reference still
-  changes the spectral shape.
+  changes the spectral shape. The first derivative removes only a constant offset: a
+  brightness or white-reference error scales every feature, so a derivative package depends
+  more on a correct reflectance calibration.
 * **Noise (`model.mlc_reg_covar`).** A full covariance over 137 bands has directions with almost
   no training variance, so the model tolerates very little noise the training cubes did not
   have: on the class means of `Kratom_adulteration` plus white noise, 0.005 reflectance per band
@@ -295,8 +304,10 @@ Things to know:
   workaround: the cure is retraining (larger `reg_covar`, fewer features, more cubes per class),
   and a raised value must be checked on known material.
 * **Classes and colours** come from the package (ids from 0; `Background` is hidden in the
-  shares by `display.hidden_classes`). A pixel with a constant or non-finite spectrum (dead
-  pixel, the all-zero warm-up frame) has no SNV and gets the package's background class.
+  shares by `display.hidden_classes`). A pixel with a non-finite spectrum, or with SNV a
+  constant one (dead pixel, the all-zero warm-up frame), has no features and gets the
+  package's background class. Without SNV a constant spectrum is classified by the model (a
+  zero derivative: `MLC_869291` calls it `Background`).
 * **Speed** (i9-12900K, slit 1024, frames in RAM): model 0.9–1.1 ms per line against 0.3 ms for
   the linear model; the full chain still reaches ~730 lines/s with 4–6 workers.
 * **Not verified here:** the result was not compared with `hsi_lab_core` itself (it is not on

@@ -724,14 +724,20 @@ class Pipeline:
             order = order[-int(max(1, max_mb * 1e6 // per_line)):]
             return ids[order].copy(), self._spec_ring[order]       # fancy index: a copy
 
-    def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0) -> None:
-        """Use new reflectance factors from the next line on and switch the step on."""
+    def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0,
+                                flatfield: str | None = None) -> None:
+        """Use new reflectance factors from the next line on and switch the step on.
+
+        ``flatfield``: label of the flat-field profile the factors already contain (a
+        "Flat-field + reference" calibration), ``None`` when they contain none.
+        """
         plan = self.plans[plan_index]
         factors = np.asarray(factors, np.float32)
         if factors.shape[-1] != plan.n_columns or (factors.ndim == 2 and factors.shape[0] != self._slit):
             raise ValueError(f"factors {factors.shape} do not fit ({self._slit}, {plan.n_columns})")
         plan.reflectance_factors = factors          # one reference swap: a worker sees old or new
         plan.reflectance_placeholder = False
+        plan.reflectance_flatfield = flatfield
         plan.steps['reflectance'] = {'available': True, 'on': True, 'why': label}
         plan.provenance['reflectance'] = (label, 'drawn on RAW')
         self.set_steps(reflectance=True)

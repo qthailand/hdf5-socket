@@ -83,6 +83,56 @@ def test_setup_and_diagnostics_keep_the_existing_tools(window):
     assert w.spectrum_panel.isVisible() and w.composition_widget.isVisible()
 
 
+def test_flatfield_box_shows_it_is_active_inside_the_reference(window):
+    import numpy as np
+    from PyQt5.QtCore import Qt
+    from flatfield_profile import FlatField, install_flatfield
+    app, w, _ = window
+    w._workspace.setCurrentIndex(1)
+    pipeline = w._pipeline
+    plan = pipeline.plans[0]
+    slit, bands = plan.frame_shape[0], plan.n_columns
+    on = pipeline.effective_steps()
+    flat = FlatField(np.ones((slit, bands), np.float32), 'profiles/cam/flatfield/flat_A/flatfield.json',
+                     on['dark'], on['flip'], on['smile'])
+    install_flatfield(plan, flat, False)
+    box, reference = w._step_boxes['flatfield'], w._step_boxes['reflectance']
+
+    pipeline.set_reflectance_factors(np.ones(bands, np.float32), 'per band')          # factors without flat-field
+    w._setup_step_switches()
+    assert not box.isChecked() and not box.isEnabled() and 'Not in this reflectance calibration' in box.toolTip()
+    assert 'No flat-field in this calibration' in reference.toolTip() and w._input_text() == 'Reflectance'
+
+    pipeline.set_reflectance_factors(np.ones((slit, bands), np.float32), 'integrated', flatfield=flat.label)
+    w._setup_step_switches()
+    assert box.isChecked() and box.isEnabled() and box.text() == 'Flat-field 🔒 in reference'
+    assert box.testAttribute(Qt.WA_TransparentForMouseEvents) and 'flat_A' in box.toolTip()
+    assert not pipeline.effective_steps()['flatfield']                                 # never divided twice
+    assert 'Includes flat-field: flat_A' in reference.toolTip() and reference.text() == 'Reflectance'
+    assert w._input_text() == 'Reflectance + flat-field'
+
+    other = FlatField(flat.values, 'profiles/cam/flatfield/flat_B/flatfield.json', flat.dark, flat.flip, flat.smile)
+    install_flatfield(plan, other, False)                                              # another profile loaded
+    w._setup_step_switches()
+    assert reference.text() == 'Reflectance ⚠' and 'flat_B' in reference.toolTip()
+
+    reference.setChecked(False)                                                        # the step is its own switch again
+    assert box.text() == 'Flat-field' and box.isEnabled() and not box.isChecked()
+    assert not box.testAttribute(Qt.WA_TransparentForMouseEvents) and w._input_text() == 'Counts'
+    box.setChecked(True)
+    assert pipeline.effective_steps()['flatfield'] and w._input_text() == 'Counts + flat-field'
+    assert not reference.isChecked()
+
+
+def test_reflectance_record_tells_which_flatfield_the_factors_contain():
+    from sim_config import reflectance_flatfield
+    assert reflectance_flatfield({'kind': 'band', 'flatfield_profile': None}) is None
+    assert reflectance_flatfield({'kind': 'row'}) is None and reflectance_flatfield({}) is None
+    assert reflectance_flatfield({'kind': 'flatfield', 'flatfield_profile': 'p/flat_A/flatfield.json'}) \
+        == 'p/flat_A/flatfield.json'
+    assert reflectance_flatfield({'kind': 'flatfield'}) == 'unknown profile'
+
+
 def test_new_splitter_layout_restores_spectrum_visibility(window):
     app, w, settings = window
     w._spectrum_button.setChecked(False)

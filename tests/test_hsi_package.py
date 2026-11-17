@@ -50,6 +50,24 @@ def snv(x, ddof=0):
     return (x - x.mean(axis=1, keepdims=True)) / x.std(axis=1, ddof=ddof, keepdims=True)
 
 
+DERIVATIVE = {'window': 5, 'polyorder': 2, 'delta': 5.0, 'units': 'per_nm'}
+
+
+def first_derivative(x, mode='interp', **parameters):
+    """The first derivative as HSI MLOps takes it (independent of hsi_package: scipy)."""
+    from scipy.signal import savgol_filter
+    p = {**DERIVATIVE, **parameters}
+    return savgol_filter(np.asarray(x, np.float64), p['window'], p['polyorder'], deriv=1, delta=p['delta'],
+                         mode=mode, axis=-1)
+
+
+def preprocess(x, steps, ddof=0, derivative_mode='interp'):
+    z = np.asarray(x, np.float64)
+    for step in steps:
+        z = snv(z, ddof) if step == 'snv' else first_derivative(z, derivative_mode)
+    return z
+
+
 def dump_as(obj_state, module, name):
     """joblib pickle of an object whose class lives in ``module`` (a stand-in for hsi_lab_core)."""
     import joblib
@@ -73,11 +91,11 @@ def dump_as(obj_state, module, name):
             del sys.modules[key]
 
 
-def build_package(folder, name='model', ddof=0, change=None, wrap=False, steps=('snv',)):
+def build_package(folder, name='model', ddof=0, change=None, wrap=False, steps=('snv',), derivative_mode='interp'):
     """Write ``<name>.hsipkg`` (or a zip around it); ``change(manifest, files)`` edits it before the checksums."""
     rng = np.random.default_rng(7)
     x, y = training_spectra(rng)
-    z = snv(x, ddof) if 'snv' in steps else x
+    z = preprocess(x, steps, ddof, derivative_mode)
     features = z[:, SELECTED]
     mean, var = features.mean(axis=0), features.var(axis=0)
     scale = np.sqrt(var)
@@ -109,6 +127,7 @@ def build_package(folder, name='model', ddof=0, change=None, wrap=False, steps=(
         'classes': [{'class_id': int(k), 'label': LABELS[k], 'n_spectra': int(counts[k]),
                      'mean': x[y == k].mean(axis=0).tolist(), 'sd': x[y == k].std(axis=0, ddof=1).tolist()}
                     for k in classes]}}}
+    reference['domains']['raw_wavelength_selected'] = reference['domains']['raw_wavelength_analysis']
     axis ={'spectral_axis_kind': 'wavelength_nm', 'spectral_resampling_mode': 'none',
             'selected_source_band_indices': list(range(WAVELENGTHS.size))}
     manifest = {
@@ -116,7 +135,9 @@ def build_package(folder, name='model', ddof=0, change=None, wrap=False, steps=(
         'hsi_lab_core_version': '1.15.0', 'exported_at': '2026-11-10T08:56:38',
         'wavelengths': WAVELENGTHS.tolist(), 'n_bands': int(WAVELENGTHS.size),
         'pipeline_audit': {
-            'steps': [{'name': step, 'parameters': {}} for step in steps],
+            'steps': [{'name': step, 'parameters': dict(DERIVATIVE) if step == 'first_derivative' else {},
+                       'implementation': 'hsi_lab_core.preprocessing.savgol_derivative'
+                       if step == 'first_derivative' else 'hsi_lab_core.preprocessing.snv'} for step in steps],
             'spectral_axis_transform': axis, 'pca': None, 'spectral_indices': None,
             'spectral_index_selection': None, 'spectral_index_discovery': None,
             'wavelength_selection': {'method': 'cars', 'selected_band_indices': SELECTED,
@@ -149,6 +170,8 @@ def reference_scores(package, x):
     """float64, written independently of the classifier: log prior + Gaussian log-density."""
     from scipy.stats import multivariate_normal
     z = snv(np.asarray(x, np.float64)) if package.snv else np.asarray(x, np.float64)
+    if package.derivative is not None:
+        z = first_derivative(z, **package.derivative_parameters)
     f = (z[:, package.selected] - package.scaler_mean) / package.scaler_scale
     return np.stack([np.log(package.priors[k]) + multivariate_normal(package.means[k], package.covariances[k]).logpdf(f)
                      for k in range(package.classes.size)], axis=1)
@@ -242,6 +265,111 @@ def test_package_without_snv_or_selection(tmp_path):
     x, y = training_spectra(np.random.default_rng(5), n=300)
     np.testing.assert_array_equal(model.predict(x.astype(np.float32), columns),
                                   reference_scores(model.package, x.astype(np.float32)).argmax(axis=1))
+
+
+@pytest.mark.parametrize('n_bands, window, polyorder, delta', [(159, 11, 2, 4.9941), (12, 5, 2, 5.0), (30, 7, 3, 1.0),
+                                                               (11, 11, 2, 2.0), (20, 9, 1, 0.5), (8, 3, 2, 3.0)])
+def test_derivative_matrix_is_scipy_savgol_interp(n_bands, window, polyorder, delta):
+    from hsi_package import savgol_derivative_matrix
+    x = np.random.default_rng(n_bands).normal(size=(5, n_bands))
+    matrix = savgol_derivative_matrix(n_bands, window, polyorder, delta)
+    np.testing.assert_allclose(x @ matrix.T, first_derivative(x, window=window, polyorder=polyorder, delta=delta),
+                               rtol=0, atol=1e-12 * np.abs(x).max() / delta)
+    np.testing.assert_allclose(matrix.sum(axis=1), 0.0, atol=1e-12)          # a constant has no slope
+    assert all(np.count_nonzero(row) <= window for row in matrix)
+
+
+def test_derivative_package_classes_are_those_of_the_training_chain(tmp_path):
+    """reflectance -> Savitzky-Golay 1st derivative -> selected bands -> scaler -> MLC: the classes
+    and posterior of a float64 scipy reference, in both the kernel and the full scores."""
+    path = build_package(tmp_path, name='d1', steps=('first_derivative',))
+    package = load_package(path)
+    assert not package.snv and package.derivative_parameters == {'window': 5, 'polyorder': 2, 'delta': 5.0}
+    assert '1st derivative (Savitzky-Golay 5/2) -> 6 bands -> StandardScaler -> MLC 3 classes' in package.chain
+    text = package.describe()
+    assert 'training reference ok' in text and '1st derivative of the raw means reproduced' in text
+    model = load_classifier(path)
+    columns, how = model.bind(WAVELENGTHS, WAVELENGTHS.size)
+    assert '1st derivative' in how
+    rng = np.random.default_rng(12)
+    x, y = training_spectra(rng, n=1500)
+    x = np.vstack([x, rng.uniform(0.02, 0.9, (1500, WAVELENGTHS.size))]).astype(np.float32)
+    reference = reference_scores(package, x)
+    ids = model.predict(x, columns)
+    np.testing.assert_array_equal(ids, reference.argmax(axis=1))
+    assert (ids[:y.size] == y).mean() > 0.95
+    scores, valid = model._scores(x, columns)
+    assert valid.all()
+    np.testing.assert_array_equal(ids, scores.argmax(axis=1))
+    np.testing.assert_allclose(scores + 0.0, reference + 0.5 * len(SELECTED) * np.log(2 * np.pi),
+                               rtol=2e-4, atol=0.05)
+    confidence_ids, confidence = model.predict_confidence(x, columns)
+    np.testing.assert_array_equal(confidence_ids, ids)
+    posterior = np.exp(reference - reference.max(axis=1, keepdims=True))
+    np.testing.assert_allclose(confidence, posterior.max(axis=1) / posterior.sum(axis=1), atol=1e-3)
+    # an offset has no slope: same classes; the input layout does not matter
+    np.testing.assert_array_equal(model.predict(x + 0.3, columns), reference_scores(package, x + 0.3).argmax(axis=1))
+    wide = np.zeros((x.shape[0], 20), np.float32)
+    order = rng.permutation(20)[:WAVELENGTHS.size]
+    wide[:, order] = x
+    np.testing.assert_array_equal(model.predict(wide, order.astype(np.intp)), ids)
+    # resampled onto the training bands (another calibration): still the chain on the training bands
+    binding, how = model.bind(WAVELENGTHS + 1.2, WAVELENGTHS.size)
+    assert 'resampled' in how
+    shifted = binding.apply(x)
+    np.testing.assert_array_equal(model.predict(x, binding), reference_scores(package, shifted).argmax(axis=1))
+    # a pixel without a finite spectrum is background, confidence 0
+    bad = x[:3].copy()
+    bad[0, 2], bad[1, 7] = np.nan, np.inf
+    with np.errstate(all='raise'):
+        ids_bad, confidence_bad = model.predict_confidence(bad, columns)
+        assert model.predict(bad, columns)[:2].tolist() == [0, 0]
+    assert ids_bad[:2].tolist() == [0, 0] and confidence_bad[:2].tolist() == [0.0, 0.0]
+
+
+def test_derivative_package_that_is_not_the_implemented_one_is_refused(tmp_path):
+    def parameters(**changes):
+        def change(manifest, files):
+            manifest['pipeline_audit']['steps'][0]['parameters'].update(changes)
+        return change
+
+    def implementation(manifest, files):
+        manifest['pipeline_audit']['steps'][0]['implementation'] = 'other.derivative'
+
+    def missing_class(manifest, files):
+        reference = json.loads(files['training_spectral_reference.json'])
+        del reference['domains']['preprocessed_wavelength_selected']['classes'][2]
+        files['training_spectral_reference.json'] = json.dumps(reference).encode()
+
+    def no_raw(manifest, files):
+        reference = json.loads(files['training_spectral_reference.json'])
+        del reference['domains']['raw_wavelength_selected']
+        files['training_spectral_reference.json'] = json.dumps(reference).encode()
+
+    cases = (('window', parameters(window=7), 'not the one implemented'),        # stated != trained
+             ('delta', parameters(delta=1.0), 'not the one implemented'),
+             ('even', parameters(window=4), 'odd window'),
+             ('wide', parameters(window=13), 'odd window'),
+             ('order', parameters(polyorder=5), 'polyorder'),
+             ('order0', parameters(polyorder=0), 'polyorder'),
+             ('float', parameters(window=5.5), 'whole window'),
+             ('nodelta', parameters(delta=None), 'delta'),
+             ('units', parameters(units='per_band'), 'per_band'),
+             ('inf', parameters(window=float('inf')), 'whole window'),
+             ('deriv2', parameters(deriv=2), 'deriv'),
+             ('nearest', parameters(mode='nearest'), 'mode'),
+             ('missing', missing_class, 'no 12-band spectrum of class 2'),
+             ('impl', implementation, 'other.derivative'))
+    for name, change, message in cases:
+        with pytest.raises(ValueError, match=message):
+            load_package(build_package(tmp_path, name=name, steps=('first_derivative',), change=change))
+    with pytest.raises(ValueError, match='not the one implemented'):            # other end handling
+        load_package(build_package(tmp_path, name='mirror', steps=('first_derivative',), derivative_mode='mirror'))
+    for steps in (('snv', 'first_derivative'), ('first_derivative', 'snv'), ('first_derivative', 'first_derivative')):
+        with pytest.raises(ValueError, match='not supported'):
+            load_package(build_package(tmp_path, name='-'.join(steps), steps=steps))
+    package = load_package(build_package(tmp_path, name='noraw', steps=('first_derivative',), change=no_raw))
+    assert any('first derivative NOT verified' in text for text in package.checks)
 
 
 def test_package_binds_every_training_band(package_path):
@@ -449,11 +577,11 @@ def test_mlc_reg_covar_widens_the_covariances_and_is_off_by_default(tmp_path, pa
 
 # ------------------------------------------------------------- the delivered packages ---
 
-@pytest.mark.parametrize('name, classes, bands', [('Kratom_adulteration_1794300998.zip', 4, 137),
-                                                  ('MLC_874171_1794299876.zip', 5, 101)])
-def test_delivered_package_loads_and_meets_the_camera_grid(tmp_path, name, classes, bands):
+@pytest.mark.parametrize('path, classes, bands', [(REAL_PACKAGES / 'Kratom_adulteration_1794300998.zip', 4, 137),
+                                                  (REAL_PACKAGES / 'MLC_874171_1794299876.zip', 5, 101),
+                                                  (ROOT / 'models' / 'MLC_869291_1794818878.hsipkg', 3, 159)])
+def test_delivered_package_loads_and_meets_the_camera_grid(tmp_path, path, classes, bands):
     """The models delivered for this project (skipped where the files are not present)."""
-    path = REAL_PACKAGES / name
     if not path.is_file():
         pytest.skip(f"{path} is not on this machine")
     model = load_classifier(path)
@@ -468,6 +596,11 @@ def test_delivered_package_loads_and_meets_the_camera_grid(tmp_path, name, class
     if offset <= 0.5:
         columns, how = model.bind(plan.wavelengths, plan.n_columns, 0.5)
         assert columns.tolist() == list(range(159))
-    else:                                              # trained on another wavelength calibration: refused
-        with pytest.raises(ValueError, match='no input band'):
-            model.bind(plan.wavelengths, plan.n_columns, 0.5)
+    else:                                              # trained on another wavelength calibration
+        with pytest.raises(ValueError, match='no input band'):                 # refused one to one ...
+            model.bind(plan.wavelengths, plan.n_columns, 0.5, resample=False)
+        inside = plan.wavelengths.min() <= model.band_wavelengths.min() \
+            and model.band_wavelengths.max() <= plan.wavelengths.max()
+        if inside:                                                             # ... or resampled
+            binding, how = model.bind(plan.wavelengths, plan.n_columns, 0.5)
+            assert 'resampled' in how and binding.n_bands == 159

@@ -119,7 +119,9 @@ class SpectrumPanel(QFrame):
         self.note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # never widens the panel
         header.addWidget(self.note_label, stretch=1)
         self._training_wavelengths = np.zeros(0)
-        self._training: dict = {False: [], True: []}        # SNV view? -> [TrainingBand]
+        self._training: dict = {'input': [], 'snv': [], 'derivative': []}    # view -> [TrainingBand]
+        self._derivative: np.ndarray | None = None          # (B, B): D @ x = SG 1st derivative on the training axis
+        self._selected = np.zeros(0)                        # nm of the bands the model uses (marked in a model view)
         self.training_button = QPushButton("Model reference")
         self.training_button.setToolTip(
             "Draw the model's training spectra behind the clicked ones: per class a band mean ± 1 SD\n"
@@ -129,13 +131,21 @@ class SpectrumPanel(QFrame):
         self.snv_button.setToolTip(
             "Show the spectra after SNV (mean 0, SD 1 over the training bands): what the model compares.\n"
             "Brightness differences vanish here; shape and noise remain.")
-        for button in (self.training_button, self.snv_button):
+        self.derivative_button = QPushButton("1st deriv")
+        self.derivative_button.setToolTip(
+            "Show the Savitzky-Golay first derivative (the model package's window / order, per nm):\n"
+            "what the model compares. Ticks at the bottom mark the bands the model uses.\n"
+            "Offsets vanish here; a gain (brightness x factor) still scales the curve, noise is amplified.")
+        for button in (self.training_button, self.snv_button, self.derivative_button):
             button.setObjectName("toggleButton")
             button.setCheckable(True)
             button.setFocusPolicy(Qt.NoFocus)
             button.setEnabled(False)
             button.toggled.connect(lambda _on: self.plot.update())
             header.addWidget(button)
+        # one model view at a time
+        self.snv_button.toggled.connect(lambda on: on and self.derivative_button.setChecked(False))
+        self.derivative_button.toggled.connect(lambda on: on and self.snv_button.setChecked(False))
         self.clear_button = QPushButton("Clear")
         self.clear_button.setObjectName("presetButton")
         self.clear_button.setToolTip("Remove every spectrum and its mark on the belt map")
@@ -171,17 +181,25 @@ class SpectrumPanel(QFrame):
         """One short line beside the caption (why a click gave no spectrum, or what was added)."""
         self.note_label.setText(text)
 
-    def set_training(self, wavelengths=None, bands=(), snv_bands=()) -> None:
+    def set_training(self, wavelengths=None, bands=(), snv_bands=(), derivative_bands=(), derivative=None,
+                     selected=None) -> None:
         """The training spectra of the model in use (``None`` / empty: the model brings none).
 
         Args:
             wavelengths: (bands,) nm of the training axis.
             bands: :class:`TrainingBand` per class in the units of the model input.
             snv_bands: the same after SNV; empty when the model does not use SNV (no SNV view).
+            derivative_bands: the same after the first derivative; empty when the model does not use it.
+            derivative: (B, B) matrix, ``D @ x`` = that derivative of a spectrum on the training axis.
+            selected: nm of the bands the model's features use (marked in the SNV / derivative view).
         """
-        had = bool(self._training[False])
+        had = bool(self._training['input'])
         self._training_wavelengths = np.zeros(0) if wavelengths is None else np.asarray(wavelengths, np.float64)
-        self._training = {False: list(bands), True: list(snv_bands)}
+        has_derivative = derivative is not None and bool(derivative_bands)
+        self._derivative = np.asarray(derivative, np.float64) if has_derivative else None
+        self._training = {'input': list(bands), 'snv': list(snv_bands),
+                          'derivative': list(derivative_bands) if has_derivative else []}
+        self._selected = np.zeros(0) if selected is None else np.asarray(selected, np.float64).ravel()
         self.reference_label.setText(
             f"Model reference: {len(bands)} classes · shaded mean ± 1 SD · dashed mean · solid clicked spectra"
             if bands else "No training reference supplied by this model · captured spectra remain available")
@@ -189,6 +207,9 @@ class SpectrumPanel(QFrame):
         self.snv_button.setEnabled(bool(snv_bands))
         if not snv_bands:
             self.snv_button.setChecked(False)
+        self.derivative_button.setEnabled(has_derivative)
+        if not has_derivative:
+            self.derivative_button.setChecked(False)
         if not bands:
             self.training_button.setChecked(False)
         elif not had:
@@ -199,14 +220,43 @@ class SpectrumPanel(QFrame):
     def snv_shown(self) -> bool:
         return self.snv_button.isChecked()
 
+    @property
+    def derivative_shown(self) -> bool:
+        return self.derivative_button.isChecked() and self._derivative is not None
+
+    @property
+    def view(self) -> str:
+        """``'input'``, ``'snv'`` or ``'derivative'``."""
+        return 'derivative' if self.derivative_shown else 'snv' if self.snv_shown else 'input'
+
+    @property
+    def selected_wavelengths(self) -> np.ndarray:
+        """nm of the model's selected bands, marked in a model view (empty in the input view)."""
+        return self._selected if self.view != 'input' else np.zeros(0)
+
     def shown_training(self) -> tuple[np.ndarray, list[TrainingBand]]:
         """``(wavelengths, bands)`` drawn now (no bands when ``Training`` is off)."""
         if not self.training_button.isChecked():
             return self._training_wavelengths, []
-        return self._training_wavelengths, self._training[self.snv_shown]
+        return self._training_wavelengths, self._training[self.view]
+
+    def shown_curve(self, point: SpectrumPoint) -> tuple[np.ndarray, np.ndarray]:
+        """``(wavelengths, values)`` of ``point`` in the current view.
+
+        The derivative view resamples the point onto the training axis (linear) and applies the
+        package's derivative there, as the model does; bands outside the point's range are NaN.
+        """
+        if not self.derivative_shown:
+            return point.wavelengths, self.shown_values(point)
+        wl = self._training_wavelengths
+        order = np.argsort(point.wavelengths)
+        x, y = point.wavelengths[order], point.values[order]
+        if x.size < 2 or not np.isfinite(y).all() or wl[0] < x[0] - 1e-6 or wl[-1] > x[-1] + 1e-6:
+            return wl, np.full(wl.shape, np.nan)
+        return wl, self._derivative @ np.interp(wl, x, y)
 
     def shown_values(self, point: SpectrumPoint) -> np.ndarray:
-        """The curve of ``point`` in the current view (as received, or after SNV)."""
+        """The curve of ``point`` on its own wavelengths (as received, or after SNV)."""
         if not self.snv_shown:
             return point.values
         wl = self._training_wavelengths
@@ -277,7 +327,9 @@ class _SpectrumPlot(QWidget):
         self._tokens = QApplication.instance().property('theme_tokens') or {}
         points = self._panel.points
         train_wl, bands = self._panel.shown_training()
-        curves = [self._panel.shown_values(pt) for pt in points]
+        shown = [self._panel.shown_curve(pt) for pt in points]
+        curves = [values for _wl, values in shown]
+        selected = self._panel.selected_wavelengths
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
@@ -292,7 +344,7 @@ class _SpectrumPlot(QWidget):
         left, bottom = 44, 15 if h >= 60 else 0
         area = QRectF(left, 3, max(10.0, w - left - key - 6), max(8.0, h - bottom - 5))
 
-        xs = np.concatenate([pt.wavelengths for pt in points] + ([train_wl] if bands else []))
+        xs = np.concatenate([wl for wl, _v in shown] + ([train_wl] if bands else []))
         ys = np.concatenate([v[np.isfinite(v)] for v in curves]
                             + [np.concatenate((b.mean - b.sd, b.mean + b.sd)) for b in bands] + [np.zeros(0)])
         if not ys.size:
@@ -333,13 +385,23 @@ class _SpectrumPlot(QWidget):
         p.setPen(QPen(self._colour('border_strong'), 1))
         p.setBrush(Qt.NoBrush)
         p.drawRect(area)
-        unit = "SNV of the model input" if self._panel.snv_shown else self._panel.unit
+        unit = {'snv': "SNV of the model input",
+                'derivative': "1st derivative of the model input (per nm)"}.get(self._panel.view, self._panel.unit)
         if unit:
             p.setPen(self._colour('text_muted'))
             p.drawText(QRectF(area.left() + 5, area.top() + 2, area.width() - 10, 14),
                        Qt.AlignLeft | Qt.AlignVCenter, unit)
 
         p.setClipRect(area.adjusted(-1, -1, 1, 1))
+        # the bands the model uses: short ticks on the bottom edge, and the zero line of a model view
+        if self._panel.view == 'derivative' and y0 < 0 < y1:
+            p.setPen(QPen(self._colour('border_strong'), 1, Qt.DotLine))
+            p.drawLine(at(x0, 0.0), at(x1, 0.0))
+        if selected.size:
+            p.setPen(QPen(self._colour('text_muted'), 1.4))
+            for value in selected:
+                x = at(float(value), y0).x()
+                p.drawLine(QPointF(x, area.bottom()), QPointF(x, area.bottom() - 7))
         # training spectra: band mean ± SD and the mean (dashed), behind the clicked curves
         for band in bands:
             colour = self._band_colour(band)
@@ -364,9 +426,9 @@ class _SpectrumPlot(QWidget):
             p.drawPath(centre)
 
         # curves: a gap where a value is NaN / inf
-        for pt, values in zip(points, curves):
+        for pt, (wavelengths, values) in zip(points, shown):
             path, pen_down = QPainterPath(), False
-            for x, y in zip(pt.wavelengths, values):
+            for x, y in zip(wavelengths, values):
                 if not np.isfinite(y):
                     pen_down = False
                     continue

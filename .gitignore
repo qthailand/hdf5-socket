@@ -17,6 +17,8 @@ data/
 *.h5
 *.hdf5
 
+raw/
+
 models/
 
 # Archives and generated reports

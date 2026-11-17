@@ -8,21 +8,30 @@ package: a zip named ``*.hsipkg`` (often inside another ``.zip``) holding ``mani
 ``inference_engine.HsiPackageClassifier`` can run the same chain as the training software:
 
     reflectance (159 bands) -> SNV per pixel -> band selection -> StandardScaler -> MLC
+    reflectance (159 bands) -> Savitzky-Golay 1st derivative -> band selection -> StandardScaler -> MLC | SVM
 
 What is read, and how it is kept honest:
 
 * ``manifest.json`` says which steps the package uses. Anything this reader does not implement
   (another preprocessing step, PCA, spectral indices, resampling, another algorithm) is refused
   by name; nothing is skipped silently.
-* The joblib files are pickles of ``hsi_lab_core`` objects. They are read with a restricted
-  unpickler: numpy arrays are loaded, ``hsi_lab_core`` classes become plain attribute holders,
-  every other global is refused. No code of the package runs and ``hsi_lab_core`` is not needed.
+* The joblib files are pickles of ``hsi_lab_core`` objects (an SVM: of ``sklearn.svm.SVC``).
+  They are read with a restricted unpickler: numpy arrays are loaded, ``hsi_lab_core`` classes
+  and ``SVC`` become plain attribute holders, every other global is refused. No code of the
+  package runs and neither ``hsi_lab_core`` nor ``sklearn`` is needed.
 * ``artifact_sha256`` of the manifest is checked for every file that is read.
 * ``training_spectral_reference.json`` (class means of the training spectra after the
   preprocessing) is the package's own evidence: the class means of the model must equal those
   spectra passed through this reader's band selection and scaler (they do, to 1e-13, for the
   packages this was written against), and the SNV convention (population SD over all bands) is
-  checked on them. A package that fails this is refused: its chain is not the one implemented here.
+  checked on them. The first derivative is linear, so the class means of the raw training
+  spectra, derived here, must give the preprocessed ones (``scipy.signal.savgol_filter`` with
+  ``mode='interp'``: polynomial fits over the first and last windows at the ends). The reference
+  also gives the count, mean and SD of every class, so the mean and variance the StandardScaler
+  was fitted with must come out of it (they do, to 1e-14) - for an SVM, whose support vectors
+  cannot be compared with class means, this and its RBF ``gamma`` ('scale' = 1 / (features x
+  variance of the scaled training data)) are the evidence. A package that fails this is
+  refused: its chain is not the one implemented here.
 
 ``python hsi_package.py <package>`` prints what a package contains and whether it passed.
 """
@@ -47,10 +56,19 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ALGORITHMS = ('MLC',)
-SUPPORTED_STEPS = ('snv',)            # preprocessing steps of pipeline_audit this reader implements
+SUPPORTED_ALGORITHMS = ('MLC', 'SVM')
+# classes of other libraries a package may pickle, read as attribute holders like hsi_lab_core's
+_FOREIGN_HOLDERS = {('sklearn.svm._classes', 'SVC'), ('sklearn.svm.classes', 'SVC')}
+_SCALER_TOLERANCE = 1e-8              # scaler mean / variance vs the ones the reference gives (relative)
+_GAMMA_TOLERANCE = 1e-8               # SVM gamma 'scale' vs the one the reference gives (relative)
+# preprocessing step lists of pipeline_audit this reader implements (in this order, nothing else)
+SUPPORTED_STEPS = ('snv', 'first_derivative')
+_SUPPORTED_CHAINS = ((), ('snv',), ('first_derivative',))
+_DERIVATIVE_IMPLEMENTATION = 'hsi_lab_core.preprocessing.savgol_derivative'
 _REFERENCE_DOMAIN = 'preprocessed_wavelength_selected'
+_RAW_DOMAIN = 'raw_wavelength_selected'
 _MEAN_TOLERANCE = 1e-6                # model class means vs the package's reference spectra (scaled units)
+_DERIVATIVE_TOLERANCE = 1e-8          # derived raw class means vs the preprocessed ones (relative to their size)
 
 
 # ------------------------------------------------------------------------------ package ---
@@ -63,6 +81,32 @@ class TrainingClass:
     n_spectra: int
     mean: np.ndarray                 # (B,) on HsiPackage.wavelengths
     sd: np.ndarray                   # (B,)
+
+
+@dataclass
+class SvmModel:
+    """An RBF ``sklearn.svm.SVC`` as libsvm evaluates it (float64, exactly as stored).
+
+    Classes are numbered by their index in ``HsiPackage.classes``; class pairs ``(i, j)``, ``i <
+    j``, run in the order (0, 1), (0, 2), ..., (1, 2), ... For pair ``p = (i, j)`` the decision
+    is ``sum over the support vectors s of class i of dual_coef[j - 1, s] K(s, x) + sum over those
+    of class j of dual_coef[i, s] K(s, x) + intercept[p]`` with ``K = exp(-gamma |s - x|^2)``;
+    positive votes for ``i``, otherwise ``j``; the class with most votes wins (the lowest index
+    on a tie). That is ``SVC.predict`` (libsvm ``svm_predict``) with ``break_ties=False``.
+    """
+    support_vectors: np.ndarray      # (S, F) in scaled feature units, grouped by class
+    n_support: np.ndarray            # (K,) support vectors per class, in class order
+    dual_coef: np.ndarray            # (K - 1, S) libsvm layout (SVC._dual_coef_)
+    intercept: np.ndarray            # (P,) = -rho per class pair (SVC._intercept_)
+    gamma: float                     # the fitted RBF gamma (SVC._gamma)
+    gamma_setting: object            # SVC.gamma as trained: 'scale', 'auto' or a number
+    prob_a: np.ndarray | None        # (P,) Platt sigmoid per pair (probability=True), else None
+    prob_b: np.ndarray | None
+
+    @property
+    def pairs(self) -> list:
+        k = self.n_support.size
+        return [(i, j) for i in range(k) for j in range(i + 1, k)]
 
 
 @dataclass
@@ -80,26 +124,43 @@ class HsiPackage:
     selected: np.ndarray             # (F,) indices into ``wavelengths`` the model uses
     scaler_mean: np.ndarray          # (F,)
     scaler_scale: np.ndarray         # (F,)
-    means: np.ndarray                # (K, F) in scaled units
-    covariances: np.ndarray          # (K, F, F), regularisation included
-    priors: np.ndarray               # (K,)
+    means: np.ndarray | None         # MLC: (K, F) in scaled units (None for an SVM)
+    covariances: np.ndarray | None   # MLC: (K, F, F), regularisation included
+    priors: np.ndarray | None        # MLC: (K,)
     input_units: str                 # 'reflectance' | 'counts'
     metric: str                      # the selection score the package reports
     exported_at: str
     lab_core_version: str
     checks: list = field(default_factory=list)   # what was verified while loading (text lines)
     # training spectra per class, for display: {'input': [TrainingClass], 'preprocessed': [TrainingClass]}
-    # ('input' = what the model is given, 'preprocessed' = after SNV); a list is empty when the package lacks it
+    # ('input' = what the model is given, 'preprocessed' = after the preprocessing); a list is empty
+    # when the package lacks it
     training: dict = field(default_factory=dict)
+    # Savitzky-Golay first derivative: z = derivative @ x per pixel, (B, B) float64; None = not used
+    derivative: np.ndarray | None = None
+    derivative_parameters: dict = field(default_factory=dict)    # window, polyorder, delta (nm)
+    svm: SvmModel | None = None      # the model of an SVM package (None for an MLC)
+    scaler_var: np.ndarray | None = None      # (F,) variance the scaler was fitted with, if stored
+    scaler_samples: float | None = None       # rows the scaler was fitted on, if stored
+
+    @property
+    def model_text(self) -> str:
+        if self.svm is not None:
+            return (f"SVM {self.classes.size} classes (RBF, {self.svm.support_vectors.shape[0]} support vectors, "
+                    "one-vs-one vote)")
+        return f"{self.algorithm} {self.classes.size} classes"
 
     @property
     def chain(self) -> str:
         steps = [f"{self.input_units} {self.wavelengths.size} bands"]
         if self.snv:
             steps.append('SNV')
+        if self.derivative is not None:
+            p = self.derivative_parameters
+            steps.append(f"1st derivative (Savitzky-Golay {p['window']}/{p['polyorder']})")
         if self.selected.size != self.wavelengths.size:
             steps.append(f"{self.selected.size} bands")
-        steps += ['StandardScaler', f"{self.algorithm} {self.classes.size} classes"]
+        steps += ['StandardScaler', self.model_text]
         return ' -> '.join(steps)
 
     def describe(self) -> str:
@@ -143,9 +204,16 @@ def load_package(path) -> HsiPackage:
     if algorithm not in SUPPORTED_ALGORITHMS or manifest.get('task_type') != 'classification':
         raise ValueError(f"{path.name}: algorithm {algorithm!r} ({manifest.get('task_type')}) is not supported; "
                          f"this reader runs {', '.join(SUPPORTED_ALGORITHMS)} classification packages")
-    wavelengths, snv, selected = _feature_chain(path, manifest)
-    scaler_mean, scaler_scale = _scaler(path, manifest, files, selected.size)
-    classes, means, covariances, priors = _mlc(path, files, selected.size)
+    wavelengths, snv, derivative_parameters, selected = _feature_chain(path, manifest)
+    derivative = None if not derivative_parameters else savgol_derivative_matrix(
+        wavelengths.size, derivative_parameters['window'], derivative_parameters['polyorder'],
+        derivative_parameters['delta'])
+    scaler_mean, scaler_scale, scaler_var, scaler_samples = _scaler(path, manifest, files, selected.size)
+    svm = means = covariances = priors = None
+    if algorithm == 'SVM':
+        classes, svm = _svm(path, files, selected.size)
+    else:
+        classes, means, covariances, priors = _mlc(path, files, selected.size)
 
     labels = [str(name) for name in manifest.get('labels', [])]
     if len(labels) != classes.size or not np.array_equal(classes, np.arange(classes.size)):
@@ -171,7 +239,9 @@ def load_package(path) -> HsiPackage:
         colors=colors, background=background, wavelengths=wavelengths, snv=snv, selected=selected,
         scaler_mean=scaler_mean, scaler_scale=scaler_scale, means=means, covariances=covariances, priors=priors,
         input_units=input_units, metric=_metric_text(manifest), exported_at=str(manifest.get('exported_at', '?')),
-        lab_core_version=str(manifest.get('hsi_lab_core_version', '?')), checks=checks)
+        lab_core_version=str(manifest.get('hsi_lab_core_version', '?')), checks=checks,
+        derivative=derivative, derivative_parameters=derivative_parameters, svm=svm, scaler_var=scaler_var,
+        scaler_samples=scaler_samples)
     checks.append(_check_reference(path, package, files.get('training_spectral_reference.json')))
     package.training = _training_spectra(package, files.get('training_spectral_reference.json'))
     logger.info("Model package loaded\n%s", package.describe())
@@ -312,10 +382,10 @@ def _restricted_unpickler():
             found = _numpy_global(module, name)
             if found is not None:
                 return found
-            if module == 'hsi_lab_core' or module.startswith('hsi_lab_core.'):
+            if module == 'hsi_lab_core' or module.startswith('hsi_lab_core.') or (module, name) in _FOREIGN_HOLDERS:
                 return type(name, (_Holder,), {'__module__': module})
-            raise pickle.UnpicklingError(f"refused {module}.{name}: a model package may hold numpy arrays and "
-                                         "hsi_lab_core objects only")
+            raise pickle.UnpicklingError(f"refused {module}.{name}: a model package may hold numpy arrays, "
+                                         "hsi_lab_core objects and sklearn SVC only")
 
     return RestrictedUnpickler
 
@@ -373,16 +443,71 @@ def _array(holder, name: str, what: str, shape: tuple | None = None) -> np.ndarr
 
 # ----------------------------------------------------------------------- manifest parts ---
 
+def savgol_derivative_matrix(n_bands: int, window: int, polyorder: int, delta: float) -> np.ndarray:
+    """``D`` (n_bands, n_bands) with ``D @ x`` = the Savitzky-Golay first derivative of ``x``.
+
+    Each band gets the slope (per ``delta``) of the least-squares polynomial of degree
+    ``polyorder`` over ``window`` bands centred on it; within half a window of either end the
+    window stays on the first (last) ``window`` bands. That is ``scipy.signal.savgol_filter(x,
+    window, polyorder, deriv=1, delta=delta, mode='interp')``, written without scipy.
+    """
+    half = window // 2
+    matrix = np.zeros((n_bands, n_bands))
+    for band in range(n_bands):
+        start = min(max(band - half, 0), n_bands - window)
+        offsets = np.arange(start, start + window, dtype=np.float64) - band
+        vander = np.vander(offsets, polyorder + 1, increasing=True)        # columns u^0 .. u^polyorder
+        matrix[band, start:start + window] = np.linalg.pinv(vander)[1] / delta   # the u^1 coefficient
+    return matrix
+
+
+def _whole(value) -> int | None:
+    """``value`` as an int when it is a whole number (not a bool), else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) \
+            or value != int(value):
+        return None
+    return int(value)
+
+
+def _derivative_parameters(path: Path, step: dict, n_bands: int) -> dict:
+    """``{window, polyorder, delta}`` of the ``first_derivative`` step, checked."""
+    implementation = step.get('implementation')
+    if implementation not in (None, _DERIVATIVE_IMPLEMENTATION):
+        raise ValueError(f"{path.name}: first_derivative by {implementation!r} is not supported "
+                         f"({_DERIVATIVE_IMPLEMENTATION} is)")
+    parameters = step.get('parameters') or {}
+    if not isinstance(parameters, dict):
+        raise ValueError(f"{path.name}: the parameters of first_derivative are not a mapping ({parameters!r})")
+    if parameters.get('deriv', 1) != 1 or parameters.get('mode', 'interp') != 'interp':
+        raise ValueError(f"{path.name}: first_derivative with deriv {parameters.get('deriv')!r} / mode "
+                         f"{parameters.get('mode')!r} is not supported (deriv 1, mode 'interp' is)")
+    window, polyorder = _whole(parameters.get('window')), _whole(parameters.get('polyorder'))
+    delta = parameters.get('delta')
+    units = parameters.get('units', 'per_nm')
+    if units != 'per_nm':
+        raise ValueError(f"{path.name}: first_derivative in units {units!r} is not supported (per_nm is)")
+    if window is None or polyorder is None or isinstance(delta, bool) or not isinstance(delta, (int, float)) \
+            or not np.isfinite(delta) or delta <= 0:
+        raise ValueError(f"{path.name}: first_derivative needs a whole window and polyorder and a delta > 0, "
+                         f"got {parameters}")
+    if window % 2 == 0 or not 3 <= window <= n_bands or not 1 <= polyorder < window:
+        raise ValueError(f"{path.name}: first_derivative window {window} / polyorder {polyorder} is not an odd "
+                         f"window of at most {n_bands} bands with 1 <= polyorder < window")
+    return {'window': window, 'polyorder': polyorder, 'delta': float(delta)}
+
+
 def _feature_chain(path: Path, manifest: dict) -> tuple:
-    """``(wavelengths of every input band, SNV on?, selected band indices)`` from the manifest."""
+    """``(wavelengths of every input band, SNV on?, first-derivative parameters ({} = none),
+    selected band indices)`` from the manifest."""
     audit = manifest.get('pipeline_audit')
     if not isinstance(audit, dict):
         raise ValueError(f"{path.name}: the manifest has no pipeline_audit (which steps did the training use?)")
-    steps = [str(step.get('name')) for step in audit.get('steps') or []]
-    unknown = [step for step in steps if step not in SUPPORTED_STEPS]
-    if unknown or len(steps) != len(set(steps)):
-        raise ValueError(f"{path.name}: preprocessing {steps} is not supported (this reader implements "
-                         f"{', '.join(SUPPORTED_STEPS)}); the model cannot be run faithfully")
+    step_list = [step if isinstance(step, dict) else {} for step in audit.get('steps') or []]
+    steps = tuple(str(step.get('name')) for step in step_list)
+    if steps not in _SUPPORTED_CHAINS:
+        raise ValueError(f"{path.name}: preprocessing {list(steps)} is not supported (this reader implements "
+                         f"{' or '.join(str(list(chain)) for chain in _SUPPORTED_CHAINS)}); the model cannot "
+                         "be run faithfully")
     for key in ('pca', 'spectral_indices', 'spectral_index_selection', 'spectral_index_discovery'):
         if audit.get(key) is not None:
             raise ValueError(f"{path.name}: the package uses {key}, which this reader does not implement")
@@ -415,13 +540,18 @@ def _feature_chain(path: Path, manifest: dict) -> tuple:
         if stated is not None and not np.allclose(wavelengths[selected], np.asarray(stated, dtype=np.float64),
                                                   atol=1e-6):
             raise ValueError(f"{path.name}: the selected band indices and selected_wavelengths_nm disagree")
-    return wavelengths, 'snv' in steps, selected
+    derivative = {}
+    if 'first_derivative' in steps:
+        derivative = _derivative_parameters(path, step_list[steps.index('first_derivative')], wavelengths.size)
+    return wavelengths, 'snv' in steps, derivative, selected
 
 
 def _scaler(path: Path, manifest: dict, files: dict, n_features: int) -> tuple:
+    """``(mean, scale, variance or None, samples or None)`` of the StandardScaler (the last two
+    only for the check against the training reference)."""
     final = (manifest.get('pipeline_audit') or {}).get('final_scaler')
     if final is None:
-        return np.zeros(n_features), np.ones(n_features)
+        return np.zeros(n_features), np.ones(n_features), None, None
     if final.get('type') != 'StandardScaler':
         raise ValueError(f"{path.name}: final scaler {final.get('type')!r} is not supported (StandardScaler is)")
     if 'scaler.joblib' not in files:
@@ -434,7 +564,12 @@ def _scaler(path: Path, manifest: dict, files: dict, n_features: int) -> tuple:
     scale = _array(holder, 'scale_', what, (n_features,)) if with_std else np.ones(n_features)
     if np.any(scale <= 0):
         raise ValueError(f"{what}: scale_ has values <= 0")
-    return mean, scale
+    variance = samples = None
+    if with_mean and with_std and getattr(holder, 'var_', None) is not None:
+        variance = _array(holder, 'var_', what, (n_features,))
+        seen = np.asarray(getattr(holder, 'n_samples_seen_', np.nan), dtype=np.float64)
+        samples = float(seen) if seen.ndim == 0 and np.isfinite(seen) and seen > 0 else None
+    return mean, scale, variance, samples
 
 
 def _mlc(path: Path, files: dict, n_features: int) -> tuple:
@@ -443,7 +578,7 @@ def _mlc(path: Path, files: dict, n_features: int) -> tuple:
     what = f"{path.name}/model.joblib"
     holder = _load_joblib(files['model.joblib'], what)
     kind = type(holder).__name__
-    if kind != 'MaximumLikelihoodClassifier':
+    if kind != 'MaximumLikelihoodClassifier' or not type(holder).__module__.startswith('hsi_lab_core'):
         raise ValueError(f"{what}: holds a {kind}; this reader runs MaximumLikelihoodClassifier")
     covariance_type = getattr(holder, 'covariance_type_', getattr(holder, 'covariance_type', None))
     if covariance_type != 'full':
@@ -465,6 +600,71 @@ def _mlc(path: Path, files: dict, n_features: int) -> tuple:
         if not np.allclose(ours, np.asarray(stored, dtype=np.float64), rtol=1e-8, atol=1e-6):
             raise ValueError(f"{what}: log_determinants_ do not belong to covariances_")
     return classes.astype(np.int64), means, covariances, priors
+
+
+def _svm_array(holder, names: tuple, what: str, shape: tuple) -> np.ndarray:
+    for name in names:                       # sklearn renamed some attributes across versions
+        if getattr(holder, name, None) is not None:
+            return _array(holder, name, what, shape)
+    raise ValueError(f"{what}: no {' / '.join(names)}")
+
+
+def _svm(path: Path, files: dict, n_features: int) -> tuple:
+    """``(classes, SvmModel)`` of a pickled ``sklearn.svm.SVC`` (read as attributes, never run)."""
+    if 'model.joblib' not in files:
+        raise ValueError(f"{path.name}: model.joblib is missing")
+    what = f"{path.name}/model.joblib"
+    holder = _load_joblib(files['model.joblib'], what)
+    kind = f"{type(holder).__module__}.{type(holder).__name__}"
+    if (type(holder).__module__, type(holder).__name__) not in _FOREIGN_HOLDERS:
+        raise ValueError(f"{what}: holds a {kind}; an SVM package must hold sklearn.svm.SVC")
+    settings = {name: getattr(holder, name, None) for name in ('kernel', '_sparse', 'break_ties',
+                                                               'decision_function_shape', 'fit_status_')}
+    if settings['kernel'] != 'rbf':
+        raise ValueError(f"{what}: SVC kernel {settings['kernel']!r} is not supported ('rbf' is)")
+    if settings['_sparse'] is True:
+        raise ValueError(f"{what}: an SVC fitted on sparse data is not supported")
+    if settings['break_ties'] is True and settings['decision_function_shape'] == 'ovr':
+        raise ValueError(f"{what}: break_ties=True (predict by the one-vs-rest decision) is not supported")
+    if settings['fit_status_'] not in (None, 0):
+        raise ValueError(f"{what}: the SVC did not converge (fit_status_ {settings['fit_status_']})")
+    classes = np.asarray(getattr(holder, 'classes_', []))
+    if classes.ndim != 1 or classes.size < 2 or classes.dtype.kind not in 'iu':
+        raise ValueError(f"{what}: classes_ {classes!r} is not a list of at least two integer class ids")
+    n_classes = classes.size
+    n_pairs = n_classes * (n_classes - 1) // 2
+    n_in = getattr(holder, 'n_features_in_', n_features)
+    if n_in != n_features:
+        raise ValueError(f"{what}: the SVC takes {n_in} features, the package's chain gives {n_features}")
+    support_vectors = _array(holder, 'support_vectors_', what)
+    if support_vectors.ndim != 2 or support_vectors.shape[1] != n_features:
+        raise ValueError(f"{what}: support_vectors_ has shape {support_vectors.shape}, expected (n, {n_features})")
+    n_vectors = support_vectors.shape[0]
+    raw = getattr(holder, '_n_support', getattr(holder, 'n_support_', None))
+    n_support = np.asarray(raw if raw is not None else [])
+    if n_support.shape != (n_classes,) or n_support.dtype.kind not in 'iu' or np.any(n_support < 0) \
+            or int(n_support.sum()) != n_vectors or n_vectors < 1:
+        raise ValueError(f"{what}: support vectors per class {n_support.tolist()} do not add up to the "
+                         f"{n_vectors} support vectors of {n_classes} classes")
+    # libsvm's own coefficients: sklearn flips the public dual_coef_ / intercept_ of a binary SVC
+    if getattr(holder, '_dual_coef_', None) is not None and getattr(holder, '_intercept_', None) is not None:
+        dual_coef = _array(holder, '_dual_coef_', what, (n_classes - 1, n_vectors))
+        intercept = _array(holder, '_intercept_', what, (n_pairs,))
+    else:
+        sign = -1.0 if n_classes == 2 else 1.0
+        dual_coef = sign * _array(holder, 'dual_coef_', what, (n_classes - 1, n_vectors))
+        intercept = sign * _array(holder, 'intercept_', what, (n_pairs,))
+    gamma = float(_array(holder, '_gamma', what, ()))
+    if not gamma > 0:
+        raise ValueError(f"{what}: gamma {gamma} is not positive")
+    prob_a = prob_b = None
+    if getattr(holder, 'probability', False):
+        prob_a = _svm_array(holder, ('_probA', 'probA_'), what, (n_pairs,))
+        prob_b = _svm_array(holder, ('_probB', 'probB_'), what, (n_pairs,))
+    model = SvmModel(support_vectors=support_vectors, n_support=n_support.astype(np.int64), dual_coef=dual_coef,
+                     intercept=intercept, gamma=gamma, gamma_setting=getattr(holder, 'gamma', None),
+                     prob_a=prob_a, prob_b=prob_b)
+    return classes.astype(np.int64), model
 
 
 def _hex_rgb(text) -> list | None:
@@ -506,11 +706,15 @@ def _check_reference(path: Path, package: HsiPackage, blob: bytes | None) -> str
         domain = json.loads(blob.decode('utf-8'))['domains'][_REFERENCE_DOMAIN]
         rows = {int(c['class_id']): (np.asarray(c['mean'], dtype=np.float64), np.asarray(c['sd'], dtype=np.float64))
                 for c in domain['classes']}
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        counts = {int(c['class_id']): c.get('n_spectra') for c in domain['classes']}
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, AttributeError) as exc:
         logger.warning("%s: training_spectral_reference.json has no %s spectra (%s): chain not verified",
                        path.name, _REFERENCE_DOMAIN, type(exc).__name__)
         return f"training reference: no {_REFERENCE_DOMAIN} spectra (chain NOT verified)"
     n_bands = package.wavelengths.size
+    derived = ''
+    if package.derivative is not None:
+        derived = _check_derivative(path, package, blob, rows)
     worst = 0.0
     for k, cid in enumerate(package.classes):
         if int(cid) not in rows or rows[int(cid)][0].shape != (n_bands,):
@@ -525,14 +729,106 @@ def _check_reference(path: Path, package: HsiPackage, blob: bytes | None) -> str
                     f"{path.name}: class {cid} of the training reference is not SNV over {n_bands} bands with "
                     f"the population SD (sum of mean {mean.sum():.3g}, sum of squares {total:.2f}): the "
                     "package's preprocessing is not the one this reader implements")
-        scaled = (mean[package.selected] - package.scaler_mean) / package.scaler_scale
-        worst = max(worst, float(np.abs(scaled - package.means[k]).max()))
+        if package.means is not None:
+            scaled = (mean[package.selected] - package.scaler_mean) / package.scaler_scale
+            worst = max(worst, float(np.abs(scaled - package.means[k]).max()))
     if worst > _MEAN_TOLERANCE:
         raise ValueError(
             f"{path.name}: the model's class means differ from the package's training reference by {worst:.3g} "
             "after this reader's band selection and scaler: the package's chain is not the one implemented here")
-    return (f"training reference ok: class means reproduced to {worst:.1e}"
-            + (", SNV = population SD over all bands" if package.snv else ""))
+    scaler = _check_scaler(path, package, rows, counts)
+    text = "training reference ok: " + (f"class means reproduced to {worst:.1e}, " if package.means is not None else "")
+    return (text + scaler + (", SNV = population SD over all bands" if package.snv else "") + derived)
+
+
+def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str:
+    """The scaler's mean and variance, and an SVM's gamma, from the reference's per-class count,
+    mean and SD (sample SD) of the preprocessed training spectra.
+
+    The reference covers the rows the final model was fitted on: the pooled mean and variance of
+    those rows (on the selected bands) are what the StandardScaler stored. A gamma of 'scale' is
+    ``1 / (features x variance of all scaled training values)`` (sklearn), which follows from them.
+    """
+    unverified = "scaler NOT verified" + (" (nor the SVM)" if package.svm is not None else "")
+    if package.scaler_var is None or package.scaler_samples is None:
+        return f"{unverified}: the scaler stores no variance / sample count"
+    try:
+        n = np.array([float(counts[int(cid)]) for cid in package.classes])
+    except (KeyError, TypeError, ValueError):
+        return f"{unverified}: the reference has no spectrum count per class"
+    if not np.all(np.isfinite(n)) or np.any(n < 2) or abs(n.sum() - package.scaler_samples) > 0.5:
+        return (f"{unverified}: the reference counts {n.sum():g} spectra, the scaler was fitted on "
+                f"{package.scaler_samples:g}")
+    means = np.array([rows[int(cid)][0][package.selected] for cid in package.classes])
+    sds = np.array([rows[int(cid)][1][package.selected] for cid in package.classes])
+    if sds.shape != means.shape or not np.isfinite(sds).all():
+        return f"{unverified}: the reference has no SD per band"
+    total = n.sum()
+    pooled = (n[:, None] * means).sum(axis=0) / total
+    variance = ((n[:, None] - 1.0) * sds ** 2 + n[:, None] * (means - pooled) ** 2).sum(axis=0) / total
+    mean_error = float(np.abs(pooled - package.scaler_mean).max() / max(np.abs(package.scaler_mean).max(),
+                                                                      package.scaler_scale.min(), 1e-300))
+    var_error = float(np.abs(variance / np.maximum(package.scaler_var, 1e-300) - 1.0).max())
+    if not (mean_error <= _SCALER_TOLERANCE and var_error <= _SCALER_TOLERANCE):
+        raise ValueError(
+            f"{path.name}: the scaler's mean / variance differ from those of the package's training reference by "
+            f"{mean_error:.3g} / {var_error:.3g} (relative): the package's chain is not the one implemented here")
+    text = f"scaler mean / variance reproduced to {max(mean_error, var_error):.1e}"
+    svm = package.svm
+    if svm is None:
+        return text
+    n_features = package.selected.size
+    if svm.gamma_setting == 'scale':
+        shift = (pooled - package.scaler_mean) / package.scaler_scale
+        second = variance / package.scaler_scale ** 2 + shift ** 2
+        expected = 1.0 / (n_features * (second.mean() - shift.mean() ** 2))
+    elif svm.gamma_setting == 'auto':
+        expected = 1.0 / n_features
+    else:
+        try:
+            expected = float(svm.gamma_setting)
+        except (TypeError, ValueError):
+            return text + f", SVM gamma {svm.gamma:g} NOT verified (setting {svm.gamma_setting!r})"
+    error = abs(svm.gamma / expected - 1.0)
+    if not error <= _GAMMA_TOLERANCE:
+        raise ValueError(f"{path.name}: the SVM's gamma {svm.gamma:.10g} is not the {svm.gamma_setting!r} gamma "
+                         f"{expected:.10g} of the package's training reference: its features are not the ones "
+                         "implemented here")
+    return text + f", SVM gamma {svm.gamma_setting!r} = {svm.gamma:.6g} reproduced to {error:.1e}"
+
+
+def _check_derivative(path: Path, package: HsiPackage, blob: bytes, preprocessed: dict) -> str:
+    """The first derivative of the raw training class means must be the preprocessed class means.
+
+    The derivative is linear, so the mean of the derived spectra is the derivative of their mean:
+    this checks the Savitzky-Golay window, order, spacing and end handling against the package.
+    """
+    try:
+        domain = json.loads(blob.decode('utf-8'))['domains'][_RAW_DOMAIN]
+        raw = {int(c['class_id']): np.asarray(c['mean'], dtype=np.float64) for c in domain['classes']}
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        logger.warning("%s: training_spectral_reference.json has no %s spectra (%s): the first derivative is "
+                       "not verified", path.name, _RAW_DOMAIN, type(exc).__name__)
+        return f"; first derivative NOT verified (no {_RAW_DOMAIN} spectra)"
+    n_bands = package.wavelengths.size
+    worst = 0.0
+    for cid in package.classes:
+        mean = raw.get(int(cid))
+        if mean is None or mean.shape != (n_bands,) or not np.isfinite(mean).all():
+            raise ValueError(f"{path.name}: the training reference has no raw {n_bands}-band spectrum of class {cid}")
+        if int(cid) not in preprocessed or preprocessed[int(cid)][0].shape != (n_bands,):
+            raise ValueError(f"{path.name}: the training reference has no {n_bands}-band spectrum of class {cid}")
+        target = preprocessed[int(cid)][0]
+        size = float(np.abs(target).max())
+        error = float(np.abs(package.derivative @ mean - target).max())
+        if not error <= _DERIVATIVE_TOLERANCE * max(size, 1e-300):
+            p = package.derivative_parameters
+            raise ValueError(
+                f"{path.name}: the Savitzky-Golay first derivative (window {p['window']}, order {p['polyorder']}, "
+                f"delta {p['delta']:g} nm) of the raw training means differs from the preprocessed ones by "
+                f"{error:.3g} (largest value {size:.3g}): the package's derivative is not the one implemented here")
+        worst = max(worst, error / max(size, 1e-300))
+    return f", 1st derivative of the raw means reproduced to {worst:.1e} (relative)"
 
 
 _TRAINING_DOMAINS = {'input': 'raw_wavelength_analysis', 'preprocessed': _REFERENCE_DOMAIN}

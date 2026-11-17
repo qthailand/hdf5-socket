@@ -663,7 +663,83 @@ class PushbroomScannerMainWindow(QMainWindow):
             if available and name != 'binning' and name not in self._step_connected:
                 box.toggled.connect(lambda checked, n=name: self._on_step_toggled(n, checked))
                 self._step_connected.add(name)
+        self._show_flatfield_state()
         self._update_units_warning()
+
+    def _reflectance_flatfield_state(self) -> tuple[str, str, str] | None:
+        """How the flat-field relates to the reflectance factors in use.
+
+        ``None`` while Reflectance is off. Else ``(state, profile in the factors, loaded profile)``
+        with state ``'in'`` (the factors contain it: it is active though its own step is off),
+        ``'mismatch'`` (they contain another profile than the one loaded) or ``'absent'``.
+        """
+        pipeline = self._pipeline
+        if not pipeline.effective_steps().get('reflectance'):
+            return None
+        plan = pipeline.plans[0]
+        inside = getattr(plan, 'reflectance_flatfield', None)
+        if not inside:
+            return 'absent', '', ''
+
+        def short(label: str) -> str:
+            return Path(label).parent.name or str(label)
+
+        loaded = getattr(plan, 'flatfield_profile', None)
+        if loaded is not None and str(loaded.label) != str(inside):
+            return 'mismatch', short(inside), short(loaded.label)
+        return 'in', short(inside), ''
+
+    def _input_text(self) -> str:
+        """What the model receives now, for the heading: counts or reflectance, with or without flat-field."""
+        steps = self._pipeline.effective_steps()
+        state = self._reflectance_flatfield_state()
+        if state is None:
+            return 'Counts + flat-field' if steps.get('flatfield') else 'Counts'
+        return 'Reflectance + flat-field' if state[0] in ('in', 'mismatch') else 'Reflectance'
+
+    def _show_flatfield_state(self) -> None:
+        """Make the Flat-field box show what happens to the data, not only its own switch.
+
+        Factors of a "Flat-field + reference" calibration contain the flat-field, so its step is
+        off while Reflectance is on (it must not divide twice) - but it is active: the box is then
+        shown checked and locked. Factors without it: unchecked and locked, with the way out.
+        """
+        labels = dict(self._STEP_LABELS)
+        plans = self._pipeline.plans
+        box, reflectance_box = self._step_boxes['flatfield'], self._step_boxes['reflectance']
+        infos = [plan.steps.get('flatfield', {'available': False, 'why': ''}) for plan in plans]
+        reflectance_tip = plans[0].steps.get('reflectance', {}).get('why', '')
+        state = self._reflectance_flatfield_state()
+        box.blockSignals(True)
+        box.setAttribute(Qt.WA_TransparentForMouseEvents, state is not None and state[0] != 'absent')
+        box.setFocusPolicy(Qt.NoFocus if state is not None else Qt.StrongFocus)
+        reflectance_box.setText(labels['reflectance'])
+        if state is None:                                  # Reflectance off: the step is its own switch
+            box.setText(labels['flatfield'])
+            box.setEnabled(any(info['available'] for info in infos))
+            box.setChecked(bool(self._pipeline.effective_steps().get('flatfield')))
+            box.setToolTip(infos[0]['why'])
+        elif state[0] == 'absent':
+            box.setText(labels['flatfield'])
+            box.setEnabled(False)
+            box.setChecked(False)
+            box.setToolTip("Not in this reflectance calibration (per-band or row-wise factors).\n"
+                           "To use it with Reflectance: calibrate again with 'Flat-field + reference'.\n"
+                           "To use the Flat-field step alone: untick Reflectance first.")
+            reflectance_tip += "\nNo flat-field in this calibration"
+        else:
+            box.setText(f"{labels['flatfield']} 🔒 in reference")
+            box.setEnabled(True)
+            box.setChecked(True)
+            box.setToolTip(f"Active inside the reflectance factors: {state[1]}.\n"
+                           "It is not applied a second time; untick Reflectance to switch both off.")
+            reflectance_tip += f"\nIncludes flat-field: {state[1]}"
+            if state[0] == 'mismatch':
+                reflectance_box.setText(f"{labels['reflectance']} ⚠")
+                reflectance_tip += (f"\n⚠ The loaded flat-field profile is {state[2]}: the factors were made with "
+                                    "another one - calibrate again")
+        box.blockSignals(False)
+        reflectance_box.setToolTip(reflectance_tip)
 
     def _on_step_toggled(self, name: str, checked: bool) -> None:
         if checked and name == 'flatfield':
@@ -678,6 +754,7 @@ class PushbroomScannerMainWindow(QMainWindow):
             box.blockSignals(True)
             box.setChecked(self._pipeline.effective_steps().get(step, False))
             box.blockSignals(False)
+        self._show_flatfield_state()
         self.performance_panel.reset_requested.emit()     # stage averages restart for the new chain
         self._update_units_warning()
 
@@ -924,7 +1001,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         source_text = 'LIVE CAMERA' if s.source_kind == 'camera' else 'PLAYBACK'
         self._run_label.setText(f"{run_text} · {source_text}")
         model_name = Path(str(getattr(self._pipeline.classifier, 'path', 'model'))).name
-        context = f"{name}  ·  Model: {model_name}"
+        context = f"{name}  ·  Model: {model_name}  ·  Input: {self._input_text()}"
         if s.error:
             context = f"{s.error}  ·  {context}"
         self._context_label.setText(context)
@@ -1098,8 +1175,15 @@ class PushbroomScannerMainWindow(QMainWindow):
         if not training.get('input'):
             self.spectrum_panel.set_training(None)
             return
-        self.spectrum_panel.set_training(package.wavelengths, bands(training['input']),
-                                         bands(training.get('preprocessed', ())) if package.snv else ())
+        preprocessed = bands(training.get('preprocessed', ()))
+        derivative = getattr(package, 'derivative', None)
+        selected = getattr(package, 'selected', None)
+        self.spectrum_panel.set_training(
+            package.wavelengths, bands(training['input']),
+            snv_bands=preprocessed if package.snv else (),
+            derivative_bands=preprocessed if derivative is not None and not package.snv else (),
+            derivative=derivative,
+            selected=None if selected is None else package.wavelengths[np.asarray(selected, int)])
 
     def _probe_spectrum(self, pos) -> None:
         """Add the spectrum of the belt-map pixel under ``pos`` (label pixels) to the preview."""
@@ -1109,6 +1193,9 @@ class PushbroomScannerMainWindow(QMainWindow):
         w, h = max(1, self._canvas_label.width()), max(1, self._canvas_label.height())
         slit = self._pipeline.sources[0].frame_shape[0]
         row = int(np.clip(pos.y() / h * slit, 0, slit - 1))
+        # the map keeps every step[0]-th slit row: take the row it shows, so the spectrum and the
+        # class read from the map belong to the same pixel
+        row -= row % max(1, int(self._belt['step'][0]))
         lines, drawn = self._belt_columns()
         column = int(np.clip(pos.x() / w * drawn, 0, drawn - 1)) - (drawn - len(lines))
         if column < 0:
@@ -1323,8 +1410,12 @@ class PushbroomScannerMainWindow(QMainWindow):
         plan, src = self._pipeline.plans[0], self._pipeline.sources[0]
         path = reflectance_save_path(self.config, plan, src)    # camera profile: refl_b<bin>_g<gain>.npy
         name = path.stem
-        label = f"{path.name} ({'row-wise' if factors.ndim == 2 else 'per band'} {factors.shape}, drawn in dialog, " \
-                f"{info['reference']})"
+        from sim_config import reflectance_flatfield
+        inside = reflectance_flatfield(info)               # the flat-field profile these factors contain
+        kind = 'flat-field + reference' if inside else 'row-wise' if factors.ndim == 2 else 'per band'
+        label = f"{path.name} ({kind} {factors.shape}, drawn in dialog, {info['reference']})"
+        if inside:
+            label += f", includes flat-field {Path(inside).parent.name or inside}"
         moved = []
         try:
             moved = backup_profile(path)
@@ -1340,7 +1431,7 @@ class PushbroomScannerMainWindow(QMainWindow):
             QMessageBox.critical(self, "Reflectance", f"Not saved, nothing changed:\n{exc}")
             return False
         try:
-            self._pipeline.set_reflectance_factors(factors, label)
+            self._pipeline.set_reflectance_factors(factors, label, flatfield=inside)
         except Exception as exc:
             logger.exception("Reflectance calibration saved but not applied")
             QMessageBox.critical(self, "Reflectance", f"Saved to {path.name} but not applied:\n{exc}")

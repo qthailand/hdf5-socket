@@ -392,6 +392,9 @@ class AcquisitionPlan:
     smile_model: object = None
     reflectance_factors: np.ndarray | None = None   # (slit, bands) or (bands,) float32, also when offered off
     reflectance_placeholder: bool = False           # factors marked placeholder in reflectance/<name>.json
+    # Flat-field profile (its label) the reflectance factors already contain ("Flat-field +
+    # reference" calibration): the Flat-field step must not run again, but it is active.
+    reflectance_flatfield: str | None = None
     flatfield_profile: object = None               # portable HSI profile; immutable per-frame snapshot
     exposure_ms: float | None = None             # of the frames: a white of another exposure is scaled to it
     gain: float | None = None
@@ -831,6 +834,9 @@ def _reflectance_step(config, plan, source) -> None:
     for note in _reflectance_warnings(plan, info):
         label += f", WARNING {note}"
         logger.warning("Reflectance %s: %s", path.name, note)
+    plan.reflectance_flatfield = reflectance_flatfield(info)
+    if plan.reflectance_flatfield:
+        label += f", includes flat-field {Path(plan.reflectance_flatfield).parent.name or plan.reflectance_flatfield}"
     plan.reflectance_placeholder = bool(info.get('placeholder'))
     if plan.reflectance_placeholder:
         label = (f"PLACEHOLDER {label} - stand-in from {info.get('white', '?')}, not a real white reference; "
@@ -839,6 +845,17 @@ def _reflectance_step(config, plan, source) -> None:
     plan.steps['reflectance'] = {'available': True, 'on': wanted,
                                  'why': label if wanted else f"none (available: {label})"}
     plan.provenance['reflectance'] = (label if wanted else f"none (available: {label})", choice)
+
+
+def reflectance_flatfield(info: dict) -> str | None:
+    """Label of the flat-field profile inside factors with this ``<name>.json`` record, else ``None``.
+
+    Only a "Flat-field + reference" calibration (``kind: flatfield``) contains one; per-band and
+    row-wise factors, and records from before this was written, contain none.
+    """
+    if info.get('kind') != 'flatfield':
+        return None
+    return str(info.get('flatfield_profile') or 'unknown profile')
 
 
 def _check_binding(plan, path) -> None:

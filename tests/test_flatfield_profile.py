@@ -209,14 +209,20 @@ def test_gui_has_only_checkbox_and_switches_off_rowwise_reflectance(tmp_path, mo
     try:
         window._gui_timer.stop()
         box = window._step_boxes['flatfield']
-        assert box.isEnabled() and not box.isChecked()
+        reflectance = window._step_boxes['reflectance']
+        # Reflectance is on with factors that contain no flat-field: the box is locked and says why.
+        assert not box.isEnabled() and not box.isChecked() and 'untick Reflectance first' in box.toolTip()
         assert not any(b.text() == 'Flat-field…' for b in window.findChildren(QPushButton))
+        reflectance.click()                                  # off: Flat-field is its own switch again
+        assert box.isEnabled() and not box.isChecked()
         box.click()
         assert box.isChecked() and pipeline.effective_steps()['flatfield']
-        assert not window._step_boxes['reflectance'].isChecked()
-        window._step_boxes['reflectance'].click()
+        assert not reflectance.isChecked()
+        reflectance.click()                                  # on again: never both
         assert not box.isChecked() and not pipeline.effective_steps()['flatfield']
+        reflectance.click()
         box.click()
+        assert box.isChecked()
         window._step_boxes['dark'].click()
         assert not box.isChecked() and not pipeline.effective_steps()['flatfield']
     finally:
