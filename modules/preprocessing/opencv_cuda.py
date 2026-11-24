@@ -8,7 +8,9 @@ Hot-pixel repair is a masked 3x3 neighbour sum divided by the cached valid
 neighbour count.  Smile gathers each interpolation tap with an integer
 nearest-neighbour remap and weights it with OpenCV's own 1/32 tables (the
 tables the CPU and CuPy use), because ``cv2.cuda.remap`` interpolates with
-float coordinates and its own cubic kernel.  Binning gathers the j-th column
+float coordinates and its own cubic kernel.  A horizontal Smile uses one tap
+row; a smile + keystone model (fractional rows) uses the 2-D tables, 4 x 4
+taps for cubic, 2 x 2 for linear.  Binning gathers the j-th column
 of every bin with one nearest-neighbour remap per column offset and sums them
 (no cuBLAS GEMM, whose handle OpenCV creates on every call), then rounds in
 float64.  All sums of uint16 values stay below 2**24, so float32 holds them
@@ -16,7 +18,7 @@ exactly.
 """
 import cv2
 import numpy as np
-from .maps import prepare_maps, horizontal_table
+from .maps import prepare_maps, horizontal_table, remap_table, moves_rows
 from .timing import HostClockTimer, stage_timer
 
 # float32 sums of up to this many uint16 pixels are exact (256 * 65535 < 2**24).
@@ -77,17 +79,14 @@ class OpenCVCUDABackend:
             hot: Object with ``_hot_coords`` and ``_neighbor_count``.
             enabled: Whether dark/hot correction is applied.
             inverted: Flip the slit axis.
-            calibration: Smile calibration or ``None``; horizontal (spectral
-                axis) linear/cubic only.
+            calibration: Smile calibration or ``None``; linear/cubic,
+                horizontal Smile or smile + keystone (fractional rows).
             snapshot: Also return the pre-Smile image.
             profiler: Object with ``time(name)`` context manager.
 
         Returns:
             tuple: ``(output, grabbed)`` host arrays owned by the caller
             (``grabbed`` is ``None`` unless ``snapshot``).
-
-        Raises:
-            ValueError: the Smile map has vertical (row) interpolation.
         """
         with profiler.time('gpu_preprocess'):
             timer = self._timer(profiler, snapshot)
@@ -190,35 +189,72 @@ class OpenCVCUDABackend:
         return cold.convertTo(cv2.CV_16U, stream, self._buffer('hot_out', h, w, cv2.CV_16UC1))
 
     def _smile(self, corrected, calibration, inverted, shape):
-        """Horizontal Smile remap (with the slit flip folded into the row map)."""
+        """Smile or smile + keystone remap (with the slit flip folded into the row map)."""
         h, w = shape
         key = (id(calibration), inverted, shape)
         if key != self._map_ref:
             _, _, xy, frac, _ = prepare_maps(calibration, inverted)
-            if frac is None or np.any(frac >> 5):
-                raise ValueError('OpenCV CUDA horizontal Smile requires integer row coordinates')
-            table = horizontal_table(calibration.interp)
-            taps = table.shape[1]
+            if frac is None:
+                raise ValueError('OpenCV CUDA Smile requires interpolation fractions (linear or cubic)')
             x = xy[..., 0].astype(np.float32)
-            fraction = frac & 31
-            self._row_map = _upload(xy[..., 1].astype(np.float32))
-            self._tap_maps = [(_upload(x + (k - (1 if taps == 4 else 0))), _upload(table[fraction, k]))
-                              for k in range(taps)]
+            y = xy[..., 1].astype(np.float32)
+            if moves_rows(frac):           # smile + keystone: 2-D taps, weight row fy * 32 + fx
+                table = remap_table(calibration.interp)
+                taps = vtaps = int(round(table.shape[1] ** 0.5))
+                fraction = frac & 1023
+            else:                          # horizontal Smile: one tap row
+                table = horizontal_table(calibration.interp)
+                taps, vtaps = table.shape[1], 1
+                fraction = frac & 31
+            dx = 1 if taps == 4 else 0
+            dy = 1 if vtaps == 4 else 0
+            self._column_maps = [_upload(x + (k - dx)) for k in range(taps)]
+            self._row_maps = [_upload(y + (r - dy)) for r in range(vtaps)]
+            self._tap_weights = [[_upload(table[fraction, r * taps + k]) for k in range(taps)]
+                                 for r in range(vtaps)]
+            self._border_masks = None
+            if taps == 4 and vtaps == 4:
+                # OpenCV's bicubic chains all 16 taps where any of them is outside the frame.
+                x0, y0 = xy[..., 0].astype(np.int64) - 1, xy[..., 1].astype(np.int64) - 1
+                border = ((x0 < 0) | (x0 + 4 > w) | (y0 < 0) | (y0 + 4 > h)).astype(np.float32)
+                self._border_masks = (_upload(1 - border), _upload(border))
             self._map_ref = key
             self._calibration_ref = calibration
         stream = self._stream
         source = corrected.convertTo(cv2.CV_32F, stream, self._buffer('smile_source', h, w, cv2.CV_32FC1))
         value = self._buffer('smile_value', h, w, cv2.CV_32FC1)
         sample = self._buffer('smile_sample', h, w, cv2.CV_32FC1)
-        # Same order of float32 operations as the CuPy kernel: ((v0*w0) + v1*w1) + ...
-        for k, (column_map, weight) in enumerate(self._tap_maps):
-            cv2.cuda.remap(source, column_map, self._row_map, cv2.INTER_NEAREST, dst=sample,
-                           borderMode=cv2.BORDER_CONSTANT, borderValue=0, stream=stream)
-            if k == 0:
-                cv2.cuda.multiply(sample, weight, dst=value, stream=stream)
-            else:
-                cv2.cuda.multiply(sample, weight, dst=sample, stream=stream)
-                cv2.cuda.add(value, sample, dst=value, stream=stream)
+        # Same order of float32 operations as the CuPy kernel (and OpenCV): bicubic sums
+        # each tap row ((v0*w0) + v1*w1) + ... first, then value = row0 + row1 + ...;
+        # bilinear (and a single tap row) sums every tap into value in one chain.  A 4 x 4
+        # remap also keeps the one-chain sum, used where a tap is outside the frame.
+        cubic = len(self._column_maps) == 4
+        chain = self._buffer('smile_chain', h, w, cv2.CV_32FC1) if self._border_masks else None
+        for r, (row_map, weights) in enumerate(zip(self._row_maps, self._tap_weights)):
+            fresh = r == 0 or cubic
+            line = value if r == 0 or not cubic else self._buffer('smile_line', h, w, cv2.CV_32FC1)
+            for k, (column_map, weight) in enumerate(zip(self._column_maps, weights)):
+                cv2.cuda.remap(source, column_map, row_map, cv2.INTER_NEAREST, dst=sample,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0, stream=stream)
+                if k == 0 and fresh:
+                    cv2.cuda.multiply(sample, weight, dst=line, stream=stream)
+                    if chain is not None:
+                        if r == 0:
+                            cv2.cuda.multiply(sample, weight, dst=chain, stream=stream)
+                        else:
+                            cv2.cuda.add(chain, line, dst=chain, stream=stream)
+                else:
+                    cv2.cuda.multiply(sample, weight, dst=sample, stream=stream)
+                    cv2.cuda.add(line, sample, dst=line, stream=stream)
+                    if chain is not None:
+                        cv2.cuda.add(chain, sample, dst=chain, stream=stream)
+            if line is not value:
+                cv2.cuda.add(value, line, dst=value, stream=stream)
+        if chain is not None:              # value * interior + chain * border (exact: masks are 0/1)
+            interior, border = self._border_masks
+            cv2.cuda.multiply(value, interior, dst=value, stream=stream)
+            cv2.cuda.multiply(chain, border, dst=chain, stream=stream)
+            cv2.cuda.add(value, chain, dst=value, stream=stream)
         return value.convertTo(cv2.CV_16U, stream, self._buffer('smile_out', h, w, cv2.CV_16UC1))
 
     def _bin(self, image, binner, shape):

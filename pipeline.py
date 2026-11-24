@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from modules.preprocessing import PreprocessingRuntime
-from sim_config import STEP_NAMES, apply_reflectance
+from sim_config import STEP_NAMES, apply_reflectance, geometry_model
 
 #: A raw pixel at or above this fraction of the camera's full scale counts as clipped. Below
 #: 1.0 on purpose: a camera that averages its hardware bin (POA) reports less than full scale
@@ -67,12 +67,37 @@ def _effective(plan, overrides: dict) -> dict:
         if name == 'binning' or wanted is None:
             wanted = info['on']
         result[name] = bool(wanted) and (info['available'] or name == 'binning' and info['on'])
+    if 'keystone' in result and not result.get('smile'):
+        result['keystone'] = False                       # part of the Smile model: no remap, no keystone
+    required = getattr(plan, 'reflectance_requires', None)
+    if result.get('reflectance') and required:
+        # factors of an hsi reference hold only for the steps it was made with (hsi ReferenceKey)
+        result['reflectance'] = all(bool(result.get(name, False)) == bool(value)
+                                    for name, value in required.items())
     flat = getattr(plan, 'flatfield_profile', None)
     if result.get('flatfield') and flat is not None:
         result['flatfield'] = (result['dark'] == flat.dark and result['flip'] == flat.flip
                                and result['smile'] == flat.smile
+                               and result.get('keystone', False) == getattr(flat, 'keystone', False)
                                and not result['reflectance'])
     return result
+
+
+def bin_2x2(lines: list) -> np.ndarray:
+    """Mean of 2 x 2 pixels: of the (one or two) ``(slit, bands)`` lines, then of each pair of
+    neighbouring slit rows; float32 ``(ceil(slit / 2), bands)``. A missing line or an odd last
+    row is a partial block, averaged over what there is (HSI-SCAN ``partial-block-mean``)."""
+    x = np.asarray(lines[0], np.float32)
+    if len(lines) > 1:
+        x = x + np.asarray(lines[1], np.float32)
+        x *= np.float32(0.5)
+    even = x.shape[0] // 2 * 2
+    out = np.empty(((x.shape[0] + 1) // 2,) + x.shape[1:], np.float32)
+    np.add(x[0:even:2], x[1:even:2], out=out[:even // 2])
+    out[:even // 2] *= np.float32(0.5)
+    if x.shape[0] % 2:
+        out[-1] = x[-1]
+    return out
 
 
 class HighResTimer:
@@ -157,6 +182,8 @@ class _Job:
     t_queued: float     # perf_counter time the line entered the buffers (queue wait starts here)
     model: tuple = None  # (generation, classifier, columns per plan) this line is classified with
     spectrum_generation: int = 0  # processing/calibration version used by this worker
+    spatial_bin: int = 1  # 2: the model sees the 2x2 mean (this line + partner, slit row pairs)
+    partner: '_Job | None' = None  # the next line, binned with this one (spatial_bin 2); None: alone
 
 
 @dataclass
@@ -328,7 +355,12 @@ class Pipeline:
         self._fps_generation = 0                 # bumped by set_fps; the camera re-reads the rate
         self._n_workers = int(config.processing.workers)
         shape = sources[0].frame_shape
-        self._slit = shape[0]
+        # slit rows per model input: the frame minus the keystone margin of the plans' Smile model
+        slits = {int(getattr(plan, 'n_slit', shape[0])) for plan in plans}
+        if len(slits) != 1:
+            raise ValueError(f"the files' Smile models crop different slit rows {sorted(slits)}: one model "
+                             "geometry per run")
+        self._slit = slits.pop()
 
         self._n_buffers = int(cam.buffer_frames)
         # live.reader = "process": the buffers are shared memory the camera process writes into,
@@ -394,6 +426,12 @@ class Pipeline:
         self._spec_ring: np.ndarray | None = None
         self._spec_ids: np.ndarray | None = None
         self._spectrum_generation = 0
+        # Spatial bin of the model input (processing.spatial_bin, set_spatial_bin): 2 pairs
+        # consecutive lines at dispatch (the camera thread holds one line until the next comes).
+        self._spatial_bin = int(config.processing.spatial_bin)
+        self._waiting: _Job | None = None
+        self._line_period = 0.0                  # s between handed-over lines (mean), for the idle flush
+        self._last_queued = 0.0
         self._canvas_col = 0
         self._canvas_filled = 0
         self._canvas_line = 0
@@ -593,8 +631,8 @@ class Pipeline:
             steps.update(switches)
             if switches.get('flatfield') is True:
                 steps['reflectance'] = False
-            elif switches.get('reflectance') is True:
-                steps['flatfield'] = False
+            elif switches.get('reflectance') is True and any(_effective(p, steps)['reflectance'] for p in self.plans):
+                steps['flatfield'] = False           # Reflectance replaces it (not when its steps keep it off)
             changed = steps != self._steps
             self._steps = steps
             if changed:
@@ -604,6 +642,37 @@ class Pipeline:
     def effective_steps(self, plan_index: int = 0) -> dict:
         """``{step: bool}`` that the workers currently apply for ``plans[plan_index]``."""
         return _effective(self.plans[plan_index], self._steps)
+
+    @property
+    def slit_rows(self) -> int:
+        """Slit rows per line the model receives and the map shows (keystone margin cropped)."""
+        return self._slit
+
+    @property
+    def spatial_bin(self) -> int:
+        """1: the model classifies every pixel; 2: the mean of 2 x 2 pixels (see :meth:`set_spatial_bin`)."""
+        return self._spatial_bin
+
+    def set_spatial_bin(self, n: int) -> None:
+        """Model input of 1 x 1 or 2 x 2 pixels, while running (``processing.spatial_bin``).
+
+        With 2, after the last processing step (reflectance) each pair of consecutive lines is
+        averaged and then each pair of neighbouring slit rows - the mean of 2 x 2 pixels, as the
+        offline reflectance export with ``spatial_bin 2`` that training data may come from. An
+        odd last slit row, and a line whose neighbour was lost or belongs to another file or
+        model, are averaged over what there is (partial block). The class and the spectrum of
+        the block are given to its 4 pixels, so the belt map, the counts and the spectrum
+        preview keep their size; the reflectance calibration still gets every line unbinned.
+        Applies from the next line the camera hands over.
+        """
+        n = int(n)
+        if n not in (1, 2):
+            raise ValueError(f"spatial bin must be 1 or 2, got {n}")
+        with self._lock:
+            if n != self._spatial_bin:
+                self._spatial_bin = n
+                self._invalidate_spectra_locked()           # the model input changes
+        logger.info("Model input: %s", "2 x 2 pixel mean" if n == 2 else "every pixel")
 
     def start_calibration_capture(self, max_lines: int = 256) -> None:
         """Keep the newest ``max_lines`` binned lines *before* the reflectance step.
@@ -725,17 +794,20 @@ class Pipeline:
             return ids[order].copy(), self._spec_ring[order]       # fancy index: a copy
 
     def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0,
-                                flatfield: str | None = None) -> None:
+                                flatfield: str | None = None, requires: dict | None = None) -> None:
         """Use new reflectance factors from the next line on and switch the step on.
 
         ``flatfield``: label of the flat-field profile the factors already contain (a
-        "Flat-field + reference" calibration), ``None`` when they contain none.
+        "Flat-field + reference" calibration), ``None`` when they contain none. ``requires``:
+        the Dark / Flip / Smile / Keystone switches they were made with (Reflectance is off in
+        another setting, as for an hsi reference), ``None`` for no condition.
         """
         plan = self.plans[plan_index]
         factors = np.asarray(factors, np.float32)
         if factors.shape[-1] != plan.n_columns or (factors.ndim == 2 and factors.shape[0] != self._slit):
             raise ValueError(f"factors {factors.shape} do not fit ({self._slit}, {plan.n_columns})")
         plan.reflectance_factors = factors          # one reference swap: a worker sees old or new
+        plan.reflectance_requires = dict(requires or {})
         plan.reflectance_placeholder = False
         plan.reflectance_flatfield = flatfield
         plan.steps['reflectance'] = {'available': True, 'on': True, 'why': label}
@@ -892,7 +964,7 @@ class Pipeline:
                             if slot is None:
                                 return
                         np.copyto(self._buffers[slot], frames[i])
-                        self._work.put(_Job(seq, line, slot, t_sensor, src_i, i, cycle, t_sensor, self._model))
+                        self._dispatch(_Job(seq, line, slot, t_sensor, src_i, i, cycle, t_sensor, self._model))
                         seq += 1
                         line += 1
                         self._delivered = seq
@@ -910,6 +982,7 @@ class Pipeline:
         finally:
             self._camera_done = True
             self._camera_fps = 0.0
+            self._flush_held(force=True)
             for _ in range(self._n_workers):
                 self._work.put(None)
 
@@ -978,6 +1051,7 @@ class Pipeline:
                 if frame is None:
                     if slot is not None:
                         self._free.put(slot)
+                    self._flush_held()                   # no next line yet: do not keep one waiting
                     if not self._stop.is_set():
                         self._grab_timeouts += 1
                     update_rates(t_arrival)
@@ -1006,7 +1080,7 @@ class Pipeline:
                 else:
                     if frame is not target:
                         np.copyto(target, frame)
-                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival, self._model))
+                    self._dispatch(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival, self._model))
                     seq += 1
                     line += 1
                     self._delivered = seq
@@ -1020,6 +1094,7 @@ class Pipeline:
             self._close_camera()                         # stops the stream first
             logger.info("Camera closed after %d frames (%d lost in the camera, %d read timeouts)",
                         seq, self._lost_camera, self._grab_timeouts)
+            self._flush_held(force=True)
             for _ in range(self._n_workers):
                 self._work.put(None)
 
@@ -1062,9 +1137,11 @@ class Pipeline:
                 now = time.perf_counter()
                 if job is not None:
                     seq, line, slot, t_sensor, t_arrival = job
-                    self._work.put(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival, self._model))
+                    self._dispatch(_Job(seq, line, slot, t_sensor, 0, line, 0, t_arrival, self._model))
                     self._delivered = seq + 1
                     rate_n += 1
+                if job is None:
+                    self._flush_held()                   # idle: do not keep a line waiting
                 if job is None or now >= next_check:
                     next_check = now + 0.1
                     camera.check()                       # raises the camera process's error
@@ -1078,8 +1155,50 @@ class Pipeline:
             self._camera_fps = 0.0
             logger.info("Camera process ended after %d frames (%d lost in the camera, %d read timeouts)",
                         received, self._lost_camera, self._grab_timeouts)
+            self._flush_held(force=True)
             for _ in range(self._n_workers):
                 self._work.put(None)
+
+    def _dispatch(self, job: _Job) -> None:
+        """Hand a line to the workers (camera thread only). With a spatial bin of 2 a line waits
+        for the next one and both go as one job; a line that cannot be paired goes alone."""
+        if self._last_queued:
+            gap = job.t_queued - self._last_queued
+            self._line_period = gap if not self._line_period else 0.9 * self._line_period + 0.1 * gap
+        self._last_queued = job.t_queued
+        held, self._waiting = self._waiting, None
+        if self._spatial_bin != 2:
+            if held is not None:
+                self._work.put(held)
+            self._work.put(job)
+            return
+        job.spatial_bin = 2
+        if held is None:
+            self._waiting = job
+        elif (job.line == held.line + 1 and job.seq == held.seq + 1 and job.source == held.source
+              and job.cycle == held.cycle and job.model is held.model):
+            held.partner = job
+            self._work.put(held)
+        else:
+            self._work.put(held)                         # a lost line, another file or model between
+            self._waiting = job
+
+    #: an idle camera: a waiting line goes alone after this many line periods (at least
+    #: FLUSH_MIN_S, at most FLUSH_MAX_S), so a slow camera still pairs its lines
+    FLUSH_PERIODS, FLUSH_MIN_S, FLUSH_MAX_S = 2.5, 0.05, 2.0
+
+    def _flush_held(self, force: bool = False) -> None:
+        """Send a line still waiting for its partner: always when ``force`` (the stream ends), else
+        only once it has waited clearly longer than a line period (the camera paused)."""
+        held = self._waiting
+        if held is None:
+            return
+        if not force:
+            limit = min(self.FLUSH_MAX_S, max(self.FLUSH_MIN_S, self.FLUSH_PERIODS * self._line_period))
+            if time.perf_counter() - held.t_queued < limit:
+                return
+        self._waiting = None
+        self._work.put(held)
 
     def _wait_slot(self):
         while not self._stop.is_set():
@@ -1112,51 +1231,84 @@ class Pipeline:
                     logger.info("worker-%d now on %s (requested %s)", k, runtime.backend_name,
                                 self._requested_backend)
                 plan = self.plans[job.source]
-                frame = self._buffers[job.slot]
-                # time the line waited in the buffers before a worker took it (for a live camera
-                # with timestamps the latency also has exposure and transfer; the queue wait not)
-                prof._record('queue', (time.perf_counter() - job.t_queued) * 1000.0)
-                with prof.time('total'):
-                    job.spectrum_generation = self._spectrum_generation
-                    on = _effective(plan, self._steps)                # one consistent set per frame
-                    clip_level, clipped = self._cal_clip_level, None
-                    if clip_level is not None and self._cal_ring is not None and plan.stage == 'raw':
-                        # raw pixels at full scale per slit row, in the row order after the flip
-                        clipped = np.count_nonzero(frame >= clip_level, axis=1)
-                        if on['flip']:
-                            clipped = clipped[::-1]
-                    if plan.stage == 'raw':
-                        binned, _, _ = runtime.process_binned(
-                            frame, plan.dark_processor(on['dark']), plan.binner,
-                            calibration=plan.smile_model if on['smile'] else None,
-                            inverted=on['flip'], profiler=prof)
-                    else:
-                        binned = frame
-                    pre = binned.astype(np.float32, copy=True) if self._cal_ring is not None else None
-                    flat = getattr(plan, 'flatfield_profile', None)
-                    if on['flatfield'] and flat is not None:
-                        with prof.time('flatfield'):
-                            binned = np.divide(binned, flat.values, dtype=np.float32)
-                    if on['reflectance']:                             # last step before the model
-                        with prof.time('reflectance'):
-                            binned = apply_reflectance(binned, plan.reflectance_factors)
-                    # spectrum preview: what the model receives (a copy: the buffers are reused)
-                    spec = binned.astype(np.float32, copy=True) if self._spec_ring is not None else None
-                    with prof.time('predict'):
-                        _, classifier, columns = job.model
-                        ids = classifier.predict(binned, columns[job.source])
-                # display only: brightness of what the model saw, one value per slit pixel
-                intensity = binned.mean(axis=1, dtype=np.float32)
-                now = time.perf_counter()
-                if now - self._display_t >= self._display_interval:
-                    self._display_t = now
-                    self._raw_frame = frame.copy()
-                self._free.put(job.slot)                       # buffer back to the camera
-                self._results.put((job, ids, intensity, pre, spec, clipped))
+                lines = [job] if job.partner is None else [job, job.partner]
+                t_start = time.perf_counter()
+                for line_job in lines:
+                    # time the line waited in the buffers before a worker took it (for a live camera
+                    # with timestamps the latency also has exposure and transfer; the queue wait not)
+                    prof._record('queue', (t_start - line_job.t_queued) * 1000.0)
+                    line_job.spectrum_generation = self._spectrum_generation
+                on = _effective(plan, self._steps)                    # one consistent set per job
+                inputs, pres, clips = [], [], []
+                for line_job in lines:
+                    binned, pre, clipped = self._model_input(runtime, plan, on, self._buffers[line_job.slot], prof)
+                    # the runtime may reuse its output for the next frame: keep a copy of a first one
+                    inputs.append(binned.astype(np.float32, copy=True) if len(lines) > 1 else binned)
+                    pres.append(pre)
+                    clips.append(clipped)
+                t0 = time.perf_counter()
+                x = bin_2x2(inputs) if job.spatial_bin == 2 else inputs[0]    # (ceil(slit / 2), bands)
+                t1 = time.perf_counter()
+                _, classifier, columns = job.model
+                ids = classifier.predict(x, columns[job.source])
+                t2 = time.perf_counter()
+                for _line in lines:                                  # stage times per line, as 'total'
+                    if job.spatial_bin == 2:
+                        prof._record('spatial_bin', (t1 - t0) * 1000.0 / len(lines))
+                    prof._record('predict', (t2 - t1) * 1000.0 / len(lines))
+                slit = inputs[0].shape[0]
+                if job.spatial_bin == 2:                              # the block's class to its pixels
+                    ids = np.repeat(ids, 2)[:slit]
+                # spectrum preview: what the model receives, per slit pixel (a copy: buffers are reused)
+                spec = None
+                if self._spec_ring is not None:
+                    spec = (np.repeat(x, 2, axis=0)[:slit] if job.spatial_bin == 2
+                            else x.astype(np.float32, copy=True))
+                total = (time.perf_counter() - t_start) * 1000.0 / len(lines)
+                for line_job, binned, pre, clipped in zip(lines, inputs, pres, clips):
+                    prof._record('total', total)                     # per line: capacity = lines / s
+                    # display only: brightness of what the model saw, one value per slit pixel
+                    intensity = (binned.mean(axis=1, dtype=np.float32) if job.spatial_bin != 2
+                                 else np.repeat(x.mean(axis=1, dtype=np.float32), 2)[:slit])
+                    now = time.perf_counter()
+                    if now - self._display_t >= self._display_interval:
+                        self._display_t = now
+                        self._raw_frame = self._buffers[line_job.slot].copy()
+                    line_job.partner = None                          # the result travels per line
+                    self._free.put(line_job.slot)                    # buffer back to the camera
+                    self._results.put((line_job, ids, intensity, pre, spec, clipped))
         except Exception as exc:
             self._fail(f'worker-{k}', exc)
         finally:
             self._results.put(None)
+
+    def _model_input(self, runtime, plan, on: dict, frame: np.ndarray, prof) -> tuple:
+        """``(model input (slit, bands), copy before flat-field / reflectance or None, clipped
+        raw pixels per slit row or None)`` of one frame: every processing step that is ``on``."""
+        clip_level, clipped = self._cal_clip_level, None
+        if clip_level is not None and self._cal_ring is not None and plan.stage == 'raw':
+            # raw pixels at full scale per slit row, in the row order after the flip
+            clipped = np.count_nonzero(frame >= clip_level, axis=1)
+            if on['flip']:
+                clipped = clipped[::-1]
+            clipped = clipped[plan.slit_rows]                     # the rows the model receives
+        if plan.stage == 'raw':
+            binned, _, _ = runtime.process_binned(
+                frame, plan.dark_processor(on['dark']), plan.binner,
+                calibration=geometry_model(plan, on),
+                inverted=on['flip'], profiler=prof)
+            binned = binned[plan.slit_rows]          # keystone margin cropped (a view; hsi crops it too)
+        else:
+            binned = frame
+        pre = binned.astype(np.float32, copy=True) if self._cal_ring is not None else None
+        flat = getattr(plan, 'flatfield_profile', None)
+        if on['flatfield'] and flat is not None:
+            with prof.time('flatfield'):
+                binned = np.divide(binned, flat.values, dtype=np.float32)
+        if on['reflectance']:                                     # last step before the model
+            with prof.time('reflectance'):
+                binned = apply_reflectance(binned, plan.reflectance_factors)
+        return binned, pre, clipped
 
     def _new_runtime(self, k: int, backend: str) -> PreprocessingRuntime:
         # Created in this thread: a CUDA backend's context belongs to the thread using it.

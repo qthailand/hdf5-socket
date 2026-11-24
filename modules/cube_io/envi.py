@@ -10,7 +10,8 @@ Data conventions:
 
 File handles:
     Band reads keep the memory maps of the last two data files open (re-mapping a
-    BIP file for every band is about 40x slower).  Call :func:`release_band_maps`
+    BIP file for every band is about 40x slower), and :func:`read_envi_cube_bsq` keeps
+    in-RAM BSQ copies of recently read cubes.  Call :func:`release_band_maps`
     before overwriting or deleting such a file: on Windows a mapped file cannot be
     replaced.  A file that changed on disk (size or modification time) is re-mapped.
 
@@ -107,10 +108,69 @@ def release_band_maps(filepath=None):
     with _maps_lock:
         if filepath is None:
             _maps.clear()
+            _cubes.clear()
         else:
             path = os.path.abspath(filepath)
-            for old in [k for k in _maps if k[0] == path]:
-                del _maps[old]
+            for cache in (_maps, _cubes):
+                for old in [k for k in cache if k[0] == path]:
+                    del cache[old]
+
+
+#: Total size of the in-RAM BSQ copies kept by :func:`read_envi_cube_bsq` (file dtype).
+CUBE_CACHE_BYTES = 4 << 30
+_cubes = OrderedDict()           # (path, mtime, size, dtype, offset, shape, interleave) -> array
+
+
+def read_envi_cube_bsq(filepath, meta, max_bytes=None):
+    """A BIL/BIP/BSQ cube as a read-only in-RAM ``(bands, lines, samples)`` array.
+
+    The array keeps the file's data type in native byte order, so ``cube[b].astype(np.float32)``
+    equals :func:`_read_envi_band_float32` of band ``b``.  Converting an interleaved file costs
+    one pass over it; the copy is then kept (largest :data:`CUBE_CACHE_BYTES` in total, least
+    recently used dropped first, re-read when the file changes) so the next reads of the same
+    cube are as fast as BSQ bands.  :func:`release_band_maps` drops it.
+
+    Args:
+        max_bytes: Largest cube to load; default :data:`CUBE_CACHE_BYTES`.  A cube that is
+            not cached is also refused when it needs more than half of the free memory.
+
+    Returns:
+        numpy.ndarray or None: ``None`` when the cube is too large (read bands in blocks
+        with :func:`read_envi_bands_float32` instead).
+    """
+    data, interleave = _envi_map(filepath, meta)
+    path = os.path.abspath(filepath)
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size, data.dtype.str, int(meta.get('header offset', 0)),
+           data.shape, interleave)
+    with _maps_lock:
+        cube = _cubes.get(key)
+        if cube is not None:
+            _cubes.move_to_end(key)
+            return cube
+    limit = CUBE_CACHE_BYTES if max_bytes is None else int(max_bytes)
+    if data.nbytes > limit or data.nbytes > _free_memory() // 2:
+        return None
+    n_bands, n_lines, n_samples = int(meta['bands']), int(meta['lines']), int(meta['samples'])
+    cube = np.empty((n_bands, n_lines, n_samples), dtype=data.dtype.newbyteorder('='))
+    _copy_bsq(data, interleave, 0, n_bands, cube)
+    cube.flags.writeable = False
+    with _maps_lock:
+        for old in [k for k in _cubes if k[0] == path]:          # the file was rewritten
+            del _cubes[old]
+        _cubes[key] = cube
+        while sum(c.nbytes for c in _cubes.values()) > CUBE_CACHE_BYTES and len(_cubes) > 1:
+            _cubes.popitem(last=False)
+    return cube
+
+
+def _free_memory():
+    """Available physical memory in bytes (unlimited if psutil is not installed)."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return 1 << 62
 
 
 def parse_envi_header(filepath):
@@ -201,6 +261,52 @@ def _read_envi_band_float32(filepath, meta, band_idx):
         ValueError: unsupported data type or interleave, or the file is smaller than
             the header describes.
     """
+    data, interleave = _envi_map(filepath, meta)
+    if interleave == 'bsq':
+        band = data[band_idx]
+    elif interleave == 'bil':
+        band = data[:, band_idx, :]
+    else:
+        band = data[:, :, band_idx]
+    return np.array(band, dtype=np.float32)        # a copy, never a view of the map
+
+
+def read_envi_bands_float32(filepath, meta, start, stop):
+    """Read bands ``start .. stop-1`` at once as float32 ``(stop - start, lines, samples)``.
+
+    Each band equals :func:`_read_envi_band_float32` of it.  For BIL and BIP files one
+    block read passes over the file once instead of once per band, which is what makes
+    band-by-band processing of interleaved cubes slow.
+
+    Raises:
+        ValueError: as :func:`_read_envi_band_float32`, or an empty / out-of-range block.
+    """
+    data, interleave = _envi_map(filepath, meta)
+    start, stop = int(start), int(stop)
+    if not 0 <= start < stop <= int(meta['bands']):
+        raise ValueError(f"Band block {start}:{stop} outside 0:{meta['bands']}")
+    out = np.empty((stop - start, int(meta['lines']), int(meta['samples'])), dtype=np.float32)
+    _copy_bsq(data, interleave, start, stop, out)
+    return out
+
+
+def _copy_bsq(data, interleave, start, stop, out):
+    """Copy bands ``start:stop`` of a mapped file into ``out`` ``(stop - start, lines, samples)``."""
+    if interleave == 'bsq':
+        out[...] = data[start:stop]
+        return
+    # a few lines at a time: transposing them in cache is ~3x faster than the whole block
+    step = max(1, (1 << 20) // max(1, data[0].nbytes))
+    for y in range(0, out.shape[1], step):
+        lines = data[y:y + step]
+        if interleave == 'bil':
+            out[:, y:y + step] = lines[:, start:stop, :].transpose(1, 0, 2)
+        else:
+            out[:, y:y + step] = lines[:, :, start:stop].transpose(2, 0, 1)
+
+
+def _envi_map(filepath, meta):
+    """``(memmap, interleave)`` of an ENVI data file, shaped by its interleave."""
     L, S, B = meta['lines'], meta['samples'], meta['bands']
     dt = envi_dtype(meta.get('data type', meta.get('data_type', '4')))
     bpp = dt.itemsize
@@ -216,13 +322,6 @@ def _read_envi_band_float32(filepath, meta, band_idx):
     if size < expected:
         raise ValueError(f"{filepath}: file has {size} bytes, the header describes {expected}")
 
-    data = _band_map(filepath, dt, offset, shapes[interleave])
-    if interleave == 'bsq':
-        band = data[band_idx]
-    elif interleave == 'bil':
-        band = data[:, band_idx, :]
-    else:
-        band = data[:, :, band_idx]
-    return np.array(band, dtype=np.float32)        # a copy, never a view of the map
+    return _band_map(filepath, dt, offset, shapes[interleave]), interleave
 
 

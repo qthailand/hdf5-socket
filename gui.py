@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QScrollArea, QS
                              QSizePolicy, QSplitter, QVBoxLayout, QWidget)
 
 from focus import edge_contrast
+from inference_engine import Resampled
 from modules.compute_runtime import get_compute_capabilities, initialize_compute
 from modules.sharpness import sharpness_score
 from model_catalog import scan_models, session_entry
@@ -289,6 +290,20 @@ class PushbroomScannerMainWindow(QMainWindow):
             box.setObjectName("stepCheck")
             self._step_boxes[name] = box
             steps_row.addWidget(box)
+        # Model input of 2 x 2 pixels (processing.spatial_bin): after the last step, before the model
+        arrow = QLabel("→")
+        arrow.setObjectName("metricCaption")
+        steps_row.addWidget(arrow)
+        self._bin_box = QCheckBox("2×2 bin")
+        self._bin_box.setObjectName("stepCheck")
+        self._bin_box.setToolTip(
+            "Model input = mean of 2 × 2 pixels (2 slit rows × 2 consecutive lines), taken after\n"
+            "Reflectance, as HSI-SCAN's offline reflectance export with 'spatial_bin 2'.\n"
+            "Use it when the model was trained on such data. Each block's class and spectrum are\n"
+            "shown on its 4 pixels; the map resolution halves. Off: every pixel is classified.\n"
+            "(processing.spatial_bin)")
+        self._bin_box.toggled.connect(self._on_spatial_bin_toggled)
+        steps_row.addWidget(self._bin_box)
         # The model was trained on counts or on reflectance; feeding it the other gives wrong classes.
         self._units_warning = QLabel("")
         self._units_warning.setObjectName("stepWarning")
@@ -630,7 +645,8 @@ class PushbroomScannerMainWindow(QMainWindow):
             text += f" = {mm / pixel:.2g} × the {pixel:.3g} mm pixel across the belt"
         self._belt_label.setText(text)
 
-    _STEP_LABELS = (('dark', 'Dark + Hot pixel'), ('flip', 'Flip'), ('smile', 'Smile'), ('binning', 'Binning'),
+    _STEP_LABELS = (('dark', 'Dark + Hot pixel'), ('flip', 'Flip'), ('smile', 'Smile'), ('keystone', 'Keystone'),
+                    ('binning', 'Binning'),
                     ('flatfield', 'Flat-field'), ('reflectance', 'Reflectance'))
 
     def _setup_step_switches(self) -> None:
@@ -663,8 +679,20 @@ class PushbroomScannerMainWindow(QMainWindow):
             if available and name != 'binning' and name not in self._step_connected:
                 box.toggled.connect(lambda checked, n=name: self._on_step_toggled(n, checked))
                 self._step_connected.add(name)
+        self._bin_box.blockSignals(True)
+        self._bin_box.setChecked(self._pipeline.spatial_bin == 2)
+        self._bin_box.blockSignals(False)
         self._show_flatfield_state()
         self._update_units_warning()
+
+    def _on_spatial_bin_toggled(self, checked: bool) -> None:
+        """2×2 bin of the model input on/off; kept for a pipeline restart (sensor settings)."""
+        n = 2 if checked else 1
+        self._pipeline.set_spatial_bin(n)
+        self.config = replace(self.config, processing=replace(self.config.processing, spatial_bin=n))
+        self.spectrum_panel.clear()
+        self.spectrum_panel.set_note('Model input changed · click a newly acquired line to inspect the current input')
+        self.performance_panel.reset_requested.emit()     # stage averages restart for the new chain
 
     def _reflectance_flatfield_state(self) -> tuple[str, str, str] | None:
         """How the flat-field relates to the reflectance factors in use.
@@ -685,7 +713,7 @@ class PushbroomScannerMainWindow(QMainWindow):
             return Path(label).parent.name or str(label)
 
         loaded = getattr(plan, 'flatfield_profile', None)
-        if loaded is not None and str(loaded.label) != str(inside):
+        if loaded is not None and short(loaded.label) != short(inside):     # profile id (folder name)
             return 'mismatch', short(inside), short(loaded.label)
         return 'in', short(inside), ''
 
@@ -746,7 +774,13 @@ class PushbroomScannerMainWindow(QMainWindow):
             for plan in self._pipeline.plans:
                 flat = plan.flatfield_profile
                 if flat is not None:
-                    self._pipeline.set_steps(dark=flat.dark, flip=flat.flip, smile=flat.smile)
+                    self._pipeline.set_steps(dark=flat.dark, flip=flat.flip, smile=flat.smile,
+                                             keystone=getattr(flat, 'keystone', False))
+        if checked and name == 'reflectance':
+            for plan in self._pipeline.plans:
+                required = getattr(plan, 'reflectance_requires', None)
+                if required:                 # factors of an hsi reference: the steps they were made with
+                    self._pipeline.set_steps(**required)
         self._pipeline.set_steps(**{name: checked})
         self.spectrum_panel.clear()
         self.spectrum_panel.set_note('Processing changed · click a newly acquired line to inspect the current input')
@@ -885,7 +919,13 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._generation_models = {g: c for g, c in self._generation_models.items() if g >= generation}
         self._shown_generation = generation
         # a model package brings the class colours chosen at training (ids without one keep Tab10)
-        self._lut = generate_tab10_lut(getattr(classifier, 'class_colors', None))
+        colors = getattr(classifier, 'class_colors', None) or {}
+        self._lut = generate_tab10_lut(colors)
+        # background (bg / background by name) is black unless the package chose a colour for it
+        hidden = {str(n).casefold() for n in self.config.display.hidden_classes}
+        for cid, name in classifier.category_names.items():
+            if str(name).casefold() in hidden and int(cid) not in colors and 0 <= int(cid) < 255:
+                self._lut[int(cid)] = (0, 0, 0)
         self._show_training_spectra(classifier)
         self.class_legend_widget.setup_classes_from_model(
             category_names=classifier.category_names, lut=self._lut, classes=classifier.classes_,
@@ -1023,7 +1063,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         """
         disp = self.config.display
         w, h = max(1, self._canvas_label.width()), max(1, self._canvas_label.height())
-        rows = self._pipeline.sources[0].frame_shape[0]
+        rows = self._pipeline.slit_rows
         return max(1, int(round(rows * w / h / (disp.line_aspect * disp.canvas_line_stride))))
 
     def _raw_zone_columns(self, columns: int) -> int:
@@ -1032,7 +1072,7 @@ class PushbroomScannerMainWindow(QMainWindow):
 
     def _belt_step(self) -> tuple[int, int]:
         """(rows, columns) decimation of the belt map down to the label's resolution."""
-        rows = self._pipeline.sources[0].frame_shape[0]
+        rows = self._pipeline.slit_rows
         h, w = max(1, self._canvas_label.height()), max(1, self._canvas_label.width())
         return max(1, rows // h), max(1, self._canvas_columns() // w)
 
@@ -1152,7 +1192,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         valid = np.flatnonzero(lines >= 0)
         if not valid.size:
             return []
-        slit = self._pipeline.sources[0].frame_shape[0]
+        slit = self._pipeline.slit_rows
         per_column = self.config.display.canvas_line_stride * self._belt['step'][1]
         marks = []
         for point in points:
@@ -1191,7 +1231,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         if self._belt is None or self._belt['lines'] is None:
             return
         w, h = max(1, self._canvas_label.width()), max(1, self._canvas_label.height())
-        slit = self._pipeline.sources[0].frame_shape[0]
+        slit = self._pipeline.slit_rows
         row = int(np.clip(pos.y() / h * slit, 0, slit - 1))
         # the map keeps every step[0]-th slit row: take the row it shows, so the spectrum and the
         # class read from the map belong to the same pixel
@@ -1219,11 +1259,25 @@ class PushbroomScannerMainWindow(QMainWindow):
         on = self._pipeline.effective_steps()
         panel.set_unit("model input: reflectance" if on.get('reflectance') else
                        "model input: counts" if plan.stage == 'raw' else "model input")
-        point = panel.add_point(plan.wavelengths, values, line=line, row=row, label=label)
+        model_values = self._model_bands(plan.columns, values)
+        point = panel.add_point(plan.wavelengths, values, line=line, row=row, label=label,
+                                model_values=model_values)
         finite = values[np.isfinite(values)]
         span = f"{finite.min():.4g} – {finite.max():.4g}" if finite.size else "no finite value"
-        panel.set_note(f"#{point.number}: {label}, slit row {row}, line {line:,}, values {span}")
+        bad = 0 if model_values is None else int((~np.isfinite(model_values)).sum())
+        warn = f" · {bad} model band(s) NaN/inf: the model treats this pixel as invalid" if bad else ""
+        panel.set_note(f"#{point.number}: {label}, slit row {row}, line {line:,}, values {span}{warn}")
         self._repaint_belt()
+
+    @staticmethod
+    def _model_bands(columns, values: np.ndarray) -> np.ndarray | None:
+        """``values`` (one pixel, every input band) on the bands the model reads, through its
+        binding ``columns``: input columns, or a :class:`Resampled` interpolation."""
+        if columns is None:
+            return None
+        if isinstance(columns, Resampled):
+            return columns.apply(np.asarray(values, np.float32)[None])[0].astype(np.float64)
+        return np.asarray(values, np.float64)[np.asarray(columns, np.intp)]
 
     @staticmethod
     def _set_pixmap(label: QLabel, image: np.ndarray, aspect) -> None:
@@ -1305,10 +1359,12 @@ class PushbroomScannerMainWindow(QMainWindow):
                 'steps': [('Dark + hot pixel', dark_on, source('dark')),
                           ('Flip', bool(steps.get('flip')), str(plan.steps.get('flip', {}).get('why', ''))),
                           ('Smile', bool(steps.get('smile')), source('smile')),
+                          ('Keystone', bool(steps.get('keystone')),
+                           str(plan.steps.get('keystone', {}).get('why', ''))),
                           ('Binning', True, source('binning'))],
                 'flatfield_label': flat_label,
-                'flatfield_matches': flat is not None and all(steps.get(k) == getattr(flat, k)
-                                                              for k in ('dark', 'flip', 'smile'))}
+                'flatfield_matches': flat is not None and all(steps.get(k, False) == getattr(flat, k, False)
+                                                              for k in ('dark', 'flip', 'smile', 'keystone'))}
 
     def _camera_text(self) -> str:
         """The camera values a calibration is bound to (also written into its JSON)."""
@@ -1350,7 +1406,7 @@ class PushbroomScannerMainWindow(QMainWindow):
             capture_steps['flatfield'] = False
             flat = getattr(plan, 'flatfield_profile', None) if choice['kind'] == 'flatfield' else None
             if choice['kind'] == 'flatfield':
-                if flat is None or any(steps.get(k) != getattr(flat, k) for k in ('dark', 'flip', 'smile')):
+                if flat is None or any(steps.get(k, False) != getattr(flat, k, False) for k in ('dark', 'flip', 'smile', 'keystone')):
                     raise ValueError('Flat-field requires the same Dark/Flip/Smile settings as its profile')
             factors, white = factors_from_lines(lines, rows, choice['values'], plan.wavelengths,
                                                 choice['kind'], steps=capture_steps,
@@ -1393,6 +1449,8 @@ class PushbroomScannerMainWindow(QMainWindow):
                     'steps': report['steps'], 'quality': report, **self._camera_values()}
             info['factor_input_space'] = 'pre_flatfield_counts'
             info['flatfield_profile'] = flat.label if flat is not None else None
+            # the switches the factors were made with: the next start runs them so (sim_config)
+            info['made_with'] = {k: bool(capture_steps.get(k, False)) for k in ('dark', 'flip', 'smile', 'keystone')}
             if self._apply_calibration(factors, info):
                 dialog.accept()
 
@@ -1431,7 +1489,8 @@ class PushbroomScannerMainWindow(QMainWindow):
             QMessageBox.critical(self, "Reflectance", f"Not saved, nothing changed:\n{exc}")
             return False
         try:
-            self._pipeline.set_reflectance_factors(factors, label, flatfield=inside)
+            self._pipeline.set_reflectance_factors(factors, label, flatfield=inside,
+                                                   requires=info.get('made_with'))
         except Exception as exc:
             logger.exception("Reflectance calibration saved but not applied")
             QMessageBox.critical(self, "Reflectance", f"Saved to {path.name} but not applied:\n{exc}")

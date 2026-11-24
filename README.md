@@ -190,6 +190,19 @@ everywhere with Reflectance on. `tools/train_sgd_coco.py` now writes `input_unit
 (float ≤ ~5 → reflectance), and the GUI warns when model and Reflectance step disagree.
 `model.path: "none"` gives a speed-only stand-in on all bands.
 
+**Training on the whole `dataset/` folder:** `python tools/train_sgd_coco.py` (no arguments) trains
+on every labelled cube in `dataset/`: each `<name>.hdr` that has COCO polygons next to it
+(`<name>.json` or `<name>.bip.json`; headers without labels are skipped with a message). The
+labelled pixels of all cubes are pooled and split once (80 % fit, 20 % held out, with a per-cube
+held-out accuracy printed). Classes are matched by name across the cubes, so one cube may label
+only some of them; the cubes must have the same bands (wavelengths within 0.01 nm), the same
+units and labels drawn at the cube's size, else the script stops and names the files. At least 3
+classes are needed (a 2-class SGD keeps one weight vector, which the fused artifact cannot use).
+Options: `--dataset <folder>`, `--out` (default `models/sgd_dataset.joblib`), `--bands`, and
+`--hdr <cube> [--labels <json>]` for one cube only. The artifact lists the cubes it was trained on
+(`training_headers`, `training_labels`), and `tools/check_calibration.py` rebuilds the pooled
+held-out split from them.
+
 **Reflectance is on at start** (`corrections.reflectance: "auto"`): every source with a
 `reflectance/<name>.npy` is calibrated before the model (`first`, `seconds` from
 `spectralon-20.h5`). Measured at 250 lines/s, frames from the disk cache: total 2.8 ms per line

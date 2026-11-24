@@ -33,8 +33,15 @@ VENDORED = (
     'compute_runtime/__init__.py',
     'dark/core.py', 'dark/library.py', 'dark/selection.py',
     'smile/calibration.py', 'smile/core.py', 'smile/surface.py', 'smile/runtime.py',
+    # Smile + keystone models (format 4): calibration.py imports it for the row margins.
+    'smile/keystone.py',
+    # keystone.py imports logged_analysis from it (off unless enabled; writes nothing here).
+    'smile/debug_log.py',
     'spectral_processing/binning.py',
     'radiometric/core.py', 'cube_io/envi.py', 'cube_io/writers.py',
+    # hsi's radiometric references (camera_profiles/<backend>/<camera>/radiometric/): active.json,
+    # ReferenceKey and its mismatch rules, read by hsi_profiles.py exactly as hsi reads them.
+    'radiometric/reference.py',
     # Live camera source (camera_source.py). Not copied: widget.py and pixel_pitch.py (PyQt5
     # widgets; pixel_pitch needs hsi's modules.contracts) - the local __init__ does not export them.
     'camera/base.py', 'camera/config.py', 'camera/factory.py', 'camera/__main__.py',

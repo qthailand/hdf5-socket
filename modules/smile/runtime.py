@@ -1,8 +1,11 @@
 """HSI runtime adapter for sensor-coordinate models, before wavelength binning.
 
 No crop or float conversion is applied: uint16 input remains uint16 and the
-spectral pixel origin stays unchanged. Invalid border columns are zero-filled.
-Models must be calibrated after the same orientation and hardware binning.
+spectral pixel origin stays unchanged. A smile model moves columns only; a smile +
+keystone model (format 4, :mod:`modules.smile.keystone`) moves rows along the slit
+too, in the same single remap. Invalid border columns (and, with keystone, border
+rows: ``calibration.row_margin``) are zero-filled. Models must be calibrated after
+the same orientation and hardware binning.
 """
 import logging
 from pathlib import Path
@@ -15,7 +18,9 @@ class SmileRuntime:
 
     Looks for ``smile_model_bin<N>.npz`` (see :func:`modules.smile.save_calibration`) in a
     folder, keeps the loaded :class:`SmileCalibration` and applies it to sensor frames
-    without changing their dtype or size.
+    without changing their dtype or size. The model is smile only (``map_x``) or smile +
+    keystone (``map_x`` and ``map_y``: ``calibration.has_keystone``), applied either way as one
+    CPU remap.
 
     Data conventions: frames are 2-D ``(slit rows, spectral columns)`` in sensor
     coordinates after orientation, at the hardware bin the model was calibrated for;
@@ -40,11 +45,13 @@ class SmileRuntime:
         """Load a model file and select the CPU fixed-point remap backend.
 
         Args:
-            path: Path of a smile model ``.npz``.
+            path: Path of a smile model ``.npz`` (format 1-4; format 4 carries the keystone
+                row map).
             bin_value: Hardware bin the model belongs to (stored as ``int``).
 
         Raises:
-            ValueError: The file's ``format_version`` is newer than supported.
+            ValueError: The file's ``format_version`` is newer than supported, or a keystone
+                model lacks its ``map_y``.
             OSError, KeyError: The file cannot be read or lacks required entries.
         """
         cal = load_calibration(str(path))
@@ -85,8 +92,9 @@ class SmileRuntime:
             frame: 2-D sensor frame ``(slit rows, spectral columns)``, uint8/uint16/float32.
 
         Returns:
-            numpy.ndarray: The remapped frame with the same shape and dtype (invalid border
-            columns are zero-filled), or ``frame`` itself when no model is loaded.
+            numpy.ndarray: The remapped frame with the same shape and dtype (columns, and with a
+            keystone model rows too, are moved; invalid border columns and rows are zero-filled),
+            or ``frame`` itself when no model is loaded.
 
         Raises:
             ValueError: The frame shape differs from the model's ``image_shape``; the model is

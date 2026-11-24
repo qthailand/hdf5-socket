@@ -138,10 +138,67 @@ def test_panel_derivative_view_applies_the_package_derivative_on_the_training_ax
     np.testing.assert_array_equal(wl, WAVELENGTHS)
     np.testing.assert_allclose(values, 0.002, rtol=1e-9)
     assert panel.selected_wavelengths.size == 2 and not panel.grab().isNull()
-    short = panel.add_point(WAVELENGTHS[1:], mean[1:], line=1, row=1)          # does not cover the axis
-    assert np.isnan(panel.shown_curve(short)[1]).all() and not panel.grab().isNull()
+    short = panel.add_point(WAVELENGTHS[1:], mean[1:], line=1, row=1)          # a whole band short
+    curve = panel.shown_curve(short)[1]                 # NaN only where the window needs that band
+    assert np.isnan(curve[:3]).all() and np.isfinite(curve[3:]).all() and not panel.grab().isNull()
     panel.set_training(None)
     assert not panel.derivative_shown and not panel.derivative_button.isEnabled()
+
+
+def test_derivative_view_uses_the_model_bands_and_survives_a_shifted_axis_and_bad_bands():
+    """Live: the camera axis need not cover the training axis (the model extrapolates its edge
+    bands) and a band the model does not read may be NaN; neither may blank the curve."""
+    pytest.importorskip('PyQt5')
+    from PyQt5.QtWidgets import QApplication
+    from hsi_package import savgol_derivative_matrix
+    from themes import apply_theme
+    from inference_engine import Resampled
+    from widgets.spectrum_panel import SpectrumPanel, TrainingBand, derive, resample
+    app = QApplication.instance() or QApplication([])
+    apply_theme(app, 'dark')
+    panel = SpectrumPanel()
+    panel.resize(600, 160)
+    step = float(WAVELENGTHS[1] - WAVELENGTHS[0])
+    D = savgol_derivative_matrix(WAVELENGTHS.size, 5, 2, step)
+    mean = np.linspace(0.2, 0.6, WAVELENGTHS.size)
+    band = [TrainingBand('Leaf', '#22AA44', mean, np.full(mean.size, 0.05), 400)]
+    panel.set_training(WAVELENGTHS, band, derivative_bands=band, derivative=D)
+    panel.derivative_button.click()
+    # shifted by 0.3 band: the first training band lies outside the input; plus a NaN band past the end
+    live = np.append(WAVELENGTHS + 0.3 * step, WAVELENGTHS[-1] + 1.3 * step)
+    values = np.append(3.0 + 0.002 * live[:-1], np.nan)
+    model = 3.0 + 0.002 * WAVELENGTHS                                  # what the model's binding read
+    with_model = panel.add_point(live, values, line=0, row=0, model_values=model)
+    np.testing.assert_allclose(panel.shown_curve(with_model)[1], 0.002, rtol=1e-9)
+    without = panel.add_point(live, values, line=1, row=0)            # no binding: interpolated here
+    np.testing.assert_allclose(panel.shown_curve(without)[1], 0.002, rtol=1e-9)   # edges extrapolated
+    # a NaN band inside: only the derivative bands whose window holds it are NaN
+    z = model.copy()
+    z[6] = np.nan
+    out = derive(D, z)
+    assert np.isnan(out[4:9]).all() and np.isfinite(out[:4]).all() and np.isfinite(out[9:]).all()
+    # the fallback resampling is the model's: same values, a bad band reaches only what reads it
+    rng = np.random.default_rng(1)
+    for shift in (0.0, 0.3, -0.45):
+        x = WAVELENGTHS + shift * step
+        y = rng.random(x.size)
+        y[5] = np.nan
+        model = Resampled(x, WAVELENGTHS).apply(y[None])[0]
+        np.testing.assert_allclose(resample(x, y, WAVELENGTHS), model, rtol=1e-6, equal_nan=True)
+    assert np.isnan(resample(WAVELENGTHS, y, WAVELENGTHS)).sum() == 1
+    assert not panel.grab().isNull()
+
+
+def test_model_bands_of_a_click_follow_the_binding():
+    import gui
+    from inference_engine import Resampled
+    values = np.arange(10, dtype=np.float64)
+    np.testing.assert_array_equal(gui.PushbroomScannerMainWindow._model_bands(np.array([2, 5]), values), [2, 5])
+    wl = np.arange(10, dtype=np.float64) * 5 + 900
+    resampled = Resampled(wl, np.array([899.0, 912.5, 946.0]))       # one band 1 nm before the input
+    np.testing.assert_allclose(gui.PushbroomScannerMainWindow._model_bands(resampled, values),
+                               [-0.2, 2.5, 9.2], atol=1e-5)
+    assert gui.PushbroomScannerMainWindow._model_bands(None, values) is None
 
 
 def test_gui_click_on_the_belt_map_adds_spectra_and_clear_removes_them(tmp_path):
@@ -185,6 +242,7 @@ def test_gui_click_on_the_belt_map_adds_spectra_and_clear_removes_them(tmp_path)
             # the cube loops: line n is file line n % 15
             np.testing.assert_allclose(point.values, cube[point.row, point.line % lines], rtol=1e-6)
             assert point.label in ('Background', 'Leaf', 'Wood')
+            np.testing.assert_allclose(point.model_values, point.values[pipeline.plans[0].columns])
         assert panel.unit.startswith('model input') and '#3' in panel.note_label.text()
         assert len(window._spectrum_marks()) == 3          # drawn on the map in the same colours
 

@@ -29,7 +29,7 @@ from themes import make_panel, set_accent
 #: Display order and names of the profiler stages (others are appended as they come).
 STAGES = (('dark_hot', 'Dark + Hot pixel'),
           ('orient_smile', 'Flip + Smile'), ('gpu_preprocess', 'GPU correction'), ('bin', 'Binning'),
-          ('reflectance', 'Reflectance'), ('predict', 'Model'), ('total', 'Total / line'))
+          ('reflectance', 'Reflectance'), ('spatial_bin', '2×2 bin'), ('predict', 'Model'), ('total', 'Total / line'))
 _HIDDEN = {'dark', 'hot_pixel',     # shown together as one step, like the step switch
            'preprocess',            # sum of dark/hot/flip/Smile on CPU; shown only without them
            'queue'}                 # waiting, not processing: shown in the latency chart

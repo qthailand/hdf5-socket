@@ -1,6 +1,6 @@
 """Resident CuPy uint16 pipeline with cached maps, sparse hot-pixel repair and lambda binning."""
 import numpy as np
-from .maps import prepare_maps, horizontal_table
+from .maps import prepare_maps, horizontal_table, remap_table, moves_rows
 from .timing import CudaEventTimer, stage_timer
 
 try:
@@ -11,20 +11,35 @@ except Exception as exc:      # optional dependency: CPU-only machines have no (
 else:
     _CUPY_ERROR = None
 
+# Fixed-point remap with OpenCV's float tables: ``taps`` columns x ``vtaps`` rows.
+# vtaps == 1: horizontal Smile (integer rows), weights (32, taps) indexed by fx.
+# vtaps == taps: smile + keystone, weights (1024, taps*taps) indexed by fy*32+fx, the
+# float32 products vy[k1]*vx[k2] of cv2.remap, summed in OpenCV's order: bicubic with
+# all 16 taps inside the frame sums each tap row first, then the rows; bilinear, and
+# bicubic at the border, sum the taps in one chain.  Taps outside the frame read 0
+# (BORDER_CONSTANT).
 _REMAP = r'''
 extern "C" __global__ void remap16(const unsigned short* src, unsigned short* dst,
  const short* xy, const unsigned short* frac, const float* weights,
- int n, int width, int height, int taps, int inverted, int identity) {
+ int n, int width, int height, int taps, int vtaps, int inverted, int identity) {
  int i=blockDim.x*blockIdx.x+threadIdx.x; if(i>=n)return;
  int row=i/width, col=i%width;
  if(identity){dst[i]=src[(inverted?height-1-row:row)*width+col];return;}
  int x=xy[2*i], y=xy[2*i+1];
  if(taps==1){dst[i]=(x>=0&&x<width&&y>=0&&y<height)?src[y*width+x]:0;return;}
- int f=frac[i]&31; float value=0;
- for(int k=0;k<taps;k++){
-   int sx=x+k-(taps==4?1:0);
-   float v=(sx>=0&&sx<width&&y>=0&&y<height)?(float)src[y*width+sx]:0;
-   value=__fadd_rn(value,__fmul_rn(v,weights[f*taps+k]));
+ int f=vtaps==1?(frac[i]&31):(frac[i]&1023);
+ const float* w=weights+f*taps*vtaps;
+ int x0=x-(taps==4?1:0), y0=y-(vtaps==4?1:0);
+ int chain=taps==2||x0<0||x0+taps>width||y0<0||y0+vtaps>height;
+ float value=0;
+ for(int r=0;r<vtaps;r++){
+   int sy=y0+r; float line=chain?value:0.0f;
+   for(int k=0;k<taps;k++){
+     int sx=x0+k;
+     float v=(sx>=0&&sx<width&&sy>=0&&sy<height)?(float)src[sy*width+sx]:0;
+     line=__fadd_rn(line,__fmul_rn(v,w[r*taps+k]));
+   }
+   value=chain?line:__fadd_rn(value,line);
  }
  value=fminf(65535.0f,fmaxf(0.0f,value));dst[i]=(unsigned short)__float2uint_rn(value);
 }
@@ -161,17 +176,14 @@ class CuPyCUDABackend:
                 ``_hot_ys``, ``_hot_xs``, ``_hot_valid``, ``_neighbor_count``).
             enabled: Whether dark/hot correction is applied.
             inverted: Flip the slit axis.
-            calibration: Smile calibration or ``None``; only horizontal
-                (spectral-axis) shifts with linear/cubic/nearest tables.
+            calibration: Smile calibration or ``None``; linear/cubic tables,
+                horizontal Smile or smile + keystone (fractional rows).
             snapshot: Also return the pre-Smile image.
             profiler: Object with ``time(name)`` context manager.
 
         Returns:
             tuple: ``(output, grabbed)`` host arrays owned by the caller
             (``grabbed`` is ``None`` unless ``snapshot``).
-
-        Raises:
-            ValueError: the Smile map has vertical (row) interpolation.
         """
         cp = self.cp
         with cp.cuda.Device(self.device_id), profiler.time('gpu_preprocess'):
@@ -276,23 +288,24 @@ class CuPyCUDABackend:
                 self._xy = cp.zeros((1, 2), dtype=cp.int16)
                 self._frac = cp.zeros(1, dtype=cp.uint16)
                 self._weights = cp.ones(1, dtype=cp.float32)
-                self._taps = 1
+                self._taps = self._vtaps = 1
             else:
                 _, _, xy, frac, _ = prepare_maps(calibration, inverted)
-                # Smile moves spectral columns only; no vertical interpolation.
-                if frac is not None and np.any(frac >> 5):
-                    raise ValueError('CuPy horizontal Smile requires integer row coordinates')
                 self._xy = cp.asarray(xy)
                 self._frac = cp.asarray(frac) if frac is not None else cp.zeros(1, dtype=cp.uint16)
-                table = horizontal_table(calibration.interp)
+                if moves_rows(frac):          # smile + keystone: 2-D taps
+                    table = remap_table(calibration.interp)
+                    self._taps = self._vtaps = int(round(table.shape[1] ** 0.5))
+                else:                         # horizontal Smile: integer rows, 1-D taps
+                    table = horizontal_table(calibration.interp)
+                    self._taps, self._vtaps = table.shape[1], 1
                 self._weights = cp.asarray(table)
-                self._taps = table.shape[1]
             self._map_ref = key
             self._calibration_ref = calibration
         h, w = frame.shape
         self._kernel(((frame.size + 255)//256,), (256,),
                      (corrected, self._output, self._xy, self._frac, self._weights,
-                      np.int32(frame.size), np.int32(w), np.int32(h), np.int32(self._taps),
+                      np.int32(frame.size), np.int32(w), np.int32(h), np.int32(self._taps), np.int32(self._vtaps),
                       np.int32(inverted), np.int32(identity)))
         timer.mark(4)
         return grabbed

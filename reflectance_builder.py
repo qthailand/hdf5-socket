@@ -74,10 +74,12 @@ def white_mean(source, plan, frames: slice | None = None, dark_cube=None, backen
                              "corrections.dark (auto or a file) for this recording")
         runtime = PreprocessingRuntime(backend)
         dark = plan.dark_processor(bool(steps.get('dark')))
-        smile = plan.smile_model if steps.get('smile') else None
+        from sim_config import geometry_model
+        smile = geometry_model(plan, steps)       # the Smile model, its smile-only view, or None
         for i in indices:                         # one frame at a time: no full stack in memory
             binned, _, _ = runtime.process_binned(np.ascontiguousarray(source.frames[i]), dark, plan.binner,
                                                   calibration=smile, inverted=bool(steps.get('flip')))
+            binned = binned[plan.slit_rows]       # keystone margin cropped, as the pipeline does
             total = binned.astype(np.float64) if total is None else total + binned
         mean = total / len(indices)
         wavelengths = plan.wavelengths
@@ -457,6 +459,8 @@ def ensure_white_profile(config, plan, name: str) -> tuple[Path | None, str]:
     lo, hi = 0, white.mean.shape[0]
     if crop:
         lo, hi = crop_rows_after_chain(crop[0], crop[1], crop[2], bool(white_plan.steps['flip']['on']))
+        top = white_plan.keystone_crop[0]            # rows of the cropped chain output
+        lo, hi = max(0, lo - top), min(white.mean.shape[0], hi - top)
     if wr.rows == 'auto':
         span = bright_span(white.mean[lo:hi].mean(axis=1), margin=2)
         rows = (lo + span[0], lo + span[1]) if span else ((lo, hi) if crop else None)

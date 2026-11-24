@@ -7,8 +7,9 @@ provider instead of being found on the first real frame.
 
 Data conventions:
     Small synthetic uint16 frames with a dark, hot pixels (corners, edges,
-    adjacent pairs), a horizontal cubic Smile that samples past both borders
-    and lambda bins of odd and even widths.  Tolerance is the runtime's: one
+    adjacent pairs), a horizontal cubic Smile that samples past both borders,
+    cubic and linear smile + keystone models (fractional rows) that also sample
+    past the top and bottom rows, and lambda bins of odd and even widths.  Tolerance is the runtime's: one
     count for corrected and binned images, exact pre-Smile Grab.
 """
 import numpy as np
@@ -41,14 +42,20 @@ class _HotPixels:
 
 
 class _Smile:
-    """Horizontal-only Smile model with integer rows."""
+    """Smile model: horizontal-only with integer rows, or smile + keystone.
 
-    def __init__(self, shape):
+    The keystone row map is fractional and moves rows by up to about 1.5 px, so
+    the first and last rows sample above row 0 and below the last row.
+    """
+
+    def __init__(self, shape, interp='cubic', keystone=False):
         self.image_shape = shape
-        self.interp = 'cubic'
+        self.interp = interp
         y, x = np.indices(shape, dtype=np.float32)
         self.map_x = np.ascontiguousarray(x + 2.3 * np.sin(y / 2 + x / 9) - 0.4, dtype=np.float32)
-        self._map_y = np.ascontiguousarray(y)
+        if keystone:
+            y = y + 1.3 * np.sin(x / 5 + y) + 0.15 * (y - (shape[0] - 1) / 2)
+        self._map_y = np.ascontiguousarray(y, dtype=np.float32)
 
     def _get_map_y(self):
         return self._map_y
@@ -107,7 +114,8 @@ def self_test(backend, cpu, profiler, zero_copy=False):
     hot = _HotPixels(dark, hot_map)
     bins = _Bins(_SHAPE[1])
     darks = (dark, None) if zero_copy else (dark,)    # no dark: hot pixels repaired from the input itself
-    for calibration in (None, _Smile(_SHAPE)):
+    models = (None, _Smile(_SHAPE), _Smile(_SHAPE, 'cubic', keystone=True), _Smile(_SHAPE, 'linear', keystone=True))
+    for calibration in models:
         for inverted in (False, True):
             for frame_dark in darks:
                 source = frame

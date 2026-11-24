@@ -9,16 +9,27 @@ package: a zip named ``*.hsipkg`` (often inside another ``.zip``) holding ``mani
 
     reflectance (159 bands) -> SNV per pixel -> band selection -> StandardScaler -> MLC
     reflectance (159 bands) -> Savitzky-Golay 1st derivative -> band selection -> StandardScaler -> MLC | SVM
+    reflectance (159 bands) -> [SNV | 1st derivative] -> band selection -> [PCA] -> StandardScaler -> MLC
+    reflectance (159 bands) -> [SNV | 1st derivative] -> band selection -> [PCA] -> StandardScaler -> SGD | PLS-DA
 
 What is read, and how it is kept honest:
 
 * ``manifest.json`` says which steps the package uses. Anything this reader does not implement
-  (another preprocessing step, PCA, spectral indices, resampling, another algorithm) is refused
-  by name; nothing is skipped silently.
-* The joblib files are pickles of ``hsi_lab_core`` objects (an SVM: of ``sklearn.svm.SVC``).
+  (another preprocessing step, spectral indices, resampling, another algorithm, PCA before an
+  SVM) is refused by name; nothing is skipped silently.
+* The joblib files are pickles of ``hsi_lab_core`` objects (an SVM: of ``sklearn.svm.SVC``; an
+  SGD: of ``sklearn.linear_model.SGDClassifier``; a PLS-DA: of ``sklearn.cross_decomposition.
+  PLSRegression`` inside ``hsi_lab_core``'s ``PLSDAClassifier``; a PCA: of ``spectral_pipeline.SafePCA``).
   They are read with a restricted unpickler: numpy arrays are loaded, ``hsi_lab_core`` classes
-  and ``SVC`` become plain attribute holders, every other global is refused. No code of the
-  package runs and neither ``hsi_lab_core`` nor ``sklearn`` is needed.
+  and those few sklearn / PCA classes become plain attribute holders, every other global is
+  refused. No code of the package runs and neither ``hsi_lab_core`` nor ``sklearn`` is needed.
+* An SGD or PLS-DA package is linear from the input bands on (PCA, scaler, the one-vs-rest
+  scores or the PLS regression are matrix products): ``inference_engine.HsiLinearClassifier``
+  folds it into one ``(bands, classes)`` matrix. A PCA's mean, the scaler's mean and variance of
+  the PCA scores are checked against the training reference and the PCA's own
+  ``explained_variance_``. A PLS-DA predicts one response per class (one-hot coded) and the class
+  is the largest response; its stored training scores give back the one-hot responses it was
+  fitted on, which are checked to be one-hot with the reference's class counts.
 * ``artifact_sha256`` of the manifest is checked for every file that is read.
 * ``training_spectral_reference.json`` (class means of the training spectra after the
   preprocessing) is the package's own evidence: the class means of the model must equal those
@@ -56,9 +67,24 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ALGORITHMS = ('MLC', 'SVM')
+SUPPORTED_ALGORITHMS = ('MLC', 'SVM', 'SGD', 'PLS-DA')
 # classes of other libraries a package may pickle, read as attribute holders like hsi_lab_core's
-_FOREIGN_HOLDERS = {('sklearn.svm._classes', 'SVC'), ('sklearn.svm.classes', 'SVC')}
+_SVM_HOLDERS = {('sklearn.svm._classes', 'SVC'), ('sklearn.svm.classes', 'SVC')}
+_SGD_HOLDERS = {('sklearn.linear_model._stochastic_gradient', 'SGDClassifier'),
+                ('sklearn.linear_model.stochastic_gradient', 'SGDClassifier')}
+_SGD_LOSS_HOLDERS = ({(module, name) for module in ('sklearn.linear_model._sgd_fast', 'sklearn.linear_model.sgd_fast')
+                      for name in ('Hinge', 'Log', 'LogLoss', 'ModifiedHuber', 'SquaredHinge')}
+                     # log_loss since sklearn 1.6: the Cython loss of sklearn._loss (its module reads '_loss')
+                     | {(module, 'CyHalfBinomialLoss') for module in ('_loss', 'sklearn._loss._loss')})
+_PCA_HOLDERS = {('spectral_pipeline', 'SafePCA'), ('sklearn.decomposition._pca', 'PCA')}
+_PLS_HOLDERS = {('sklearn.cross_decomposition._pls', 'PLSRegression'),
+                ('sklearn.cross_decomposition.pls_', 'PLSRegression')}
+_FOREIGN_HOLDERS = _SVM_HOLDERS | _SGD_HOLDERS | _SGD_LOSS_HOLDERS | _PCA_HOLDERS | _PLS_HOLDERS
+# the 'loss' of a PLS-DA LinearModel: its scores are regression responses (confidence = their softmax)
+PLS_RESPONSE = 'pls_response'
+_PLS_TOLERANCE = 1e-6                 # PLS coef_ vs its rotations / loadings, recovered one-hot responses
+# SGDClassifier losses whose decision is a class (the classifier runs every one the same way)
+_SGD_LOSSES = ('hinge', 'log_loss', 'log', 'modified_huber', 'squared_hinge', 'perceptron')
 _SCALER_TOLERANCE = 1e-8              # scaler mean / variance vs the ones the reference gives (relative)
 _GAMMA_TOLERANCE = 1e-8               # SVM gamma 'scale' vs the one the reference gives (relative)
 # preprocessing step lists of pipeline_audit this reader implements (in this order, nothing else)
@@ -110,6 +136,24 @@ class SvmModel:
 
 
 @dataclass
+class LinearModel:
+    """An ``sklearn.linear_model.SGDClassifier`` or a PLS-DA (float64, from the stored values).
+
+    Scores ``f @ coef.T + intercept`` of the (scaled) features ``f``; with more than two classes
+    (always for a PLS-DA) one row per class and the class with the largest score wins. An SGD
+    with two classes has one row: a score > 0 gives the second class, otherwise the first
+    (``SGDClassifier.predict``). For a PLS-DA the scores are ``PLSRegression.predict`` (the
+    regression's own centring folded into ``intercept``) and ``loss`` is ``PLS_RESPONSE``.
+    """
+    coef: np.ndarray                 # (K, F), or (1, F) with two classes
+    intercept: np.ndarray            # (K,), or (1,)
+    loss: str                        # what it was trained with ('hinge' has no probabilities)
+    components: int | None = None    # PLS-DA: latent components of the regression
+    fit_counts: np.ndarray | None = None   # PLS-DA: rows per class of the fit (from its one-hot responses)
+    fit_accuracy: float | None = None      # PLS-DA: share of the fitted rows the largest response gets right
+
+
+@dataclass
 class HsiPackage:
     """One trained model as plain arrays (float64, exactly as stored)."""
     path: str
@@ -142,12 +186,23 @@ class HsiPackage:
     svm: SvmModel | None = None      # the model of an SVM package (None for an MLC)
     scaler_var: np.ndarray | None = None      # (F,) variance the scaler was fitted with, if stored
     scaler_samples: float | None = None       # rows the scaler was fitted on, if stored
+    linear: LinearModel | None = None         # the model of an SGD package
+    # PCA between the selected bands and the scaler (not before an SVM): p = (x[selected] - pca_mean)
+    # @ pca_components.T, then the scaler works on p (scaler_mean / scaler_scale are then (P,))
+    pca_mean: np.ndarray | None = None        # (F,)
+    pca_components: np.ndarray | None = None  # (P, F)
+    pca_variance: np.ndarray | None = None    # (P,) explained_variance_ (sample variance of the scores), if stored
+    pca_samples: float | None = None          # rows the PCA was fitted on, if stored
 
     @property
     def model_text(self) -> str:
         if self.svm is not None:
             return (f"SVM {self.classes.size} classes (RBF, {self.svm.support_vectors.shape[0]} support vectors, "
                     "one-vs-one vote)")
+        if self.linear is not None and self.linear.loss == PLS_RESPONSE:
+            return f"PLS-DA {self.classes.size} classes ({self.linear.components} components, largest response)"
+        if self.linear is not None:
+            return f"SGD {self.classes.size} classes (linear, loss {self.linear.loss})"
         return f"{self.algorithm} {self.classes.size} classes"
 
     @property
@@ -160,6 +215,8 @@ class HsiPackage:
             steps.append(f"1st derivative (Savitzky-Golay {p['window']}/{p['polyorder']})")
         if self.selected.size != self.wavelengths.size:
             steps.append(f"{self.selected.size} bands")
+        if self.pca_components is not None:
+            steps.append(f"PCA {self.pca_components.shape[0]}")
         steps += ['StandardScaler', self.model_text]
         return ' -> '.join(steps)
 
@@ -197,7 +254,7 @@ def load_package(path) -> HsiPackage:
         manifest = json.loads(files['manifest.json'].decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{path.name}: manifest.json is not readable JSON ({exc})") from exc
-    checks = [_check_sha256(path, manifest, files, ('model.joblib', 'scaler.joblib',
+    checks = [_check_sha256(path, manifest, files, ('model.joblib', 'scaler.joblib', 'pca.joblib',
                                                     'training_spectral_reference.json'))]
 
     algorithm = str(manifest.get('algorithm'))
@@ -208,12 +265,23 @@ def load_package(path) -> HsiPackage:
     derivative = None if not derivative_parameters else savgol_derivative_matrix(
         wavelengths.size, derivative_parameters['window'], derivative_parameters['polyorder'],
         derivative_parameters['delta'])
-    scaler_mean, scaler_scale, scaler_var, scaler_samples = _scaler(path, manifest, files, selected.size)
-    svm = means = covariances = priors = None
+    pca_mean = pca_components = pca_variance = pca_samples = None
+    if (manifest.get('pipeline_audit') or {}).get('pca') is not None:
+        if algorithm == 'SVM':                  # its gamma check needs the band features
+            raise ValueError(f"{path.name}: the package uses pca before an SVM, which this reader does not "
+                             "implement (pca before an MLC, SGD or PLS-DA model)")
+        pca_mean, pca_components, pca_variance, pca_samples = _pca(path, manifest, files, selected.size)
+    n_scaled = selected.size if pca_components is None else pca_components.shape[0]
+    scaler_mean, scaler_scale, scaler_var, scaler_samples = _scaler(path, manifest, files, n_scaled)
+    svm = means = covariances = priors = linear = None
     if algorithm == 'SVM':
-        classes, svm = _svm(path, files, selected.size)
+        classes, svm = _svm(path, files, n_scaled)
+    elif algorithm == 'SGD':
+        classes, linear = _sgd(path, files, n_scaled)
+    elif algorithm == 'PLS-DA':
+        classes, linear = _plsda(path, files, n_scaled)
     else:
-        classes, means, covariances, priors = _mlc(path, files, selected.size)
+        classes, means, covariances, priors = _mlc(path, files, n_scaled)
 
     labels = [str(name) for name in manifest.get('labels', [])]
     if len(labels) != classes.size or not np.array_equal(classes, np.arange(classes.size)):
@@ -241,7 +309,8 @@ def load_package(path) -> HsiPackage:
         input_units=input_units, metric=_metric_text(manifest), exported_at=str(manifest.get('exported_at', '?')),
         lab_core_version=str(manifest.get('hsi_lab_core_version', '?')), checks=checks,
         derivative=derivative, derivative_parameters=derivative_parameters, svm=svm, scaler_var=scaler_var,
-        scaler_samples=scaler_samples)
+        scaler_samples=scaler_samples, linear=linear, pca_mean=pca_mean, pca_components=pca_components,
+        pca_variance=pca_variance, pca_samples=pca_samples)
     checks.append(_check_reference(path, package, files.get('training_spectral_reference.json')))
     package.training = _training_spectra(package, files.get('training_spectral_reference.json'))
     logger.info("Model package loaded\n%s", package.describe())
@@ -283,7 +352,7 @@ def _size_ok(info: zipfile.ZipInfo, where: str) -> None:
 
 
 def _members(package: zipfile.ZipFile, where: str) -> dict:
-    wanted = ('manifest.json', 'model.joblib', 'scaler.joblib', 'training_spectral_reference.json')
+    wanted = ('manifest.json', 'model.joblib', 'scaler.joblib', 'training_spectral_reference.json', 'pca.joblib')
     files = {}
     for name in wanted:
         if name in package.namelist():
@@ -385,7 +454,8 @@ def _restricted_unpickler():
             if module == 'hsi_lab_core' or module.startswith('hsi_lab_core.') or (module, name) in _FOREIGN_HOLDERS:
                 return type(name, (_Holder,), {'__module__': module})
             raise pickle.UnpicklingError(f"refused {module}.{name}: a model package may hold numpy arrays, "
-                                         "hsi_lab_core objects and sklearn SVC only")
+                                         "hsi_lab_core objects and the sklearn SVC / SGDClassifier / "
+                                         "PLSRegression / PCA this reader runs only")
 
     return RestrictedUnpickler
 
@@ -508,7 +578,7 @@ def _feature_chain(path: Path, manifest: dict) -> tuple:
         raise ValueError(f"{path.name}: preprocessing {list(steps)} is not supported (this reader implements "
                          f"{' or '.join(str(list(chain)) for chain in _SUPPORTED_CHAINS)}); the model cannot "
                          "be run faithfully")
-    for key in ('pca', 'spectral_indices', 'spectral_index_selection', 'spectral_index_discovery'):
+    for key in ('spectral_indices', 'spectral_index_selection', 'spectral_index_discovery'):   # pca: load_package
         if audit.get(key) is not None:
             raise ValueError(f"{path.name}: the package uses {key}, which this reader does not implement")
 
@@ -554,6 +624,10 @@ def _scaler(path: Path, manifest: dict, files: dict, n_features: int) -> tuple:
         return np.zeros(n_features), np.ones(n_features), None, None
     if final.get('type') != 'StandardScaler':
         raise ValueError(f"{path.name}: final scaler {final.get('type')!r} is not supported (StandardScaler is)")
+    stated = final.get('input_features')
+    if stated is not None and stated != n_features:       # e.g. a scaler before the PCA, not after it
+        raise ValueError(f"{path.name}: the final scaler takes {stated} features, the package's chain gives "
+                         f"{n_features} at that point")
     if 'scaler.joblib' not in files:
         raise ValueError(f"{path.name}: the manifest names a StandardScaler but scaler.joblib is missing")
     what = f"{path.name}/scaler.joblib"
@@ -616,7 +690,7 @@ def _svm(path: Path, files: dict, n_features: int) -> tuple:
     what = f"{path.name}/model.joblib"
     holder = _load_joblib(files['model.joblib'], what)
     kind = f"{type(holder).__module__}.{type(holder).__name__}"
-    if (type(holder).__module__, type(holder).__name__) not in _FOREIGN_HOLDERS:
+    if (type(holder).__module__, type(holder).__name__) not in _SVM_HOLDERS:
         raise ValueError(f"{what}: holds a {kind}; an SVM package must hold sklearn.svm.SVC")
     settings = {name: getattr(holder, name, None) for name in ('kernel', '_sparse', 'break_ties',
                                                                'decision_function_shape', 'fit_status_')}
@@ -665,6 +739,147 @@ def _svm(path: Path, files: dict, n_features: int) -> tuple:
                      intercept=intercept, gamma=gamma, gamma_setting=getattr(holder, 'gamma', None),
                      prob_a=prob_a, prob_b=prob_b)
     return classes.astype(np.int64), model
+
+
+def _pca(path: Path, manifest: dict, files: dict, n_features: int) -> tuple:
+    """``(mean (F,), components (P, F))`` of the package's PCA (read as attributes, never run)."""
+    spec = manifest['pipeline_audit']['pca']
+    if not isinstance(spec, dict) or spec.get('type', 'PCA') != 'PCA':
+        raise ValueError(f"{path.name}: pca {spec!r} is not supported (a PCA is)")
+    if spec.get('whiten'):
+        raise ValueError(f"{path.name}: a whitened pca is not supported")
+    stated = spec.get('input_features')
+    if stated is not None and stated != n_features:
+        raise ValueError(f"{path.name}: the pca takes {stated} features, the package's chain gives {n_features}")
+    if 'pca.joblib' not in files:
+        raise ValueError(f"{path.name}: the manifest names a pca but pca.joblib is missing")
+    what = f"{path.name}/pca.joblib"
+    holder = _load_joblib(files['pca.joblib'], what)
+    kind = (type(holder).__module__, type(holder).__name__)
+    if kind not in _PCA_HOLDERS and not (kind[0].startswith('hsi_lab_core') and kind[1] in ('SafePCA', 'PCA')):
+        raise ValueError(f"{what}: holds a {'.'.join(kind)}, not a PCA")
+    if getattr(holder, 'whiten', False):
+        raise ValueError(f"{what}: a whitened pca is not supported")
+    components = _array(holder, 'components_', what)
+    if components.ndim != 2 or components.shape[1] != n_features or not 1 <= components.shape[0] <= n_features:
+        raise ValueError(f"{what}: components_ has shape {components.shape}, expected (n <= {n_features}, "
+                         f"{n_features})")
+    wanted = spec.get('n_components')
+    if wanted is not None and wanted != components.shape[0]:
+        raise ValueError(f"{what}: {components.shape[0]} components, the manifest says {wanted}")
+    variance = samples = None                       # only for the check against the training reference
+    if getattr(holder, 'explained_variance_', None) is not None:
+        variance = _array(holder, 'explained_variance_', what, (components.shape[0],))
+        seen = np.asarray(getattr(holder, 'n_samples_', np.nan), dtype=np.float64)
+        samples = float(seen) if seen.ndim == 0 and np.isfinite(seen) and seen > 1 else None
+    return _array(holder, 'mean_', what, (n_features,)), components, variance, samples
+
+
+def _sgd(path: Path, files: dict, n_features: int) -> tuple:
+    """``(classes, LinearModel)`` of a pickled ``sklearn.linear_model.SGDClassifier`` (never run)."""
+    if 'model.joblib' not in files:
+        raise ValueError(f"{path.name}: model.joblib is missing")
+    what = f"{path.name}/model.joblib"
+    holder = _load_joblib(files['model.joblib'], what)
+    kind = (type(holder).__module__, type(holder).__name__)
+    if kind not in _SGD_HOLDERS:
+        raise ValueError(f"{what}: holds a {'.'.join(kind)}; an SGD package must hold "
+                         "sklearn.linear_model.SGDClassifier")
+    loss = getattr(holder, 'loss', None)
+    if loss not in _SGD_LOSSES:
+        raise ValueError(f"{what}: loss {loss!r} is not a classification loss of SGDClassifier")
+    classes = np.asarray(getattr(holder, 'classes_', []))
+    if classes.ndim != 1 or classes.size < 2 or classes.dtype.kind not in 'iu':
+        raise ValueError(f"{what}: classes_ {classes!r} is not a list of at least two integer class ids")
+    n_in = getattr(holder, 'n_features_in_', n_features)
+    if n_in != n_features:
+        raise ValueError(f"{what}: the SGDClassifier takes {n_in} features, the package's chain gives {n_features}")
+    rows = 1 if classes.size == 2 else classes.size
+    coef = _array(holder, 'coef_', what, (rows, n_features))
+    intercept = _array(holder, 'intercept_', what, (rows,))
+    return classes.astype(np.int64), LinearModel(coef=coef, intercept=intercept, loss=str(loss))
+
+
+def _plsda(path: Path, files: dict, n_features: int) -> tuple:
+    """``(classes, LinearModel)`` of ``hsi_lab_core``'s ``PLSDAClassifier`` around a pickled
+    ``sklearn.cross_decomposition.PLSRegression`` (read as attributes, never run).
+
+    ``PLSRegression.predict`` is ``(f - x_mean) @ coef.T + intercept`` (sklearn >= 1.1: ``coef_``
+    already divided by the X standard deviation); the class is the largest response. Checked:
+    ``coef_`` is the one the regression's rotations and loadings give, and the training scores
+    it stores give back responses that are one-hot (one column per class, in class order).
+    """
+    if 'model.joblib' not in files:
+        raise ValueError(f"{path.name}: model.joblib is missing")
+    what = f"{path.name}/model.joblib"
+    holder = _load_joblib(files['model.joblib'], what)
+    kind = (type(holder).__module__, type(holder).__name__)
+    if kind[1] != 'PLSDAClassifier' or not kind[0].startswith('hsi_lab_core'):
+        raise ValueError(f"{what}: holds a {'.'.join(kind)}; a PLS-DA package must hold PLSDAClassifier")
+    pls = getattr(holder, 'model_', None)
+    if pls is None or (type(pls).__module__, type(pls).__name__) not in _PLS_HOLDERS:
+        raise ValueError(f"{what}: the PLSDAClassifier holds no sklearn PLSRegression (model_)")
+    classes = np.asarray(getattr(holder, 'classes_', []))
+    if classes.ndim != 1 or classes.size < 2 or classes.dtype.kind not in 'iu':
+        raise ValueError(f"{what}: classes_ {classes!r} is not a list of at least two integer class ids")
+    k = classes.size
+    n_in = getattr(pls, 'n_features_in_', n_features)
+    if n_in != n_features:
+        raise ValueError(f"{what}: the PLSRegression takes {n_in} features, the package's chain gives {n_features}")
+    if getattr(pls, '_predict_1d', False):
+        raise ValueError(f"{what}: a PLSRegression with one response is not a PLS-DA of {k} classes")
+    coef = _array(pls, 'coef_', what, (k, n_features))
+    intercept = _array(pls, 'intercept_', what, (k,))
+    x_mean = _array(pls, '_x_mean', what, (n_features,))
+    x_std = _array(pls, '_x_std', what, (n_features,))
+    y_mean = _array(pls, '_y_mean', what, (k,))
+    y_std = _array(pls, '_y_std', what, (k,))
+    rotations = _array(pls, 'x_rotations_', what)
+    if rotations.ndim != 2 or rotations.shape[0] != n_features or rotations.shape[1] < 1:
+        raise ValueError(f"{what}: x_rotations_ has shape {rotations.shape}, expected ({n_features}, n)")
+    components = rotations.shape[1]
+    loadings = _array(pls, 'y_loadings_', what, (k, components))
+    if np.any(x_std <= 0) or np.any(y_std <= 0):
+        raise ValueError(f"{what}: a standard deviation of the PLS regression is <= 0")
+    if not np.allclose(intercept, y_mean, rtol=0, atol=1e-12):
+        raise ValueError(f"{what}: intercept_ is not the response mean (a PLSRegression of another sklearn version)")
+    expected = (rotations @ loadings.T * y_std).T / x_std
+    error = float(np.abs(coef - expected).max() / max(np.abs(expected).max(), 1e-300))
+    if not error <= _PLS_TOLERANCE:
+        raise ValueError(f"{what}: coef_ is not the one its rotations and loadings give (relative difference "
+                         f"{error:.3g}): not the PLSRegression.predict implemented here")
+    counts = accuracy = None
+    x_name = next((n for n in ('_x_scores', 'x_scores_') if getattr(pls, n, None) is not None), None)
+    y_name = next((n for n in ('_y_scores', 'y_scores_') if getattr(pls, n, None) is not None), None)
+    if x_name and y_name and getattr(pls, 'y_weights_', None) is not None \
+            and getattr(pls, 'deflation_mode', 'regression') == 'regression' \
+            and not getattr(pls, '_norm_y_weights', False):
+        x_scores, y_scores = _array(pls, x_name, what), _array(pls, y_name, what)
+        weights = _array(pls, 'y_weights_', what, (k, components))
+        if x_scores.shape != y_scores.shape or x_scores.ndim != 2 or x_scores.shape[1] != components:
+            raise ValueError(f"{what}: the stored training scores {x_scores.shape} / {y_scores.shape} do not fit "
+                             f"{components} components")
+        # NIPALS, regression deflation: Y_i = Y_0 - sum_{j<i} t_j q_j^T and u_i = Y_i c_i / |c_i|^2, so
+        # Y_0 c_i = u_i |c_i|^2 + sum_{j<i} t_j (q_j . c_i). Every c_i lies in the row space of Y_0:
+        # the least-norm solution gives Y_0 back whenever the c_i span it.
+        projected = np.empty_like(y_scores)
+        for i in range(components):
+            c = weights[:, i]
+            projected[:, i] = y_scores[:, i] * (c @ c) + x_scores[:, :i] @ (loadings[:, :i].T @ c)
+        responses = np.linalg.lstsq(weights.T, projected.T, rcond=None)[0].T * y_std + y_mean     # (n, K)
+        hot = np.rint(responses)
+        if np.abs(responses - hot).max() <= _PLS_TOLERANCE and np.all((hot == 0) | (hot == 1)) \
+                and np.all(hot.sum(axis=1) == 1):
+            truth = hot.argmax(axis=1)
+            counts = np.bincount(truth, minlength=k).astype(np.float64)
+            fitted = x_scores @ (loadings.T * y_std) + y_mean       # PLSRegression.predict of the training rows
+            accuracy = float(np.mean(fitted.argmax(axis=1) == truth))
+        elif np.linalg.matrix_rank(weights) >= k - 1:               # the c_i span every one-hot coding
+            raise ValueError(f"{what}: the responses the PLS regression was fitted on are not one-hot per class: "
+                             "not the PLS-DA implemented here (largest response = class)")
+    return classes.astype(np.int64), LinearModel(
+        coef=coef, intercept=intercept - x_mean @ coef.T, loss=PLS_RESPONSE, components=components,
+        fit_counts=counts, fit_accuracy=accuracy)
 
 
 def _hex_rgb(text) -> list | None:
@@ -730,7 +945,10 @@ def _check_reference(path: Path, package: HsiPackage, blob: bytes | None) -> str
                     f"the population SD (sum of mean {mean.sum():.3g}, sum of squares {total:.2f}): the "
                     "package's preprocessing is not the one this reader implements")
         if package.means is not None:
-            scaled = (mean[package.selected] - package.scaler_mean) / package.scaler_scale
+            features = mean[package.selected]
+            if package.pca_components is not None:
+                features = (features - package.pca_mean) @ package.pca_components.T
+            scaled = (features - package.scaler_mean) / package.scaler_scale
             worst = max(worst, float(np.abs(scaled - package.means[k]).max()))
     if worst > _MEAN_TOLERANCE:
         raise ValueError(
@@ -738,7 +956,27 @@ def _check_reference(path: Path, package: HsiPackage, blob: bytes | None) -> str
             "after this reader's band selection and scaler: the package's chain is not the one implemented here")
     scaler = _check_scaler(path, package, rows, counts)
     text = "training reference ok: " + (f"class means reproduced to {worst:.1e}, " if package.means is not None else "")
-    return (text + scaler + (", SNV = population SD over all bands" if package.snv else "") + derived)
+    return (text + scaler + (", SNV = population SD over all bands" if package.snv else "") + derived
+            + _check_pls_counts(path, package, counts))
+
+
+def _check_pls_counts(path: Path, package: HsiPackage, counts: dict) -> str:
+    """A PLS-DA's one-hot responses must count the reference's spectra of every class."""
+    linear = package.linear
+    if linear is None or linear.loss != PLS_RESPONSE:
+        return ''
+    if linear.fit_counts is None:
+        return ", PLS-DA responses NOT verified (the regression stores no training scores)"
+    try:
+        n = np.array([float(counts[int(cid)]) for cid in package.classes])
+    except (KeyError, TypeError, ValueError):
+        return ", PLS-DA responses one-hot (class counts NOT verified: the reference has none)"
+    if not np.array_equal(n, linear.fit_counts):
+        raise ValueError(f"{path.name}: the PLS-DA was fitted on {linear.fit_counts.astype(int).tolist()} rows per "
+                         f"class, the training reference counts {n.astype(int).tolist()}: its responses are not the "
+                         "classes in the package's order")
+    return (f", PLS-DA responses one-hot with the reference's class counts, largest response right on "
+            f"{linear.fit_accuracy:.4f} of its training rows")
 
 
 def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str:
@@ -749,6 +987,8 @@ def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> 
     those rows (on the selected bands) are what the StandardScaler stored. A gamma of 'scale' is
     ``1 / (features x variance of all scaled training values)`` (sklearn), which follows from them.
     """
+    if package.pca_components is not None:
+        return _check_pca(path, package, rows, counts)
     unverified = "scaler NOT verified" + (" (nor the SVM)" if package.svm is not None else "")
     if package.scaler_var is None or package.scaler_samples is None:
         return f"{unverified}: the scaler stores no variance / sample count"
@@ -795,6 +1035,46 @@ def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> 
                          f"{expected:.10g} of the package's training reference: its features are not the ones "
                          "implemented here")
     return text + f", SVM gamma {svm.gamma_setting!r} = {svm.gamma:.6g} reproduced to {error:.1e}"
+
+
+def _check_pca(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str:
+    """The PCA's mean, and the scaler's mean of the PCA scores, from the reference's per-class
+    count and mean (both were fitted on the rows the reference covers).
+
+    The variance of the scores is not in the reference (it would need the spectra's covariances),
+    but the PCA stores it: ``explained_variance_`` is their sample variance, so the scaler fitted
+    on the same rows holds it times ``(n - 1) / n``.
+    """
+    unverified = "PCA and scaler NOT verified"
+    try:
+        n = np.array([float(counts[int(cid)]) for cid in package.classes])
+    except (KeyError, TypeError, ValueError):
+        return f"{unverified}: the reference has no spectrum count per class"
+    if not np.all(np.isfinite(n)) or np.any(n < 1):
+        return f"{unverified}: the reference has no spectrum count per class"
+    means = np.array([rows[int(cid)][0][package.selected] for cid in package.classes])
+    pooled = (n[:, None] * means).sum(axis=0) / n.sum()
+    pca_error = float(np.abs(pooled - package.pca_mean).max() / max(np.abs(package.pca_mean).max(), 1e-300))
+    projected = (pooled - package.pca_mean) @ package.pca_components.T
+    scaler_error = float(np.abs(projected - package.scaler_mean).max()
+                         / max(np.abs(package.scaler_mean).max(), package.scaler_scale.min(), 1e-300))
+    if not (pca_error <= _SCALER_TOLERANCE and scaler_error <= _SCALER_TOLERANCE):
+        raise ValueError(
+            f"{path.name}: the PCA mean / the scaler mean of the PCA scores differ from those of the package's "
+            f"training reference by {pca_error:.3g} / {scaler_error:.3g} (relative): the package's chain is not the "
+            "one implemented here")
+    text = f"PCA mean and scaler mean reproduced to {max(pca_error, scaler_error):.1e}"
+    m = package.pca_samples
+    if package.pca_variance is None or m is None or package.scaler_var is None:
+        return text + ", scaler variance NOT verified (the PCA or the scaler stores no variance / sample count)"
+    if abs(m - n.sum()) > 0.5 or (package.scaler_samples is not None and abs(package.scaler_samples - m) > 0.5):
+        return (text + f", scaler variance NOT verified (PCA fitted on {m:g} rows, scaler on "
+                       f"{package.scaler_samples}, reference {n.sum():g})")
+    var_error = float(np.abs(package.scaler_var / (package.pca_variance * (m - 1.0) / m) - 1.0).max())
+    if not var_error <= _SCALER_TOLERANCE:
+        raise ValueError(f"{path.name}: the scaler's variance is not the PCA scores' variance (relative difference "
+                         f"{var_error:.3g}): the scaler does not follow the PCA as implemented here")
+    return text + f", scaler variance = PCA variance to {var_error:.1e}"
 
 
 def _check_derivative(path: Path, package: HsiPackage, blob: bytes, preprocessed: dict) -> str:

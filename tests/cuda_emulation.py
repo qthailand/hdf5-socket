@@ -148,7 +148,7 @@ def _device(array):
     return np.array(array, copy=True).view(DeviceArray)
 
 
-def _remap16(src, dst, xy, frac, weights, n, width, height, taps, inverted, identity):
+def _remap16(src, dst, xy, frac, weights, n, width, height, taps, vtaps, inverted, identity):
     src, out = src.view(np.ndarray).ravel(), dst.view(np.ndarray).reshape(-1)
     rows, cols = np.divmod(np.arange(int(n)), int(width))
     if identity:
@@ -156,14 +156,26 @@ def _remap16(src, dst, xy, frac, weights, n, width, height, taps, inverted, iden
         return
     pairs = xy.view(np.ndarray).reshape(-1, 2).astype(np.int64)
     x, y = pairs[:, 0], pairs[:, 1]
-    f = frac.view(np.ndarray).ravel() & 31
-    table = weights.view(np.ndarray).reshape(-1, int(taps))
+    taps, vtaps = int(taps), int(vtaps)
+    if taps == 1:
+        inside = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+        out[:] = np.where(inside, src[np.clip(y, 0, height - 1) * width + np.clip(x, 0, width - 1)], 0)
+        return
+    f = frac.view(np.ndarray).ravel() & (31 if vtaps == 1 else 1023)
+    table = weights.view(np.ndarray).reshape(-1, vtaps * taps)
+    x0, y0 = x - (1 if taps == 4 else 0), y - (1 if vtaps == 4 else 0)
+    # the kernel's order: interior cubic sums each tap row, then the rows; linear and border cubic one chain
+    chain = (taps == 2) | (x0 < 0) | (x0 + taps > width) | (y0 < 0) | (y0 + vtaps > height)
     value = np.zeros(int(n), np.float32)
-    for k in range(int(taps)):
-        sx = x + k - (1 if taps == 4 else 0)
-        inside = (sx >= 0) & (sx < width) & (y >= 0) & (y < height)
-        v = np.where(inside, src[np.clip(y, 0, height - 1) * width + np.clip(sx, 0, width - 1)], 0).astype(np.float32)
-        value = (value + v * table[f, k]).astype(np.float32)
+    for r in range(vtaps):
+        sy = y0 + r
+        line = np.where(chain, value, np.float32(0)).astype(np.float32)
+        for k in range(taps):
+            sx = x0 + k
+            inside = (sx >= 0) & (sx < width) & (sy >= 0) & (sy < height)
+            v = np.where(inside, src[np.clip(sy, 0, height - 1) * width + np.clip(sx, 0, width - 1)], 0).astype(np.float32)
+            line = (line + v * table[f, r * taps + k]).astype(np.float32)
+        value = np.where(chain, line, value + line).astype(np.float32)
     out[:] = np.rint(np.clip(value, 0, 65535)).astype(np.uint16)
 
 

@@ -14,8 +14,9 @@ the class colours are set here, because they are data, not theme.
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QScrollArea,
-    QGridLayout, QPushButton, QColorDialog, QCheckBox
+    QGridLayout, QPushButton, QCheckBox
 )
+from utils import pick_color
 from PyQt5.QtGui import QColor
 from PyQt5.QtCore import Qt, pyqtSignal
 import numpy as np
@@ -216,8 +217,7 @@ class ClassLegendWidget(QWidget):
         current_rgb = self._current_lut[class_id]
         initial_color = QColor(current_rgb[0], current_rgb[1], current_rgb[2])
 
-        selected_color = QColorDialog.getColor(
-            initial_color, self, f"Select Color for Class ID {class_id}")
+        selected_color = pick_color(initial_color, self, f"Select Color for Class ID {class_id}")
         if selected_color.isValid():
             new_rgb = [selected_color.red(), selected_color.green(), selected_color.blue()]
             self._current_lut[class_id] = new_rgb

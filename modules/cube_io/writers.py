@@ -65,20 +65,43 @@ COUNT_HEADER_FIELDS = (
 #: written when present in ``config``: ``(config key, header field, kind)``.  ``bool`` fields are
 #: written ``1``/``0``; a missing key means unknown (e.g. a cube opened from a file without it).
 SCAN_HEADER_FIELDS = (
+    ('camera_backend', 'camera backend', str),
     ('camera_model', 'camera model', str),
     ('camera_serial', 'camera serial number', str),
+    ('raw_inverted', 'raw frames inverted', bool),
+    ('sensor_pixel_pitch_um', 'sensor pixel pitch (um, bin 1)', float),
     ('exposure_ms', 'exposure time (ms)', float),
     ('gain', 'sensor gain', float),
-    ('frame_rate_hz', 'frame rate (Hz)', float),
+    ('frame_rate_hz', 'frame rate (Hz)', float),      # what the camera reports (AcquisitionFrameRate)
+    # what the recording reached: (lines - 1) / (time of the last - first line); below the
+    # camera's rate when frames were lost before the recorder
+    ('line_rate_hz', 'line rate measured (Hz)', float),
+    ('line_rate_source', 'line rate source', str),    # 'camera timestamps' or 'host time'
+    ('frames_missing', 'frames missing (estimated)', int),      # camera timestamps only
     ('camera_bin', 'camera bin', int),
+    ('resolution_nm', 'spectral bin width (nm)', float),
     ('dark_corrected', 'dark corrected', bool),
     ('hot_pixel_corrected', 'hot pixel corrected', bool),
     ('hot_pixel_count', 'hot pixel count', int),
     ('dark_file', 'dark reference', str),          # its temperature: 'dark temperature' above
     ('dark_frames', 'dark reference frames', int),
+    # when that dark was captured ('modified <time>' for an older file): with the file name it
+    # identifies the frame, since a new capture replaces the file (the old one goes to history/)
+    ('dark_captured', 'dark reference captured', str),
+    ('dark_light_leak', 'dark reference light leak', str),     # spectral lines found in the dark
     ('smile_corrected', 'smile corrected', bool),
     ('smile_model', 'smile model', str),
     ('smile_model_created', 'smile model created', str),
+    # '[k0, k1, n_full]': bins kept of the full grid; the others touch the Smile border columns
+    # (zero-filled at the slit ends). Absent = every bin kept.
+    ('smile_border_bands', 'smile border bands kept', str),
+    # smile + keystone model (modules.smile.keystone): rows moved along the slit too; only
+    # written when on (absent = no keystone, as in files from before keystone existed)
+    ('keystone_corrected', 'keystone corrected', bool),
+    ('keystone_row_margin', 'keystone row margin top bottom (px)', str),   # '[top, bottom]', informational
+    # what an export did with those rows: 'NaN' (float cube, rows kept) or
+    # 'cropped (first line = slit row N)' (rows removed; other row numbers stay sensor rows)
+    ('keystone_margin_rows', 'keystone margin rows', str),
     ('wavelength_source', 'wavelength calibration source', str),
     ('wavelength_profile', 'wavelength calibration', str),
     ('wavelength_profile_saved', 'wavelength calibration saved', str),
@@ -88,12 +111,28 @@ SCAN_HEADER_FIELDS = (
     ('reflectance_reference', 'reflectance reference', str),
     ('reflectance_reference_cube', 'reflectance reference cube', str),
     ('reflectance_reference_rows', 'reflectance reference rows', str),
+    # automatic calibration with a stored reference (modules.radiometric.auto)
+    ('reflectance_reference_mode', 'reflectance reference mode', str),
+    ('reflectance_reference_scanned', 'reflectance reference scanned', str),
+    ('reflectance_reference_age_h', 'reflectance reference age (h)', float),
+    ('reflectance_reference_delta_t_c', 'reflectance reference temperature difference (C)', float),
+    ('reflectance_reference_roi', 'reflectance reference roi', str),
+    # flat-field applied on its own (counts evened along the slit, no reflectance): the profile id
+    # and how ('frame by frame'); absent = not applied on its own (a reflectance cube holds it in
+    # its reference's factors when that reference was made with a profile)
+    ('flatfield_profile', 'flat-field profile', str),
+    ('flatfield_mode', 'flat-field mode', str),
     ('calibration_warnings', 'calibration warnings', str),
     ('stage_type', 'stage type', str),
     ('speed_um_s', 'linear speed (um/s)', float),
     ('speed_um_s_achieved', 'linear speed achieved (um/s)', float),
+    # linear stage only: stage speed / measured line rate = the along-track size of a line
+    ('along_track_step_um', 'along-track step (um/line)', float),
     ('degree_per_second', 'rotation speed (deg/s)', float),
     ('degree_per_second_achieved', 'rotation speed achieved (deg/s)', float),
+    # stage type "free" (no stage): the time set, and the time recorded (shorter after a Stop)
+    ('duration_s', 'free scan time set (s)', float),
+    ('duration_s_recorded', 'free scan time recorded (s)', float),
 )
 
 
@@ -215,6 +254,51 @@ def acquisition_time_utc(config):
     return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def keystone_row_margin(config) -> tuple:
+    """``(top, bottom)`` keystone row margin from ``config['keystone_row_margin']`` (list, tuple or
+    the header text ``'[15, 5]'``); ``(0, 0)`` when absent or unreadable."""
+    value = (config or {}).get('keystone_row_margin')
+    if value is None:
+        return (0, 0)
+    if isinstance(value, str):
+        value = [v for v in value.replace('[', ' ').replace(']', ' ').replace(',', ' ').split() if v]
+    try:
+        top, bottom = (max(0, int(float(v))) for v in value)
+    except (TypeError, ValueError):
+        return (0, 0)
+    return (top, bottom)
+
+
+def margin_plan(config, dtype, lines: int, crop: bool = False) -> dict:
+    """How an export treats the keystone margin rows (rows the keystone remap filled from
+    outside the sensor: 0 in some bands).
+
+    Returns:
+        dict: ``mode`` (``"keep"``, ``"nan"`` or ``"crop"``), ``top`` / ``bottom`` (rows),
+        ``rows`` (``slice`` of the slit lines written) and ``note`` (header value, or ``None``).
+        ``crop``: remove them; otherwise a float cube gets NaN there and an integer one is kept.
+    """
+    top, bottom = keystone_row_margin(config)
+    if str((config or {}).get('keystone_margin_rows', '')).startswith('cropped'):
+        top = bottom = 0                                  # already left out (at acquisition or an earlier export)
+    if top + bottom <= 0 or top + bottom >= lines:
+        return dict(mode='keep', top=0, bottom=0, rows=slice(0, lines), note=None)
+    if crop:
+        return dict(mode='crop', top=top, bottom=bottom, rows=slice(top, lines - bottom),
+                    note=f'cropped (first line = slit row {top})')
+    if np.dtype(dtype).kind == 'f':
+        return dict(mode='nan', top=top, bottom=bottom, rows=slice(0, lines), note='NaN')
+    return dict(mode='keep', top=top, bottom=bottom, rows=slice(0, lines), note=None)
+
+
+def _with_note(config, plan):
+    """``config`` plus the ``keystone_margin_rows`` note of ``plan`` (a copy; ``config`` unchanged)."""
+    out = dict(config or {})
+    if plan['note']:
+        out['keystone_margin_rows'] = plan['note']
+    return out
+
+
 class GeoTIFFWriter:
     """Write a band-first cube as a tiled, LZW-compressed multi-band GeoTIFF.
 
@@ -222,17 +306,20 @@ class GeoTIFFWriter:
     kept.  Requires ``rasterio`` (imported when constructing).
     """
 
-    def __init__(self, *, save_path: str, config: dict, hypercube: np.ndarray, linear_spectrum: np.ndarray, camera_bin: int = 1, progress=None):
+    def __init__(self, *, save_path: str, config: dict, hypercube: np.ndarray, linear_spectrum: np.ndarray, camera_bin: int = 1, progress=None,
+                 crop_margin: bool = False):
         """Prepare the GeoTIFF profile (no file is written yet).
 
         Args:
             save_path: Output ``.tif`` path.
-            config: Export settings (unused; accepted for API symmetry).
+            config: Export settings; only ``keystone_row_margin`` is used (see :func:`margin_plan`).
             hypercube: Band-first ``(wavelength, slit, scan)`` array; kept
                 by reference, not copied.  Written in its own dtype (native byte order).
             linear_spectrum: 1-D band wavelengths (nm), one per band.
             camera_bin: Camera hardware bin (``0``/``None`` mean 1).
             progress: Optional ``callable(int percent)``.
+            crop_margin: Leave out the keystone margin rows; otherwise a float cube gets NaN
+                there (:func:`margin_plan`).
 
         Raises:
             ValueError: ``hypercube`` is not 3-D (tuple unpacking of its shape).
@@ -247,10 +334,12 @@ class GeoTIFFWriter:
         self.linear_spectrum = linear_spectrum
         self.count, self.hight, self.width = self.hypercube.shape
         self.dtype = self.hypercube.dtype.newbyteorder('=')
+        self.margin = margin_plan(config, self.dtype, self.hight, crop_margin)
+        rows = self.margin['rows']
         self.geo_meta = {
             'driver': 'GTiff',
             'width': self.width,
-            'height': self.hight,
+            'height': rows.stop - rows.start,
             'count': self.count,
             'dtype': self.dtype.name,
             'tiled': True,
@@ -281,8 +370,17 @@ class GeoTIFFWriter:
 
             with warnings.catch_warnings(), rasterio.open(self.save_path, "w", **self.geo_meta) as dst:
                 warnings.simplefilter('ignore', NotGeoreferencedWarning)   # no georeference on purpose
+                plan = self.margin
+                if plan['note']:
+                    dst.update_tags(KEYSTONE_MARGIN_ROWS=plan['note'],
+                                    KEYSTONE_ROW_MARGIN=f"[{plan['top']}, {plan['bottom']}]")
                 for i in range(self.count):
-                    data = np.ascontiguousarray(self.hypercube[i], dtype=self.dtype)   # views welcome (no-op if contiguous)
+                    if plan['mode'] == 'nan':
+                        data = np.array(self.hypercube[i], dtype=self.dtype)            # a copy: rows set to NaN
+                        data[:plan['top']] = np.nan
+                        data[data.shape[0] - plan['bottom']:] = np.nan
+                    else:
+                        data = np.ascontiguousarray(self.hypercube[i][plan['rows']], dtype=self.dtype)   # views welcome
                     wl = self.linear_spectrum[i]
                     dst.update_tags(bidx=i + 1, WAVELENGTH=f"{wl:.3f}", WAVELENGTH_UNIT="nm")
                     dst.set_band_description(i + 1, f"Band {i + 1} (λ={wl:.3f} nm)")
@@ -297,7 +395,8 @@ class GeoTIFFWriter:
 class HypercubeWriter:
     """Write a band-first cube as ENVI BIP ``save_path`` plus ``save_path + '.hdr'``."""
     chunk_size = 100 * 1024 * 1024
-    def __init__(self, *, save_path: str, config: dict, fsync: bool = True, hypercube: np.ndarray, linear_spectrum: np.ndarray, camera_bin: int = 1, progress=None):
+    def __init__(self, *, save_path: str, config: dict, fsync: bool = True, hypercube: np.ndarray, linear_spectrum: np.ndarray, camera_bin: int = 1, progress=None,
+                 crop_margin: bool = False):
         """Store the export parameters (no file is written yet).
 
         Args:
@@ -312,15 +411,19 @@ class HypercubeWriter:
                 start/end/min/max``, ``dark temperature`` and ``target temperature``; optional
                 scan settings and corrections (:data:`SCAN_HEADER_FIELDS`: camera model and
                 serial number, exposure, gain, frame
-                rate, bin, dark / hot-pixel / smile corrected, smile model, stage speeds).
+                rate, bin, dark / hot-pixel / smile / keystone corrected, smile model, stage speeds).
             fsync: Accepted for API symmetry; currently unused.
             hypercube: Band-first ``(wavelength, slit, scan)`` array, kept by
                 reference.  The header's ``data type`` and ``byte order`` follow its dtype.
             linear_spectrum: 1-D band wavelengths in nm (written to the header).
             camera_bin: Camera hardware bin (``0``/``None`` mean 1).
             progress: Optional ``callable(int percent)``.
+            crop_margin: Leave out the keystone margin rows (``config['keystone_row_margin']``);
+                otherwise a float cube gets NaN there and an integer one is written as it is
+                (:func:`margin_plan`). The header says which (``keystone margin rows``).
         """
         self.progress = progress or (lambda value: None)
+        self.crop_margin = bool(crop_margin)
         self.save_path = save_path
         self.config = config
         self.camera_bin = int(camera_bin or 1)
@@ -350,11 +453,18 @@ class HypercubeWriter:
             percents = 0
 
             bip = self.hypercube.transpose(1,2,0)
+            plan = margin_plan(self.config, self.hypercube.dtype, lines, self.crop_margin)
+            rows = range(plan['rows'].start, plan['rows'].stop)
+            nan_line = None
+            if plan['mode'] == 'nan':
+                nan_line = np.full(bip.shape[1:], np.nan, dtype=self.hypercube.dtype)
             with open(f'{self.save_path}', 'wb') as fb:
-                for i in range(bip.shape[0]):
-                    fb.write(bip[i, :, :].copy())
-                    percents = int(((i + 1) / bip.shape[0]) * 100)
+                for n, i in enumerate(rows):
+                    edge = nan_line is not None and (i < plan['top'] or i >= lines - plan['bottom'])
+                    fb.write(nan_line if edge else bip[i, :, :].copy())
+                    percents = int(((n + 1) / len(rows)) * 100)
                     self.progress(percents)
+            lines = len(rows)
 
             acquisition = acquisition_time_utc(self.config)
 
@@ -368,7 +478,7 @@ class HypercubeWriter:
                 file.write(f'lines = {lines}\n')
                 file.write(f'samples = {samples}\n')
                 file.write(f'bands = {bands}\n')
-                for line in metadata_header_lines(self.config):
+                for line in metadata_header_lines(_with_note(self.config, plan)):
                     file.write(line + '\n')
                 file.write('wavelength units = Nanometers\n')
                 file.write('wavelength = {%s}\n' % ', '.join(np.asarray(self.linear_spectrum).astype('str').tolist()))

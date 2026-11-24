@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import datetime as _dt
+import os
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -19,12 +22,16 @@ __all__ = [
     "margin_from_map",
     "correct_smile",
     "crop_margin",
+    "crop_geometry",
     "SmileCalibration",
     "calibration_from_analysis",
+    "calibration_from_keystone",
     "save_calibration",
     "load_calibration",
     "save_calibration_fast",
     "load_calibration_fast",
+    "load_frames",
+    "FRAME_KINDS",
 ]
 
 
@@ -48,12 +55,10 @@ def build_maps(
         values.
     """
     n_rows, n_cols = shape
-    X, Y = np.meshgrid(
-        np.arange(n_cols, dtype=np.float32),
-        np.arange(n_rows, dtype=np.float32),
-    )
-    S = smile(Y, X)
-    map_x = np.ascontiguousarray(X + S, dtype=np.float32)
+    xs = np.arange(n_cols, dtype=np.float32)
+    ys = np.arange(n_rows, dtype=np.float32)
+    S = smile.grid(ys, xs) if hasattr(smile, "grid") else smile(*np.meshgrid(ys, xs, indexing="ij"))
+    map_x = np.ascontiguousarray(xs[None, :] + S, dtype=np.float32)
     map_y = np.ascontiguousarray(
         np.repeat(
             np.arange(n_rows, dtype=np.float32)[:, None], n_cols, axis=1
@@ -132,6 +137,24 @@ def correct_smile(
     return corrected, margin_from_map(map_x, interp), map_x, map_y
 
 
+def crop_geometry(frame: np.ndarray, margin: Tuple[int, int],
+                  row_margin: Tuple[int, int] = (0, 0)) -> np.ndarray:
+    """Crop invalid border columns and (with keystone) invalid border rows.
+
+    Args:
+        frame: Corrected image with zero-valued borders.
+        margin: ``(left, right)`` columns to remove.
+        row_margin: ``(top, bottom)`` rows to remove.
+
+    Returns:
+        The cropped view.
+    """
+    top, bottom = (int(v) for v in row_margin)
+    if top + bottom > 0:
+        frame = frame[top : frame.shape[0] - bottom]
+    return crop_margin(frame, margin)
+
+
 def crop_margin(frame: np.ndarray, margin: Tuple[int, int]) -> np.ndarray:
     """Crop invalid (zero) border columns produced by :func:`correct_smile`.
 
@@ -149,7 +172,7 @@ def crop_margin(frame: np.ndarray, margin: Tuple[int, int]) -> np.ndarray:
 
 
 # -----------------------------------------------------------------
-#  Optimized remap engine  ★ ย้ายขึ้นมาก่อน SmileCalibration
+#  Optimized remap engine (defined before SmileCalibration, which uses it)
 # -----------------------------------------------------------------
 
 
@@ -171,6 +194,8 @@ class _RemapEngine:
 
     # Ordered from most to least preferred for single-frame throughput.
     _BACKEND_PRIORITY = ["cpu", "cuda", "opencl"]
+    #: "auto" considers CUDA only above this many pixels (CPU wins for single smaller frames).
+    _AUTO_CUDA_PIXELS = 8_000_000
 
     def __init__(
         self,
@@ -193,10 +218,18 @@ class _RemapEngine:
         self._map_x = np.ascontiguousarray(map_x, dtype=np.float32)
         self._map_y = np.ascontiguousarray(map_y, dtype=np.float32)
 
-        # --- Detect available backends ---
+        # --- Detect available backends: only when one may be used ---
+        # Probing a GPU creates an OpenCL / CUDA context; on a Jetson the first one can compile
+        # kernels for minutes. "cpu" never probes; "auto" probes CUDA only for frames large
+        # enough to pick it; backend_info reports None for a backend that was not probed.
         self._cpu_ok = True
-        self._opencl_ok = self._detect_opencl()
-        self._cuda_ok = self._detect_cuda()
+        self._opencl_ok = None
+        self._cuda_ok = None
+        n_px = self._map_x.shape[0] * self._map_x.shape[1]
+        if backend == "opencl":
+            self._opencl_ok = self._detect_opencl()
+        if backend == "cuda" or (backend == "auto" and n_px > self._AUTO_CUDA_PIXELS):
+            self._cuda_ok = self._detect_cuda()
 
         # --- Select backend ---
         if backend == "auto":
@@ -241,7 +274,7 @@ class _RemapEngine:
         # CPU is fastest for < 4K single-frame (no PCIe transfer).
         # GPU wins for > 4K or when staying on GPU between operations.
         n_px = self._map_x.shape[0] * self._map_x.shape[1]
-        if n_px > 8_000_000 and self._cuda_ok:
+        if n_px > self._AUTO_CUDA_PIXELS and self._cuda_ok:
             return "cuda"
         return "cpu"
 
@@ -415,8 +448,12 @@ class _RemapEngine:
 class SmileCalibration:
     """Persistable calibration for repeated application.
 
-    Stores ``map_x`` only (``map_y`` is a trivial row-index array built
-    lazily).  A :class:`_RemapEngine` is pre-built after loading so
+    A smile-only model stores ``map_x`` only (``map_y`` is a trivial
+    row-index array built lazily). A smile + keystone model (see
+    :mod:`modules.smile.keystone`) also stores ``map_y`` (rows move along the
+    slit) and the joint geometry in ``keystone``; it is written as format 4,
+    which builds older than this module refuse instead of silently applying
+    the smile alone. A :class:`_RemapEngine` is pre-built after loading so
     that ``apply()`` runs at peak speed from the first call.
 
     Attributes:
@@ -441,6 +478,18 @@ class SmileCalibration:
             (``modules.contracts.CameraSetting.to_dict()``: backend, index, bin,
             orientation, frame size), or ``None`` for a model saved without it (older
             files).  The HSI app refuses a model whose setting differs from the camera's.
+        map_y: Row remap array ``float32 (H, W)`` of a smile + keystone model, or
+            ``None`` (identity rows: smile only).
+        frames: Source frames the model was measured from, written with it so it can be
+            re-analysed or reviewed without the original image files: ``{kind: (H, W) array}``
+            with kinds from :data:`FRAME_KINDS` (lamp, target, white, dark), raw orientation
+            as analysed (never smile / keystone corrected). Not read by :func:`load_calibration`
+            (see :func:`load_frames`); empty for older files.
+        frames_info: Provenance of each frame (``{kind: {"source": ..., "dark_applied": ...}}``).
+        keystone: Description of the joint geometry
+            (:meth:`modules.smile.keystone.KeystoneAnalysis.to_json`: model, margins,
+            QC), or ``None``.  With keystone, ``map_x`` is the joint model's column
+            map and the ``surface_coef`` / fit numbers describe the smile-only fit.
     """
 
     map_x: np.ndarray
@@ -463,6 +512,10 @@ class SmileCalibration:
     backend: str = "auto" 
     y_ref: Optional[float] = None
     camera_setting: Optional[dict] = None
+    map_y: Optional[np.ndarray] = None
+    keystone: Optional[dict] = None
+    frames: dict = field(default_factory=dict, repr=False)
+    frames_info: dict = field(default_factory=dict, repr=False)
     _map_y: Optional[np.ndarray] = field(
         default=None, init=False, repr=False
     )
@@ -478,7 +531,39 @@ class SmileCalibration:
             )
         self.interp = interp
         self._engine = None
-        self.margin = margin_from_map(self.map_x, interp)
+        if self.map_y is not None and self.keystone is not None:
+            from .keystone import valid_rect
+            self.margin, row_margin = valid_rect(self.map_x, self._get_map_y(), interp)
+            self.keystone["margin"] = list(self.margin)
+            self.keystone["row_margin"] = list(row_margin)
+        else:
+            self.margin = margin_from_map(self.map_x, interp)
+
+    @property
+    def has_keystone(self) -> bool:
+        """True for a smile + keystone model (rows are remapped too)."""
+        return self.map_y is not None
+
+    def smile_only(self) -> "SmileCalibration":
+        """This model with the keystone switched off: the stored smile surface alone
+        (``map_x = X + S(Y, X)``, rows untouched, no row margin). Returns ``self`` for a smile-only
+        model. The copy shares the frames and metadata; its remap engine is its own."""
+        if not self.has_keystone:
+            return self
+        import dataclasses
+        h, w = (int(v) for v in self.image_shape)
+        map_x, _map_y, _s = build_maps((h, w), self.surface())
+        out = dataclasses.replace(self, map_x=map_x, map_y=None, keystone=None)
+        out.margin = margin_from_map(out.map_x, out.interp)
+        return out
+
+    @property
+    def row_margin(self) -> Tuple[int, int]:
+        """``(top, bottom)`` rows without a full source (``(0, 0)`` for smile only)."""
+        if self.keystone and self.keystone.get("row_margin"):
+            top, bottom = self.keystone["row_margin"]
+            return int(top), int(bottom)
+        return 0, 0
 
     def surface(self) -> Surface2D:
         """Reconstruct the :class:`Surface2D` from stored coefficients.
@@ -495,8 +580,18 @@ class SmileCalibration:
         )
 
     def _get_map_y(self) -> np.ndarray:
-        """Build (or return cached) ``map_y`` row-index array."""
+        """Row map ``float32 (H, W)``: the stored keystone map, else the identity rows.
+
+        Raises:
+            ValueError: A stored ``map_y`` does not have the shape ``image_shape``.
+        """
         h, w = self.image_shape
+        if self.map_y is not None:
+            if tuple(self.map_y.shape) != (h, w):
+                raise ValueError(f"Stored map_y {self.map_y.shape} does not match the model {(h, w)}.")
+            if self.map_y.dtype != np.float32 or not self.map_y.flags.c_contiguous:
+                self.map_y = np.ascontiguousarray(self.map_y, dtype=np.float32)
+            return self.map_y
         if self._map_y is None or self._map_y.shape != (h, w):
             self._map_y = np.ascontiguousarray(
                 np.repeat(
@@ -551,7 +646,7 @@ class SmileCalibration:
                 f"calibrated for {self.image_shape}. "
                 f"Re-calibration required."
             )
-        return self._get_engine().remap(frame)          # ★ ใช้ engine
+        return self._get_engine().remap(frame)          # through the pre-built engine
 
     def apply_native(self, frame: np.ndarray) -> np.ndarray:
         """CPU remap preserving sensor dtype and full image dimensions.
@@ -573,9 +668,9 @@ class SmileCalibration:
             frame: Image to correct.
 
         Returns:
-            Corrected image with borders removed.
+            Corrected image with border columns (and, with keystone, border rows) removed.
         """
-        return crop_margin(self.apply(frame), self.margin)
+        return crop_geometry(self.apply(frame), self.margin, self.row_margin)
 
     def summary(self) -> str:
         """Return a human-readable summary.
@@ -600,7 +695,26 @@ class SmileCalibration:
             f"{self.rms_before:.4f} -> {self.rms_after:.4f} px\n"
             f"  Border crop  : left={left} right={right} px "
             f"({left + right} px total)\n"
-            f"  Notes        : {self.notes}"
+            + self._keystone_summary()
+            + f"  Notes        : {self.notes}"
+        )
+
+    def _keystone_summary(self) -> str:
+        """Keystone lines of :meth:`summary` (empty for a smile-only model)."""
+        if not self.has_keystone:
+            return ""
+        k = self.keystone or {}
+        q, s = k.get("qc") or {}, k.get("summary") or {}
+        top, bottom = self.row_margin
+
+        def px(v):
+            return "n/a" if v is None else f"{float(v):.3f}"
+        return (
+            f"  Keystone     : max {px(s.get('keystone_max_px'))} px, tilt "
+            f"{px(s.get('tilt_deg'))} deg, {q.get('target_bars', '?')} target bars\n"
+            f"  Re-traced    : lamp {px(q.get('retrace_lamp_rms_px'))} px, "
+            f"target {px(q.get('retrace_target_rms_px'))} px RMS\n"
+            f"  Border rows  : top={top} bottom={bottom} px\n"
         )
 
 
@@ -639,11 +753,34 @@ def calibration_from_analysis(analysis, notes: str = "") -> SmileCalibration:
         rms_after=float(analysis.rms_after),
         n_lines_used=len(analysis.used_lines),
         n_lines_total=len(analysis.all_lines),
-        created=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        created=_dt.datetime.now().isoformat(timespec="milliseconds"),
         notes=notes,
         y_ref=float(analysis.y_ref),
     )
     cal._get_engine()    # ★ pre-build engine
+    return cal
+
+
+def calibration_from_keystone(analysis, keystone, notes: str = "") -> SmileCalibration:
+    """Build a smile + keystone :class:`SmileCalibration` (one combined map).
+
+    Args:
+        analysis: The :class:`~smile.analysis.SmileAnalysis` of the lamp frame (its
+            smile-only fit numbers are kept for reference).
+        keystone: The :class:`~smile.keystone.KeystoneAnalysis` built from it.
+        notes: Free-form annotation.
+
+    Returns:
+        A ready-to-save calibration whose maps are the joint geometry's.
+    """
+    cal = calibration_from_analysis(analysis, notes=notes)
+    cal.map_x = np.ascontiguousarray(keystone.map_x, dtype=np.float32)
+    cal.map_y = np.ascontiguousarray(keystone.map_y, dtype=np.float32)
+    cal.margin = tuple(int(v) for v in keystone.margin)
+    cal.interp = keystone.interp
+    cal.keystone = keystone.to_json()
+    cal._engine = None
+    cal._get_engine()
     return cal
 
 
@@ -683,15 +820,56 @@ def _cal_to_meta(cal: SmileCalibration, format_version: int) -> dict:
         "notes": cal.notes,
         "y_ref": cal.y_ref,
         **({"camera_setting": dict(cal.camera_setting)} if cal.camera_setting else {}),
+        **({"keystone": cal.keystone} if cal.map_y is not None and cal.keystone else {}),
+        **({"frames": {k: dict(cal.frames_info.get(k) or {}) for k in cal.frames}} if cal.frames else {}),
     }
 
 
-def _meta_to_cal(meta: dict, map_x: np.ndarray) -> SmileCalibration:
-    """Reconstruct a :class:`SmileCalibration` from metadata + map_x.
+#: Frames a model file may carry (array ``frame_<kind>``; see :attr:`SmileCalibration.frames`).
+FRAME_KINDS = ("lamp", "target", "white", "dark")
+
+
+def _frame_arrays(cal: SmileCalibration) -> dict:
+    """``frame_<kind>`` arrays to write: integral counts as ``uint16`` (half the size), else ``float32``."""
+    out = {}
+    for kind, frame in (cal.frames or {}).items():
+        if kind not in FRAME_KINDS:
+            raise ValueError(f"Unknown frame kind {kind!r} (expected one of {FRAME_KINDS})")
+        a = np.asarray(frame)
+        if a.shape != tuple(cal.image_shape):
+            raise ValueError(f"The {kind} frame {a.shape} differs from the model {tuple(cal.image_shape)}")
+        if a.dtype != np.uint16:
+            f = a.astype(np.float32)
+            whole = bool(np.all(np.isfinite(f))) and f.min() >= 0 and f.max() <= 65535 and bool(np.all(f == np.round(f)))
+            a = f.astype(np.uint16) if whole else f
+        out["frame_" + kind] = np.ascontiguousarray(a)
+    return out
+
+
+def load_frames(path: str) -> Tuple[dict, dict, Optional[dict]]:
+    """Source frames stored in a model file (only these arrays are read; the maps are not).
+
+    Returns:
+        ``(frames, info, camera_setting)``: ``{kind: float32 (H, W)}`` (empty for a file
+        saved without frames), their provenance ``{kind: dict}``, and the model's
+        ``camera_setting`` dict (``None`` when absent).
+    """
+    with np.load(path, allow_pickle=False) as data:
+        meta = json.loads(data["metadata"].tobytes().decode("utf-8"))
+        frames = {name[6:]: np.asarray(data[name], dtype=np.float32)
+                  for name in data.files if name.startswith("frame_") and name[6:] in FRAME_KINDS}
+    info = {k: dict(v) for k, v in (meta.get("frames") or {}).items() if k in frames}
+    return frames, info, (dict(meta["camera_setting"]) if meta.get("camera_setting") else None)
+
+
+def _meta_to_cal(meta: dict, map_x: np.ndarray,
+                 map_y: Optional[np.ndarray] = None) -> SmileCalibration:
+    """Reconstruct a :class:`SmileCalibration` from metadata + maps.
 
     Args:
         meta: Deserialised metadata dict.
         map_x: Horizontal remap array.
+        map_y: Row remap array of a smile + keystone model (format 4), or ``None``.
 
     Returns:
         The calibration with ``map_y`` and ``_RemapEngine`` pre-built.
@@ -719,7 +897,11 @@ def _meta_to_cal(meta: dict, map_x: np.ndarray) -> SmileCalibration:
         notes=meta.get("notes", ""),
         y_ref=(float(meta["y_ref"]) if meta.get("y_ref") is not None else None),
         camera_setting=(dict(meta["camera_setting"]) if meta.get("camera_setting") else None),
+        map_y=map_y,
+        keystone=(dict(meta["keystone"]) if map_y is not None and meta.get("keystone") else None),
     )
+    if map_y is not None and tuple(map_y.shape) != tuple(map_x.shape):
+        raise ValueError(f"map_y {map_y.shape} and map_x {map_x.shape} differ in this model file.")
     cal._get_engine()   # ★ pre-build engine (map_y + fixed-point maps)
     return cal
 
@@ -729,8 +911,45 @@ def _meta_to_cal(meta: dict, map_x: np.ndarray) -> SmileCalibration:
 # -----------------------------------------------------------------
 
 
+def _savez_atomic(path, compressed: bool, **arrays) -> None:
+    """``np.savez[_compressed]`` that never leaves a half-written file at *path*.
+
+    The arrays go to a temporary file in the same folder (flushed to disk), which then replaces
+    *path* in one step (:func:`os.replace`). If anything fails, *path* keeps its previous content
+    and the temporary file is removed. Like NumPy, ``.npz`` is appended when *path* lacks it.
+    """
+    target = os.fspath(path)
+    if not target.endswith(".npz"):
+        target += ".npz"
+    folder = os.path.dirname(os.path.abspath(target))
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(target) + ".", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            (np.savez_compressed if compressed else np.savez)(f, **arrays)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":                      # mkstemp makes 0600; give the usual umask mode
+            mask = os.umask(0)
+            os.umask(mask)
+            os.chmod(tmp, 0o666 & ~mask)
+        for attempt in range(6):                 # Windows: a scanner / reader may hold the old file briefly
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.1)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_calibration(path: str, cal: SmileCalibration) -> None:
-    """Write a calibration to a compressed ``.npz`` file.
+    """Write a calibration to a compressed ``.npz`` file (atomic: see :func:`_savez_atomic`).
 
     Smaller file, slower load.  Use :func:`save_calibration_fast`
     for production pipelines that load repeatedly.
@@ -739,10 +958,14 @@ def save_calibration(path: str, cal: SmileCalibration) -> None:
         path: Destination file path.
         cal: Calibration to serialise.
     """
-    meta = _cal_to_meta(cal, format_version=2)
-    np.savez_compressed(
-        path,
-        map_x=cal.map_x.astype(np.float32),
+    meta = _cal_to_meta(cal, format_version=4 if cal.map_y is not None else 2)
+    arrays = dict(map_x=cal.map_x.astype(np.float32))
+    if cal.map_y is not None:
+        arrays["map_y"] = np.asarray(cal.map_y, dtype=np.float32)
+    arrays.update(_frame_arrays(cal))
+    _savez_atomic(
+        path, True,
+        **arrays,
         metadata=np.frombuffer(
             json.dumps(meta).encode("utf-8"), dtype=np.uint8
         ),
@@ -750,7 +973,7 @@ def save_calibration(path: str, cal: SmileCalibration) -> None:
 
 
 def load_calibration(path: str) -> SmileCalibration:
-    """Read a calibration from ``.npz`` (supports format v1–v3).
+    """Read a calibration from ``.npz`` (supports format v1–v4; v4 adds ``map_y``).
 
     Args:
         path: Path to the ``.npz`` file.
@@ -764,13 +987,22 @@ def load_calibration(path: str) -> SmileCalibration:
     with np.load(path, allow_pickle=False) as data:
         meta = json.loads(data["metadata"].tobytes().decode("utf-8"))
         map_x = data["map_x"].astype(np.float32)
+        map_y = (np.ascontiguousarray(data["map_y"], dtype=np.float32)
+                 if "map_y" in data.files else None)
 
+    return _meta_to_cal(_check_version(meta, map_y), map_x, map_y)
+
+
+def _check_version(meta: dict, map_y: Optional[np.ndarray]) -> dict:
+    """Refuse a format newer than 4, and a keystone model whose ``map_y`` is missing."""
     ver = meta.get("format_version", 1)
-    if ver > 3:
+    if ver > 4:
         raise ValueError(
             f"format_version {ver} is newer than this module supports."
         )
-    return _meta_to_cal(meta, map_x)
+    if map_y is None and meta.get("keystone"):
+        raise ValueError("This smile + keystone model file has no map_y array (damaged file).")
+    return meta
 
 
 # -----------------------------------------------------------------
@@ -779,7 +1011,7 @@ def load_calibration(path: str) -> SmileCalibration:
 
 
 def save_calibration_fast(path: str, cal: SmileCalibration) -> None:
-    """Write a calibration to an *uncompressed* ``.npz`` file.
+    """Write a calibration to an *uncompressed* ``.npz`` file (atomic: see :func:`_savez_atomic`).
 
     Larger file (~3-5x), but loads 3-5x faster than
     :func:`save_calibration`.  Preferred for production pipelines.
@@ -788,10 +1020,14 @@ def save_calibration_fast(path: str, cal: SmileCalibration) -> None:
         path: Destination file path.
         cal: Calibration to serialise.
     """
-    meta = _cal_to_meta(cal, format_version=3)
-    np.savez(
-        path,
-        map_x=np.ascontiguousarray(cal.map_x, dtype=np.float32),
+    meta = _cal_to_meta(cal, format_version=4 if cal.map_y is not None else 3)
+    arrays = dict(map_x=np.ascontiguousarray(cal.map_x, dtype=np.float32))
+    if cal.map_y is not None:
+        arrays["map_y"] = np.ascontiguousarray(cal.map_y, dtype=np.float32)
+    arrays.update(_frame_arrays(cal))
+    _savez_atomic(
+        path, False,
+        **arrays,
         metadata=np.frombuffer(
             json.dumps(meta).encode("utf-8"), dtype=np.uint8
         ),
@@ -799,7 +1035,7 @@ def save_calibration_fast(path: str, cal: SmileCalibration) -> None:
 
 
 def load_calibration_fast(path: str) -> SmileCalibration:
-    """Load a calibration from ``.npz`` (any format v1–v3).
+    """Load a calibration from ``.npz`` (any format v1–v4).
 
     Same output as :func:`load_calibration`, but skips compressed-file
     overhead when the file was saved with :func:`save_calibration_fast`.
@@ -816,10 +1052,7 @@ def load_calibration_fast(path: str) -> SmileCalibration:
     with np.load(path, allow_pickle=False) as data:
         meta = json.loads(data["metadata"].tobytes().decode("utf-8"))
         map_x = np.ascontiguousarray(data["map_x"], dtype=np.float32)
+        map_y = (np.ascontiguousarray(data["map_y"], dtype=np.float32)
+                 if "map_y" in data.files else None)
 
-    ver = meta.get("format_version", 1)
-    if ver > 3:
-        raise ValueError(
-            f"format_version {ver} is newer than this module supports."
-        )
-    return _meta_to_cal(meta, map_x)
+    return _meta_to_cal(_check_version(meta, map_y), map_x, map_y)

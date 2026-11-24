@@ -26,11 +26,20 @@ class SensorDialog(QDialog):
         self._config = config
         self._backend = plan.camera_backend or config.acquisition.camera_backend
         self._config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
-        from sim_config import calibration_folder
+        from sim_config import calibration_folders
         self._plan = plan
-        folder, self._dark_where = calibration_folder(config, plan, 'dark')
-        self._library = DarkFrameLibrary(str(folder)) if folder.is_dir() else None
-        self._darks = self._library.list_keys() if self._library else []
+        # the camera's dark folder, falling back to the next one per setting (as build_plan does)
+        folders = [(f, label) for f, label in calibration_folders(config, plan, 'dark') if f.is_dir()]
+        self._dark_where = ' > '.join(label for _, label in folders) or 'no dark folder'
+        self._libraries = [DarkFrameLibrary(str(f)) for f, _ in folders]
+        self._library = self._libraries[0] if self._libraries else None
+        seen, self._darks = set(), []
+        for library in self._libraries:                  # a setting is taken from the first folder that has it
+            items = library.list_keys()
+            keys = {(item.get('bin'), item.get('exposure'), item.get('gain')) for item in items}
+            self._darks += [item for item in items if (item.get('bin'), item.get('exposure'), item.get('gain'))
+                            not in seen]
+            seen |= keys
 
         self.exposure = QDoubleSpinBox()
         self.exposure.setRange(0.01, 60000.0)
@@ -101,8 +110,8 @@ class SensorDialog(QDialog):
 
     def _check(self) -> None:
         values = self.values()
-        found = self._library.find(values['camera_bin'], values['exposure_ms'], values['gain']) \
-            if self._library else None
+        found = next((path for path in (library.find(values['camera_bin'], values['exposure_ms'], values['gain'])
+                                        for library in self._libraries) if path), None)
         if found:
             self.dark_note.setText(f"✓ {Path(found).name}")
         else:
@@ -117,6 +126,11 @@ class SensorDialog(QDialog):
         from sim_config import profile_reflectance_path
         if self._plan.camera_id is None:
             return "camera has no model/serial: reflectance/<source>.npy is used"
+        hsi = getattr(self._plan, 'hsi_profile_dir', None)
+        if hsi is not None and (hsi / 'radiometric').is_dir():
+            return ("hsi radiometric reference of the copied camera folder: used when one of its active "
+                    "references was made at exactly this bin, exposure and gain (not scaled); see "
+                    "Reflectance in the processing steps after the restart")
         path = profile_reflectance_path(replace(self._plan, camera_bin=values['camera_bin'], gain=values['gain']))
         if path is not None and path.is_file():
             return f"✓ {path.name} (scaled to the exposure)"

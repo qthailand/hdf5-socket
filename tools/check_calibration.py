@@ -16,7 +16,8 @@ with ``train_test_split(test_size=0.2, random_state=42, stratify=y)``, which dep
 labels, so the same split is reproduced here (``--split train`` / ``all`` for the others). The
 held-out pixels come from the same recording as the training pixels (neighbours of them), so the
 numbers are an upper bound for a new recording; ``--hdr`` / ``--labels`` of another labelled
-recording check all of its pixels.
+recording check all of its pixels. A model trained on several cubes (``train_sgd_coco.py`` over
+``dataset/``) lists them in the artifact; the split of their pooled pixels is rebuilt from that.
 """
 import argparse
 import sys
@@ -30,7 +31,7 @@ from sklearn.model_selection import train_test_split
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from inference_engine import PushbroomLineClassifier  # noqa: E402
-from tools.train_sgd_coco import load_coco_masks  # noqa: E402
+from tools.train_sgd_coco import load_coco_masks, load_training_set  # noqa: E402
 
 
 def reliability(confidence, correct, edges):
@@ -73,36 +74,59 @@ def main(argv=None):
         if not args.temperature > 0:
             sys.exit('--temperature must be > 0')
         clf.temperature = args.temperature
-    training_header = joblib.load(model_path).get('training_header')
-    if (args.hdr or training_header) is None:
-        sys.exit('the artifact has no training_header: pass --hdr')
-    hdr = _existing(args.hdr or training_header)
-    own_cube = training_header is None or Path(training_header).name == hdr.name
-    img = spy.open_image(str(hdr))
-    data_file = Path(img.filename)
-    labels = _existing(args.labels or data_file.with_name(data_file.name + '.json'))
-    mask, names = load_coco_masks(str(labels), img.nrows, img.ncols)
-    names = {**names, **clf.category_names}
+    artifact = joblib.load(model_path)
+    training_header = artifact.get('training_header')
+    heads, label_files = artifact.get('training_headers'), artifact.get('training_labels')
+    # A model trained on several cubes (train_sgd_coco.py over dataset/): rebuild the pooled split.
+    pooled = bool(heads and len(heads) > 1 and not args.hdr and label_files)
+    if pooled:
+        data = load_training_set([(_existing(h), _existing(lab)) for h, lab in zip(heads, label_files)])
+        hdr, labels = ', '.join(Path(h).name for h in heads), 'next to each cube'
+        names = {**data.category_names, **clf.category_names}
+        y_all = data.y
+        valid = np.arange(y_all.size)
+        y = y_all
+        if args.split != 'all':
+            idx_train, idx_test = train_test_split(valid, test_size=0.2, random_state=42, stratify=y_all)
+            valid = np.sort(idx_test if args.split == 'test' else idx_train)
+            y = y_all[valid]
+        columns, binding = clf.bind(data.wavelengths, data.X.shape[1])
 
-    # Same pixel order and split as train_sgd_coco.py (another cube: every pixel is unseen).
-    y_all = mask.reshape(-1)
-    valid = np.where(y_all > 0)[0]
-    y = y_all[valid]
-    if own_cube and args.split != 'all':
-        idx_train, idx_test = train_test_split(valid, test_size=0.2, random_state=42, stratify=y)
-        valid = np.sort(idx_test if args.split == 'test' else idx_train)
+        def fetch(part):
+            return data.X[valid[part]]
+        own_cube = True
+    else:
+        if (args.hdr or training_header) is None:
+            sys.exit('the artifact has no training_header: pass --hdr')
+        hdr = _existing(args.hdr or training_header)
+        own_cube = training_header is None or Path(training_header).name == hdr.name
+        img = spy.open_image(str(hdr))
+        data_file = Path(img.filename)
+        labels = _existing(args.labels or data_file.with_name(data_file.name + '.json'))
+        mask, names = load_coco_masks(str(labels), img.nrows, img.ncols)
+        names = {**names, **clf.category_names}
+
+        # Same pixel order and split as train_sgd_coco.py (another cube: every pixel is unseen).
+        y_all = mask.reshape(-1)
+        valid = np.where(y_all > 0)[0]
         y = y_all[valid]
+        if own_cube and args.split != 'all':
+            idx_train, idx_test = train_test_split(valid, test_size=0.2, random_state=42, stratify=y)
+            valid = np.sort(idx_test if args.split == 'test' else idx_train)
+            y = y_all[valid]
 
-    cube = img.open_memmap()                                    # (lines, samples, bands)
-    wavelengths = getattr(img.bands, 'centers', None)
-    columns, binding = clf.bind(wavelengths, img.nbands)
+        cube = img.open_memmap()                                # (lines, samples, bands)
+        wavelengths = getattr(img.bands, 'centers', None)
+        columns, binding = clf.bind(wavelengths, img.nbands)
+        rows, cols = np.divmod(valid, img.ncols)
+
+        def fetch(part):
+            return np.asarray(cube[rows[part], cols[part]], dtype=np.float32)
     pred = np.empty(valid.size, np.uint8)
     conf = np.empty(valid.size, np.float32)
-    rows, cols = np.divmod(valid, img.ncols)
     for s in range(0, valid.size, 100_000):
         part = slice(s, s + 100_000)
-        pixels = np.asarray(cube[rows[part], cols[part]], dtype=np.float32)
-        pred[part], conf[part] = clf.predict_confidence(pixels, columns)
+        pred[part], conf[part] = clf.predict_confidence(fetch(part), columns)
     correct = pred == y
 
     split = {'test': "held-out 20 % (not used to fit the weights" +

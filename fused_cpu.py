@@ -96,7 +96,10 @@ class FusedCPU:
 
     @staticmethod
     def supports(frame, calibration) -> bool:
-        return frame.dtype == np.uint16 and (calibration is None or calibration.interp in ('linear', 'cubic'))
+        # a smile + keystone model remaps rows too: hsi's path, without disabling this one
+        # (the keystone step may be switched off again: the smile-only view is horizontal)
+        return frame.dtype == np.uint16 and (calibration is None or (
+            calibration.interp in ('linear', 'cubic') and not getattr(calibration, 'has_keystone', False)))
 
     def _smile_maps(self, calibration, inverted):
         key = (id(calibration), bool(inverted))

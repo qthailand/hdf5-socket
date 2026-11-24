@@ -267,3 +267,26 @@ def test_gui_adds_the_trained_model_as_a_session_tile_and_switches(tmp_path):
         assert 'Quick 1' in selector._note.text()      # still running until another model is chosen
     finally:
         assert window._pipeline.stop()                 # not close(): that saves the user's window layout
+
+
+def test_linear_predict_is_one_numba_call_with_the_classes_of_the_numpy_scores():
+    """The linear predict runs in numba (no BLAS threads: OpenBLAS <= 0.3.26 threaded a quick
+    model's 1024 x 159 @ 159 x 2 product on every core, per worker, on the Orin) and gives the
+    classes of argmax(x @ W + b): index and resampled bindings, NaN / inf pixels, 2 and 5 classes."""
+    from inference_engine import PushbroomLineClassifier, Resampled
+    rng = np.random.default_rng(3)
+    wl = np.linspace(900.0, 1700.0, 159)
+    for n_classes in (2, 5):
+        spectra = {c: (0.3 + 0.1 * c * np.sin(wl / (90 + 15 * c)) + rng.normal(0, 0.02, (300, wl.size)))
+                   .astype(np.float32) for c in range(1, n_classes + 1)}
+        art, _ = train_artifact(spectra, {c: f'c{c}' for c in spectra}, wl, 'reflectance')
+        model = PushbroomLineClassifier.from_artifact(art, 'Quick')
+        x = np.concatenate(list(spectra.values()))
+        x[::37, 4] = np.nan
+        x[::53, 90] = np.inf
+        for axis in (wl, wl + 2.0):                         # by index, and resampled onto the model's bands
+            columns, _ = model.bind(axis, axis.size)
+            assert isinstance(columns, Resampled) == (axis is not wl)
+            ids = model.predict(x, columns)
+            assert ids.dtype == np.uint8 and ids.shape == (x.shape[0],)
+            np.testing.assert_array_equal(ids, model._class_ids[model._scores(x, columns).argmax(axis=1)])

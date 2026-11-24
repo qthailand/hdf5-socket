@@ -15,11 +15,12 @@ from __future__ import annotations
 import numpy as np
 from PyQt5.QtCore import QPoint, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen
-from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QColorDialog, QDialog,
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog,
                              QHBoxLayout, QHeaderView, QLabel, QPushButton, QSizePolicy, QSlider, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from quick_model import LabelSet, spectral_angle, train_artifact
+from utils import pick_color
 
 #: lines classified at a time for the preview (bounds the temporary copy)
 PREVIEW_CHUNK = 64
@@ -366,7 +367,7 @@ class QuickModelDialog(QDialog):
         if column != 0:
             return
         cid = int(self.table.item(row, 1).data(Qt.UserRole))
-        colour = QColorDialog.getColor(QColor(*self.labels.colors[cid]), self, "Class colour")
+        colour = pick_color(QColor(*self.labels.colors[cid]), self, "Class colour")
         if colour.isValid():
             self.labels.colors[cid] = [colour.red(), colour.green(), colour.blue()]
             self._fill_table(select=cid)

@@ -5,6 +5,17 @@ import numpy as np
 from config import LOST_LINE_RGB, TAB10_RGB_COLORS
 
 
+def pick_color(initial, parent, title: str):
+    """``QColorDialog.getColor`` with Qt's own dialog.
+
+    The native (GTK / portal) dialog on the Jetson opens invisible but modal: the GUI blocks
+    until Esc. Qt's own dialog always shows, centred on the main window.
+    """
+    from PyQt5.QtWidgets import QColorDialog
+    return QColorDialog.getColor(initial, parent.window() if parent is not None else None, title,
+                                 QColorDialog.DontUseNativeDialog)
+
+
 def generate_tab10_lut(custom_map: dict[int, list[int]] | None = None) -> np.ndarray:
     """RGB lookup table (256, 3): 0 black, 1..10 Tab10, 255 = lost line (magenta)."""
     lut = np.zeros((256, 3), dtype=np.uint8)

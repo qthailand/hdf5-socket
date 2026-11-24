@@ -82,6 +82,25 @@ class Surface2D:
                 k += 1
         return out
 
+    def grid(self, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+        """Values on the grid ``ys`` (rows) x ``xs`` (columns): ``(len(ys), len(xs))``.
+
+        Same numbers as ``self(Y, X)`` on the meshgrid, but separable
+        (``By @ C @ Bx.T``): a full-frame map costs two small matrix products
+        instead of one full-frame array per coefficient.
+        """
+        y0, y1 = self.y_rng
+        x0, x1 = self.x_rng
+        Y = 2.0 * (np.asarray(ys, dtype=float).ravel() - y0) / (y1 - y0) - 1.0
+        X = 2.0 * (np.asarray(xs, dtype=float).ravel() - x0) / (x1 - x0) - 1.0
+        if self.clamp:
+            Y = np.clip(Y, -1.0, 1.0)
+            X = np.clip(X, -1.0, 1.0)
+        By = np.stack([Y ** i for i in range(self.deg_y + 1)], axis=1)
+        Bx = np.stack([X ** j for j in range(self.deg_x + 1)], axis=1)
+        C = np.asarray(self.coef, dtype=float).reshape(self.deg_y + 1, self.deg_x + 1)
+        return By @ C @ Bx.T
+
     def __repr__(self) -> str:
         """Short description with degrees and clamp flag."""
         return (
@@ -94,6 +113,42 @@ def _rng(a: np.ndarray) -> Tuple[float, float]:
     """Return ``(min, max)`` of *a*, handling the degenerate case."""
     lo, hi = float(a.min()), float(a.max())
     return (lo, hi) if hi > lo else (lo - 1.0, lo + 1.0)
+
+
+# Above this condition number of AᵀWA the weighted fit falls back to SVD least squares.
+# Lamp-line point sets stay far below it (≈1e2 for degree 2x1, ≤3e6 for 5x3).
+_NORMAL_EQ_MAX_COND = 1e8
+
+
+def _weighted_lstsq(A: np.ndarray, v: np.ndarray, w: np.ndarray, At: np.ndarray = None) -> np.ndarray:
+    """Coefficients minimising ``Σ w·(v - A·c)²``.
+
+    Solves the normal equations ``(AᵀWA) c = AᵀWv`` plus one step of iterative refinement
+    on the weighted residual (a few-column system: ≈2× faster than SVD least squares on tens
+    of thousands of points; the refinement brings the result back to SVD accuracy, ~1e-13,
+    so the 4σ rejections of the IRLS loop are unchanged even on noise-free data, where the
+    rounding of the plain normal equations could exceed the 1e-9 σ floor); falls back to
+    ``np.linalg.lstsq`` on ``√w·A`` (minimum-norm solution, as before) when ``AᵀWA`` is
+    singular or ill-conditioned, e.g. when zero weights leave too few distinct columns.
+
+    ``At``: ``A.T`` as a C-contiguous array (computed when ``None``); passing it once per fit
+    saves a copy per iteration.
+    """
+    if At is None:
+        At = np.ascontiguousarray(A.T)
+    Atw = At * w
+    G = Atw @ A
+    try:
+        if np.linalg.cond(G) < _NORMAL_EQ_MAX_COND:
+            coef = np.linalg.solve(G, Atw @ v)
+            coef = coef + np.linalg.solve(G, Atw @ (v - A @ coef))
+            if np.all(np.isfinite(coef)):
+                return coef
+    except np.linalg.LinAlgError:
+        pass
+    sw = np.sqrt(w)
+    coef, *_ = np.linalg.lstsq(A * sw[:, None], v * sw, rcond=None)
+    return coef
 
 
 def fit_surface_2d(
@@ -151,9 +206,9 @@ def fit_surface_2d(
     )
 
     # Initial least-squares fit ensures *res* is defined even when n_iter == 0.
+    At = np.ascontiguousarray(A.T)
     w = np.ones_like(v)
-    sw = np.sqrt(w)
-    coef, *_ = np.linalg.lstsq(A * sw[:, None], v * sw, rcond=None)
+    coef = _weighted_lstsq(A, v, w, At)
     res = v - A @ coef
 
     for _ in range(max(0, n_iter)):
@@ -161,9 +216,15 @@ def fit_surface_2d(
         u = np.abs(res) / (huber_k * sig)
         w = np.where(u <= 1.0, 1.0, 1.0 / np.maximum(u, 1e-9))
         w[np.abs(res) > 4.0 * sig] = 0.0
-        sw = np.sqrt(w)
-        coef, *_ = np.linalg.lstsq(A * sw[:, None], v * sw, rcond=None)
+        new = _weighted_lstsq(A, v, w, At)
+        converged = np.array_equal(new, coef)
+        coef = new
         res = v - A @ coef
+        if converged:
+            # Fixed point to the last bit: the residuals, hence the weights and the
+            # coefficients of every further iteration, are identical - stop early with
+            # exactly the result of the remaining iterations.
+            break
 
     n_used = int(np.sum(w > 0))
     rms = float(np.sqrt(np.sum(w * res**2) / max(np.sum(w), 1.0)))

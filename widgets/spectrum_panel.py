@@ -40,6 +40,7 @@ class SpectrumPoint:
     wavelengths: np.ndarray     # (bands,) nm
     values: np.ndarray          # (bands,) what the model received
     label: str = ''             # class the model gave this pixel
+    model_values: np.ndarray | None = None   # (training bands,) what the model read: its bands of ``values``
 
 
 @dataclass
@@ -63,6 +64,37 @@ def snv(values: np.ndarray, use: np.ndarray | None = None) -> np.ndarray:
     if not part.size or not np.isfinite(part).all() or part.std() == 0:
         return np.full(values.shape, np.nan)
     return (values - part.mean()) / part.std()
+
+
+def resample(wavelengths: np.ndarray, values: np.ndarray, wanted: np.ndarray) -> np.ndarray:
+    """``values`` on the ``wanted`` nm as ``inference_engine.Resampled`` reads them: linear between
+    the two input bands around each wanted band, only that band when one lies exactly on it, linear
+    extrapolation from the two edge bands up to half a band outside the input; further out NaN.
+    A NaN / inf input band reaches only the wanted bands that read it."""
+    order = np.argsort(wavelengths)
+    x, y = np.asarray(wavelengths, np.float64)[order], np.asarray(values, np.float64)[order]
+    wanted = np.asarray(wanted, np.float64)
+    if x.size < 2:
+        return np.full(wanted.shape, np.nan)
+    right = np.clip(np.searchsorted(x, wanted), 1, x.size - 1)
+    left = right - 1
+    weight = (wanted - x[left]) / (x[right] - x[left])
+    left, right = np.where(weight == 1.0, right, left), np.where(weight == 0.0, left, right)
+    with np.errstate(invalid='ignore'):
+        z = np.where(left == right, y[left], (1.0 - weight) * y[left] + weight * y[right])
+    half = 0.5 * float(np.median(np.diff(wanted))) if wanted.size > 1 else 0.0
+    z[(wanted < x[0] - half - 1e-6) | (wanted > x[-1] + half + 1e-6)] = np.nan
+    return z
+
+
+def derive(matrix: np.ndarray, z: np.ndarray) -> np.ndarray:
+    """``matrix @ z`` where only the rows whose window (non-zero coefficients) holds a NaN / inf
+    band of ``z`` are NaN: one bad band does not blank the whole derivative."""
+    bad = ~np.isfinite(z)
+    out = matrix @ np.where(bad, 0.0, z)
+    if bad.any():
+        out[(matrix[:, bad] != 0).any(axis=1)] = np.nan
+    return out
 
 
 def nice_ticks(lo: float, hi: float, count: int = 4) -> list[float]:
@@ -243,17 +275,19 @@ class SpectrumPanel(QFrame):
     def shown_curve(self, point: SpectrumPoint) -> tuple[np.ndarray, np.ndarray]:
         """``(wavelengths, values)`` of ``point`` in the current view.
 
-        The derivative view resamples the point onto the training axis (linear) and applies the
-        package's derivative there, as the model does; bands outside the point's range are NaN.
+        The derivative view applies the package's derivative to the model's own bands of the
+        point (:attr:`SpectrumPoint.model_values`, read through the model's binding: the same
+        columns, interpolation and edge extrapolation). A point without them is resampled here the
+        way the model's binding resamples (:func:`resample`). Only the
+        derivative bands whose window holds a NaN / inf input band are NaN.
         """
         if not self.derivative_shown:
             return point.wavelengths, self.shown_values(point)
-        wl = self._training_wavelengths
-        order = np.argsort(point.wavelengths)
-        x, y = point.wavelengths[order], point.values[order]
-        if x.size < 2 or not np.isfinite(y).all() or wl[0] < x[0] - 1e-6 or wl[-1] > x[-1] + 1e-6:
-            return wl, np.full(wl.shape, np.nan)
-        return wl, self._derivative @ np.interp(wl, x, y)
+        wl, D = self._training_wavelengths, self._derivative
+        z = point.model_values
+        if z is None or z.size != D.shape[1]:
+            z = resample(point.wavelengths, point.values, wl)
+        return wl, derive(D, z)
 
     def shown_values(self, point: SpectrumPoint) -> np.ndarray:
         """The curve of ``point`` on its own wavelengths (as received, or after SNV)."""
@@ -266,8 +300,13 @@ class SpectrumPanel(QFrame):
         use = (point.wavelengths >= wl[0] - half) & (point.wavelengths <= wl[-1] + half)
         return snv(point.values, use)
 
-    def add_point(self, wavelengths, values, line: int, row: int, label: str = '') -> SpectrumPoint:
-        """Add one curve; the oldest goes when there are more than :attr:`MAX_POINTS`."""
+    def add_point(self, wavelengths, values, line: int, row: int, label: str = '',
+                  model_values=None) -> SpectrumPoint:
+        """Add one curve; the oldest goes when there are more than :attr:`MAX_POINTS`.
+
+        ``model_values``: the point on the model's training bands as the model read it (used by
+        the derivative view); ``None`` when not known.
+        """
         wavelengths = np.asarray(wavelengths, np.float64).ravel()
         values = np.asarray(values, np.float64).ravel()
         if wavelengths.size != values.size or not values.size:
@@ -277,7 +316,9 @@ class SpectrumPanel(QFrame):
         used = {p.colour for p in self._points}
         colour = next(c for c in COLOURS if c not in used)
         self._number += 1
-        point = SpectrumPoint(self._number, colour, int(line), int(row), wavelengths, values, label)
+        if model_values is not None:
+            model_values = np.asarray(model_values, np.float64).ravel()
+        point = SpectrumPoint(self._number, colour, int(line), int(row), wavelengths, values, label, model_values)
         self._points.append(point)
         self.clear_button.setEnabled(True)
         self.plot.update()

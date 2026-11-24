@@ -1,8 +1,11 @@
 """Shared preprocessing API with CPU reference and optional CUDA backends.
 
 Outputs are owned contiguous arrays. GPU failures latch CPU fallback for this
-runtime. New GPU configurations are checked against the CPU reference once;
-integer interpolation may differ by at most one uint16 count.
+runtime, except a configuration the GPU backend does not support (``TypeError`` /
+``ValueError``: frame dtype, interpolation, bin width), which runs on the CPU
+only until the frame shape/dtype, calibration or binner changes.  New GPU
+configurations are checked against the CPU reference once; integer
+interpolation may differ by at most one uint16 count.
 
 Data conventions:
     A sensor frame is a 2-D ``(slit, wavelength)`` uint16 array (CUDA backends
@@ -55,6 +58,10 @@ from .selftest import self_test
 
 logger = logging.getLogger(__name__)
 
+# A GPU backend raises these for a configuration it does not support (not for a broken
+# device or a wrong result): the CPU takes over only until the configuration changes.
+_UNSUPPORTED = (TypeError, ValueError)
+
 # Candidates tried in order; every GPU candidate runs the whole path itself.
 _ORDER = {
     'auto': ('cupy_cuda', 'opencv_cuda', 'cpu'),
@@ -70,7 +77,8 @@ class PreprocessingRuntime:
         requested: Backend requested at construction.
         capabilities: ``ComputeCapabilities`` used to choose a backend.
         fallback_reason: Message of the last backend initialisation/validation
-            failure that caused a fallback (``''`` if none).
+            failure that caused a fallback (``''`` if none).  It is kept after the
+            runtime returns to the GPU.
     """
 
     def __init__(self, backend='auto', capabilities=None):
@@ -95,6 +103,7 @@ class PreprocessingRuntime:
         self._cpu = CPUBackend()
         self._backend = None
         self._validated = None
+        self._suspended = None        # (GPU backend, configuration it could not run)
         self.fallback_reason = ''
 
     @property
@@ -183,10 +192,32 @@ class PreprocessingRuntime:
         if calibration is not None and calibration.interp not in ('linear', 'cubic'):
             raise ValueError('CUDA preprocessing currently supports linear/cubic Smile')
 
-    def _fall_back(self, exc):
+    @staticmethod
+    def _configuration(frame, calibration, binner=None):
+        return (frame.shape, frame.dtype.str, calibration, binner)
+
+    def _fall_back(self, exc, configuration):
         self.fallback_reason = str(exc)
-        logger.warning('Preprocessing CUDA failure; switching to CPU: %s', exc)
+        if isinstance(exc, _UNSUPPORTED):
+            logger.warning('Preprocessing configuration not supported by %s; CPU until it changes: %s',
+                           self.backend_name, exc)
+            self._suspended = (self._backend, configuration)
+        else:
+            logger.warning('Preprocessing CUDA failure; switching to CPU: %s', exc)
         self._backend = self._cpu
+        self._publish_backend()
+
+    def _resume(self, configuration):
+        """Return to the suspended GPU backend once the unsupported configuration is gone."""
+        if self._suspended is None:
+            return
+        backend, unsupported = self._suspended
+        shape, dtype, calibration, binner = configuration
+        if (shape, dtype) == unsupported[:2] and calibration is unsupported[2] and binner is unsupported[3]:
+            return
+        self._suspended = None
+        self._backend = backend
+        logger.info('Preprocessing configuration changed; returning to %s', backend.name)
         self._publish_backend()
 
     def process(self, frame, dark_processor, calibration=None, inverted=False, snapshot=False, profiler=None):
@@ -216,10 +247,14 @@ class PreprocessingRuntime:
         A CUDA backend error or a CUDA/CPU mismatch (more than one count, checked
         once per configuration) does not raise: the runtime switches
         permanently to CPU, records ``fallback_reason`` and recomputes the frame.
+        A configuration the GPU does not support (``TypeError``/``ValueError``)
+        runs on the CPU only until the frame shape/dtype or calibration changes.
         """
         if profiler is None:
             profiler = _NoProfiler()
         args = self._prepare(frame, dark_processor, calibration, inverted, snapshot)
+        configuration = self._configuration(frame, calibration)
+        self._resume(configuration)
         with profiler.time('preprocess'):
             if self._backend is not self._cpu:
                 try:
@@ -234,7 +269,7 @@ class PreprocessingRuntime:
                         logger.info('%s verified against CPU: maximum error=%d count', self.backend_name, error)
                     return output, grabbed
                 except Exception as exc:
-                    self._fall_back(exc)
+                    self._fall_back(exc, configuration)
             return self._cpu.process(*args, profiler)
 
     def process_binned(self, frame, dark_processor, binner, calibration=None, inverted=False,
@@ -260,7 +295,8 @@ class PreprocessingRuntime:
         Profiling: on the CPU the spans are ``preprocess`` (correction) and
         ``bin``; on a GPU binning runs inside ``preprocess``/``gpu_preprocess``
         and no ``bin`` span is recorded.  GPU errors and mismatches fall back
-        to CPU exactly as in :meth:`process`; the first frame of each
+        to CPU exactly as in :meth:`process` (an unsupported configuration also
+        ends when the binner changes); the first frame of each
         configuration is checked on ``binned`` (and ``output`` when ``full``).
         """
         if profiler is None:
@@ -268,6 +304,8 @@ class PreprocessingRuntime:
         args = self._prepare(frame, dark_processor, calibration, inverted, snapshot)
         if binner.v_ != frame.shape[1]:
             raise ValueError(f'Binner fitted for {binner.v_} spectral pixels, frame has {frame.shape[1]}')
+        configuration = self._configuration(frame, calibration, binner)
+        self._resume(configuration)
         if self._backend is not self._cpu:
             with profiler.time('preprocess'):
                 try:
@@ -284,7 +322,7 @@ class PreprocessingRuntime:
                         logger.info('%s verified against CPU: maximum error=%d count', self.backend_name, error)
                     return binned, output, grabbed
                 except Exception as exc:
-                    self._fall_back(exc)
+                    self._fall_back(exc, configuration)
         with profiler.time('preprocess'):
             output, grabbed = self._cpu.process(*args, profiler)
         with profiler.time('bin'):

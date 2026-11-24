@@ -454,7 +454,7 @@ def dark_plan(tmp_path, **corrections):
 
 def test_steps_dark_and_hot_pixel_are_one_switch(tmp_path):
     _, _, plan = dark_plan(tmp_path, dark='auto')
-    assert set(plan.steps) == {'dark', 'flip', 'smile', 'binning', 'flatfield', 'reflectance'}
+    assert set(plan.steps) == {'dark', 'flip', 'smile', 'keystone', 'binning', 'flatfield', 'reflectance'}
     assert plan.steps['dark'] == {'available': True, 'on': True, 'why': plan.steps['dark']['why']}
     assert '1 hot pixels repaired' in plan.steps['dark']['why']
     on, off = plan.dark_processor(True), plan.dark_processor(False)

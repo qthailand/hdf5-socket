@@ -1,4 +1,4 @@
-"""Cached OpenCV-compatible horizontal Smile interpolation tables."""
+"""Cached OpenCV-compatible Smile (and smile + keystone) interpolation tables."""
 import cv2
 import numpy as np
 
@@ -56,3 +56,34 @@ def horizontal_table(interp):
         basis[0, index] = 1
         weights.append(cv2.remap(basis, x, y, FLAGS[interp], borderMode=cv2.BORDER_CONSTANT)[0])
     return np.ascontiguousarray(np.stack(weights, axis=1))
+
+def moves_rows(fractions):
+    """Whether a ``CV_16SC2`` map has fractional row coordinates (smile + keystone).
+
+    Args:
+        fractions: ``cv2.convertMaps`` fraction array (``fy * 32 + fx``) or ``None``.
+
+    Returns:
+        bool: ``True`` when any vertical fraction ``(fractions >> 5) & 31`` is non-zero.
+    """
+    return fractions is not None and bool(np.any(fractions >> 5))
+
+def remap_table(interp):
+    """OpenCV's own 2-D float table for a remap that moves rows as well as columns.
+
+    ``cv2.remap`` on uint16 data with fixed-point maps weights tap ``(k1, k2)`` of
+    fraction ``(fy, fx)`` by ``float(vy[k1] * vx[k2])``, the float32 product of the
+    1-D table with itself (``initInterTab2D``); this is that product.
+
+    Args:
+        interp: ``'linear'`` or ``'cubic'``.
+
+    Returns:
+        numpy.ndarray: float32 weights ``(1024, taps * taps)``; row ``fy * 32 + fx``
+        (the ``cv2.convertMaps`` fraction value), column ``k1 * taps + k2`` (tap row
+        ``k1``, tap column ``k2``).
+    """
+    table = horizontal_table(interp)
+    taps = table.shape[1]
+    product = table[:, None, :, None] * table[None, :, None, :]       # (fy, fx, k1, k2), float32
+    return np.ascontiguousarray(product.reshape(32 * 32, taps * taps), dtype=np.float32)

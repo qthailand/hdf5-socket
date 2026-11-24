@@ -47,6 +47,13 @@ Each .npz contains:
                   — scalar float (°C) over the captured frames; absent when unknown
     camera_model, camera_serial
                   — scalar str of the camera that took the frames; absent when unknown
+    captured_at   — scalar str, local ISO time of the capture; absent in older files
+
+A new capture never overwrites silently: the file it replaces is moved to
+``<folder>/history/<stem>.<YYYYMMDD-HHMMSS>.npz`` (the old capture's time), so a cube's
+``dark reference`` (file name plus ``dark reference captured``) still identifies its frame.
+A capture whose mean shows spectral lines (:func:`light_leak`: light reached the sensor) is
+not stored at all (``reject_light_leak``); :attr:`DarkFrameLibrary.last_capture` says why.
 
 Selection:
     ``load``/``find`` pick, among the files of a (bin, exposure, gain), the one whose
@@ -56,6 +63,7 @@ Selection:
     of that combination; new captures always go to ``folder``.
 """
 
+import datetime
 import logging
 import os
 import re
@@ -67,8 +75,67 @@ logger = logging.getLogger(__name__)
 
 #: Temperature (°C) assumed when the camera reports none: pick the dark taken nearest to it.
 UNKNOWN_TEMPERATURE_C = 60.0
+#: Sub-folder of the dark folder that keeps the darks a new capture replaced.
+HISTORY_FOLDER = "history"
+#: :func:`light_leak` defaults: slit blocks, spectral median window (pixels), peak over noise,
+#: smallest peak in counts (below it the leak is negligible, e.g. one count of a 16-bit dark).
+LEAK_BLOCKS = 8
+LEAK_WINDOW = 31
+LEAK_RATIO = 10.0
+LEAK_MIN_COUNTS = 16.0
 
 _TEMPERATURE_SUFFIX = re.compile(r"_t([+-]\d+)\.npz$")
+
+
+def light_leak(mean: np.ndarray, blocks: int = LEAK_BLOCKS, window: int = LEAK_WINDOW,
+               ratio: float = LEAK_RATIO, min_counts: float = LEAK_MIN_COUNTS) -> Optional[Dict]:
+    """Spectral lines in a dark frame: light reached the sensor through the slit while it was taken.
+
+    A dark has no spectral structure, only offsets and fixed pattern. Light that leaks in (room
+    fluorescent tubes through an uncapped lens) shows as narrow lines along the spectral axis
+    (argon at 912 / 966 / 1047 nm, mercury in the visible). Subtracting such a dark removes the
+    same counts from every pixel at those wavelengths, and a reflectance cube then shows peaks on
+    targets brighter than the reference panel and dips on darker ones.
+
+    The slit is split into ``blocks`` (the lines curve with the smile); in each, the median over
+    its rows gives a column profile, whose running median over ``window`` columns is removed. A
+    leak is reported when the largest residual exceeds ``ratio`` times the robust noise of the
+    residual and ``min_counts``, and spans at least two columns (a hot column is one pixel wide).
+
+    Args:
+        mean: Dark frame ``(slit, wavelength)``.
+        blocks, window, ratio, min_counts: See above.
+
+    Returns:
+        ``None`` for a clean dark, else ``{"columns": [...], "peak_counts": float, "ratio":
+        float, "block": int}``: the columns of the lines found in the worst block (strongest
+        first, at most 8), the strongest line above its surroundings and its ratio to the noise.
+    """
+    from scipy.ndimage import median_filter
+    frame = np.asarray(mean, dtype=np.float64)
+    if frame.ndim != 2 or frame.shape[1] < 3 * window or frame.shape[0] < blocks:
+        return None
+    h = frame.shape[0]
+    worst = None
+    for i in range(int(blocks)):
+        profile = np.median(frame[i * h // blocks:(i + 1) * h // blocks], axis=0)
+        residual = profile - median_filter(profile, size=int(window), mode="nearest")
+        noise = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+        threshold = max(float(ratio) * noise, float(min_counts))
+        above = residual > threshold
+        wide = above & (np.roll(above, 1) | np.roll(above, -1))     # two adjacent columns or more
+        wide[0] = wide[-1] = False
+        if not wide.any():
+            continue
+        peak = float(residual[wide].max())
+        score = peak / max(noise, 1e-9)
+        if worst is None or score > worst["ratio"]:
+            cols = np.flatnonzero(wide)
+            groups = np.split(cols, np.flatnonzero(np.diff(cols) > 1) + 1)
+            centres = sorted(groups, key=lambda g: -residual[g].max())[:8]
+            worst = {"columns": [int(g[np.argmax(residual[g])]) for g in centres],
+                     "peak_counts": peak, "ratio": float(score), "block": i}
+    return worst
 
 
 def valid_temperature(value) -> Optional[float]:
@@ -125,6 +192,11 @@ class DarkFrameLibrary:
         self.fallback_folder = None if same else fallback_folder
         self.camera_model = camera_model or None
         self.camera_serial = camera_serial or None
+        #: Refuse to store a capture in which :func:`light_leak` finds spectral lines.
+        self.reject_light_leak = True
+        #: Outcome of the last finished capture: ``{"saved": path or None, "light_leak": dict or
+        #: None, "replaced": path in history or None}`` (``None`` before any capture finished).
+        self.last_capture: Optional[Dict] = None
         os.makedirs(folder, exist_ok=True)
 
         # Capture state (reset by start_capture)
@@ -170,9 +242,9 @@ class DarkFrameLibrary:
                 known values and is named after their mean.
 
         Returns:
-            bool: True when ``n_frames`` have been collected, the mean has been
-            computed, and the result has been saved to disk (capture then stops).
-            False otherwise, including when no capture is active.
+            bool: True when ``n_frames`` have been collected and the capture has ended (the
+            mean was saved, or refused because it shows spectral lines; see
+            :attr:`last_capture`). False otherwise, including when no capture is active.
 
         Raw frames are discarded immediately after the mean is computed.
         """
@@ -275,6 +347,7 @@ class DarkFrameLibrary:
                 'temperature_max': float | None,
                 'camera_model':    str | None,   # camera that took the frames, if recorded
                 'camera_serial':   str | None,
+                'captured_at':     str | None,   # local ISO time of the capture (older files: None)
                 'filename':        str,
                 'path':            str,          # in ``folder`` or ``fallback_folder``
             }
@@ -294,6 +367,7 @@ class DarkFrameLibrary:
                 'n_frames':      int(data['n_frames']),
                 **self._temperature_fields(data),
                 **self._camera_fields(data),
+                'captured_at':   str(data['captured_at']) if 'captured_at' in data.files else None,
                 'filename':      os.path.basename(path),
                 'path':          path,
             }
@@ -435,7 +509,21 @@ class DarkFrameLibrary:
         camera = {name: np.array(value) for name, value in
                   (('camera_model', self.camera_model), ('camera_serial', self.camera_serial)) if value}
 
+        n_frames = len(self._stack)
+        self._stack.clear()
+        self._temperatures.clear()
+        leak = light_leak(mean)
+        if leak is not None and self.reject_light_leak:
+            self.last_capture = {"saved": None, "light_leak": leak, "replaced": None}
+            logger.error(
+                "DarkFrameLibrary: capture NOT saved - light reached the sensor (spectral lines at "
+                "columns %s, %.0f counts, %.0f x noise); the stored dark is unchanged",
+                leak["columns"], leak["peak_counts"], leak["ratio"])
+            return
+
         path = self._filepath(self._bin, self._exposure, self._gain, mean_temperature)
+        replaced = self._keep_in_history(path)
+        captured_at = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
         np.savez_compressed(
             path,
             mean=mean,
@@ -443,17 +531,45 @@ class DarkFrameLibrary:
             bin=np.array(self._bin,     dtype=np.int32),
             exposure=np.array(self._exposure, dtype=np.float32),
             gain=np.array(self._gain,    dtype=np.float32),
-            n_frames=np.array(len(self._stack), dtype=np.int32),
+            n_frames=np.array(n_frames, dtype=np.int32),
+            captured_at=np.array(captured_at),
             **temperature,
             **camera,
         )
+        self.last_capture = {"saved": path, "light_leak": leak, "replaced": replaced}
         logger.info(
-            "DarkFrameLibrary: saved %s (%d frames, %d hot pixels, temperature %s)",
-            path, len(self._stack), int(hot_pixel_map.sum() > 0 and np.count_nonzero(hot_pixel_map)),
+            "DarkFrameLibrary: saved %s (%d frames, %d hot pixels, temperature %s)%s",
+            path, n_frames, int(np.count_nonzero(hot_pixel_map)),
             "unknown" if mean_temperature is None else f"{mean_temperature:.1f} C",
+            f"; the previous file is kept as {replaced}" if replaced else "",
         )
-        self._stack.clear()
-        self._temperatures.clear()
+
+    def _keep_in_history(self, path: str) -> Optional[str]:
+        """Move an existing ``path`` into :data:`HISTORY_FOLDER` before a capture replaces it, so a
+        cube's ``dark reference`` keeps naming the frame it was corrected with. The copy is named
+        ``<stem>.<YYYYMMDD-HHMMSS>.npz`` after the old capture's time (its ``captured_at``, else the
+        file's modification time). Returns the new path, or ``None`` when nothing was there."""
+        if not os.path.isfile(path):
+            return None
+        stamp = None
+        try:
+            with np.load(path) as old:
+                if 'captured_at' in old.files:
+                    stamp = datetime.datetime.fromisoformat(str(old['captured_at']))
+        except Exception:
+            logger.warning("DarkFrameLibrary: cannot read the capture time of %s", path)
+        if stamp is None:
+            stamp = datetime.datetime.fromtimestamp(self._mtime(path))
+        folder = os.path.join(self.folder, HISTORY_FOLDER)
+        os.makedirs(folder, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        target = os.path.join(folder, f"{stem}.{stamp.strftime('%Y%m%d-%H%M%S')}.npz")
+        n = 1
+        while os.path.exists(target):
+            target = os.path.join(folder, f"{stem}.{stamp.strftime('%Y%m%d-%H%M%S')}_{n}.npz")
+            n += 1
+        os.replace(path, target)
+        return target
 
     def _detect_hot_pixels(self, frame: np.ndarray) -> np.ndarray:
         """
