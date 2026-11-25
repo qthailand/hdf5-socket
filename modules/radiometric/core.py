@@ -52,6 +52,7 @@ Example:
 """
 import os
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -353,6 +354,36 @@ def reflectance_at(ref_excel, wavelengths):
     f_ref = CubicSpline(data_ref[:, 0], data_ref[:, 1], extrapolate=False)
     table_range = (float(np.min(data_ref[:, 0])), float(np.max(data_ref[:, 0])))
     return f_ref(np.asarray(wavelengths, dtype=np.float64)).astype(np.float32), table_range
+
+
+def processed_cube_problem(meta) -> Optional[str]:
+    """Why a cube may not be used as counts for reflectance factors, or ``None`` if it may.
+
+    Factors (row-wise, flat-field or fluorescence) are ``R / counts`` of dark-subtracted counts.
+    A cube already divided by a flat-field profile (``flatfield_profile``) or already
+    reflectance (``reflectance_reference``) would be divided a second time: by ``F`` again at
+    every slit row, or by the white counts on top of an earlier white. Reads both the export
+    header labels as :func:`modules.cube_io.envi.parse_envi_header` gives them (``'flat-field
+    profile'``) and the metadata keys (``'flatfield_profile'``).
+    """
+    meta = meta or {}
+
+    def field(*names):
+        for name in names:
+            value = meta.get(name)
+            if value not in (None, ''):
+                return str(value).strip()
+        return None
+
+    reflectance = field('reflectance_reference', 'reflectance reference')
+    if reflectance:
+        return (f'it is already reflectance (calibrated with {reflectance}): calibrating it again divides '
+                'by the reference counts twice. Use the scan in counts.')
+    flat = field('flatfield_profile', 'flat-field profile')
+    if flat:
+        return (f'it is already flat-fielded (counts divided by {flat}): reflectance factors divide by the '
+                'slit falloff again. Use the scan in counts.')
+    return None
 
 
 def _rowwise_factors(read_box, n_bands, H, W, wl, ref_excel, avg_window_size, mask,

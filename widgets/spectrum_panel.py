@@ -266,6 +266,10 @@ class SpectrumPanel(QFrame):
         """nm of the model's selected bands, marked in a model view (empty in the input view)."""
         return self._selected if self.view != 'input' else np.zeros(0)
 
+    def training_reference(self) -> tuple[np.ndarray, list[TrainingBand]]:
+        """``(wavelengths, bands)`` of the model's training spectra in input units (shown or not)."""
+        return self._training_wavelengths, list(self._training['input'])
+
     def shown_training(self) -> tuple[np.ndarray, list[TrainingBand]]:
         """``(wavelengths, bands)`` drawn now (no bands when ``Training`` is off)."""
         if not self.training_button.isChecked():

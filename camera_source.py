@@ -247,6 +247,36 @@ class CameraFrameGaps:
         return count - previous
 
 
+class TemperaturePoll:
+    """Sensor temperature read every ``period_s`` while the camera streams.
+
+    Called by the reader between frames (one node / SDK read, a few ms; the frame buffers absorb
+    it). ``value`` is ``None`` while the camera reports none; after three failed reads in a row
+    it is not asked again.
+    """
+
+    def __init__(self, camera, period_s: float = 10.0) -> None:
+        self._camera, self.period_s = camera, float(period_s)
+        self._next = 0.0
+        self._failures = 0
+        self.value: float | None = None
+
+    def due(self, now: float) -> bool:
+        return now >= self._next
+
+    def read(self, now: float) -> float | None:
+        self._next = now + self.period_s
+        try:
+            self.value = valid_temperature(self._camera.get_temperature())
+        except Exception:
+            self.value = None
+        self._failures = 0 if self.value is not None else self._failures + 1
+        if self._failures >= 3:
+            self._next = float('inf')
+            logger.info("Sensor temperature not reported by the camera: not polled any more")
+        return self.value
+
+
 class CameraClock:
     """Sensor time of each live frame on the ``time.perf_counter()`` clock (for the latency).
 

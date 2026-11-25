@@ -55,7 +55,9 @@ OPEN_TIMEOUT_S = 120.0               # spawn + imports + camera open (GenICam st
 JOB_DTYPE = np.dtype([('seq', '<i8'), ('line', '<i8'), ('slot', '<i8'),
                       ('t_sensor', '<f8'), ('t_arrival', '<f8')])
 # Counters written by the camera process (one aligned int64 each; read at any time, monotonic).
-RECEIVED, LOST, LOST_CAMERA, TIMEOUTS, CAMERA_CLOCK = range(5)
+RECEIVED, LOST, LOST_CAMERA, TIMEOUTS, CAMERA_CLOCK, TEMPERATURE = range(6)
+#: ``counters[TEMPERATURE]``: sensor temperature in m°C, or this when the camera reports none
+NO_TEMPERATURE = -(2 ** 62)
 _N_COUNTERS = 8
 _ALIGN = 64
 
@@ -90,6 +92,7 @@ class SharedFrames:
         self.counters = np.ndarray((_N_COUNTERS,), np.int64, buffer=buf, offset=counters_at)
         if name is None:
             self.counters[:] = 0
+            self.counters[TEMPERATURE] = NO_TEMPERATURE
         self._owner = name is None
 
     @property
@@ -237,10 +240,12 @@ class CameraProcess:
     def counters(self) -> dict:
         """The camera process's running totals (zeros before the stream starts)."""
         if self.shared is None or self.shared.counters is None:
-            return {'received': 0, 'lost': 0, 'lost_camera': 0, 'timeouts': 0, 'line_clock': 'arrival'}
+            return {'received': 0, 'lost': 0, 'lost_camera': 0, 'timeouts': 0, 'line_clock': 'arrival',
+                    'temperature_c': None}
         c = self.shared.counters.copy()
         return {'received': int(c[RECEIVED]), 'lost': int(c[LOST]), 'lost_camera': int(c[LOST_CAMERA]),
-                'timeouts': int(c[TIMEOUTS]), 'line_clock': 'camera' if c[CAMERA_CLOCK] else 'arrival'}
+                'timeouts': int(c[TIMEOUTS]), 'line_clock': 'camera' if c[CAMERA_CLOCK] else 'arrival',
+                'temperature_c': None if c[TEMPERATURE] == NO_TEMPERATURE else c[TEMPERATURE] / 1000.0}
 
     # ----------------------------------------------------------------------------- close ---
 
@@ -342,7 +347,7 @@ def _camera_main(config, conn, stop_event, jobs_ready, slots_free, backend_facto
 
 def _read_loop(camera, shared: SharedFrames, conn, stop_event, jobs_ready, slots_free, timeout_ms: int) -> None:
     """``Pipeline._live_loop`` on this side of the shared memory (same counting rules)."""
-    from camera_source import CameraClock, CameraFrameGaps
+    from camera_source import CameraClock, CameraFrameGaps, TemperaturePoll
     n, shape = shared.n, shared.shape
     frames, jobs, free, counters = shared.frames, shared.jobs, shared.free, shared.counters
     scratch = np.empty(shape, shared.dtype)
@@ -375,6 +380,7 @@ def _read_loop(camera, shared: SharedFrames, conn, stop_event, jobs_ready, slots
             return
         raise
     gaps, clock = CameraFrameGaps(camera), CameraClock(camera)
+    temperature = TemperaturePoll(camera)
     gaps.start()
     conn.send(('running',))
     try:
@@ -383,6 +389,9 @@ def _read_loop(camera, shared: SharedFrames, conn, stop_event, jobs_ready, slots
             target = scratch if slot is None else frames[slot]
             frame = camera.read_frame_raw_into(provide, timeout_ms=timeout_ms)
             t_arrival = time.perf_counter()
+            if temperature.due(t_arrival):
+                value = temperature.read(t_arrival)
+                counters[TEMPERATURE] = NO_TEMPERATURE if value is None else int(round(value * 1000.0))
             if frame is None:
                 held = slot
                 if not stop_event.is_set():

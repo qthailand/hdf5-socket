@@ -278,3 +278,68 @@ QLabel#verdict { background: transparent; font-size: 16px; font-weight: 700; col
 QLabel#verdict[state="ok"]    { color: @success; }
 QLabel#verdict[state="warn"]  { color: @warning; }
 QLabel#verdict[state="error"] { color: @danger; }
+
+/* --------------------------------------------- pipeline view (Setup tab) --- */
+/* Full border in the state's colour (no stripe): a problem is seen from across the room.
+ * Every box keeps a 2 px border, so selecting one only changes colours, never the layout. */
+QFrame#pipelineBlock, QFrame#pipelineDetail {
+    background-color: @surface;
+    border: 2px solid @border;
+    border-radius: 8px;
+}
+QFrame#pipelineBlock[state="ok"],    QFrame#pipelineDetail[state="ok"]    { border-color: @success; }
+QFrame#pipelineBlock[state="warn"],  QFrame#pipelineDetail[state="warn"]  { border-color: @warning; }
+QFrame#pipelineBlock[state="error"], QFrame#pipelineDetail[state="error"] { border-color: @danger; }
+QFrame#pipelineBlock[state="off"] { background-color: @bg; border-color: @border; }
+QFrame#pipelineBlock[selected="true"] { background-color: @surface_hover; }
+QFrame#pipelineBlock[selected="true"][state="off"] { border-color: @text_faint; }
+QFrame#setupPanel {
+    background-color: @surface;
+    border: 1px solid @border;
+    border-radius: 8px;
+}
+QLabel#detailTitle { background: transparent; color: @text; font-size: 14px; font-weight: 700; }
+QLabel#detailState { background: transparent; color: @text_muted; font-size: 12px; font-weight: 600; }
+QLabel#detailState[state="ok"]    { color: @success; }
+QLabel#detailState[state="warn"]  { color: @warning; }
+QLabel#detailState[state="error"] { color: @danger; }
+QLabel#blockTitle { background: transparent; color: @text; font-size: 12px; font-weight: 600; }
+QLabel#blockLine  { background: transparent; color: @text_muted; font-size: 11px; }
+QLabel#blockTime  { background: transparent; color: @text_faint; font-size: 10px; }
+QLabel#blockArrow { background: transparent; color: @text_faint; font-size: 16px; }
+QLabel#blockDot   { background: transparent; color: @text_faint; font-size: 11px; }
+QLabel#blockDot[state="ok"]    { color: @success; }
+QLabel#blockDot[state="warn"]  { color: @warning; }
+QLabel#blockDot[state="error"] { color: @danger; }
+QLabel#pipelineSummary { background: transparent; color: @text_muted; font-size: 12px; font-weight: 600; }
+QLabel#pipelineSummary[state="ok"]    { color: @success; }
+QLabel#pipelineSummary[state="warn"]  { color: @warning; }
+QLabel#pipelineSummary[state="error"] { color: @danger; }
+QLabel#pipelineNote { background: transparent; color: @text_muted; font-size: 12px; }
+QLabel#pipelineNote[state="warn"]  { color: @warning; }
+QLabel#pipelineNote[state="error"] { color: @danger; }
+QLabel#pipelineStatusItem { background: transparent; color: @text_muted; font-size: 12px; }
+QLabel#pipelineStatusItem[state="warn"]  { color: @warning; }
+QLabel#pipelineStatusItem[state="error"] { color: @danger; }
+QLabel#workspaceTitle { background: transparent; color: @text_muted; font-size: 11px; font-weight: 600; }
+QLabel#fileRow  { background: transparent; color: @text; font-size: 12px; }
+QLabel#fileAge  { background: transparent; color: @text_faint; font-size: 11px; }
+QLabel#fileRow[state="warn"] { color: @warning; }
+QFrame#nextSteps { background-color: @surface; border: 1px solid @border; border-radius: 8px; }
+QFrame#nextSteps[state="warn"]  { border-color: @warning; }
+QFrame#nextSteps[state="error"] { border-color: @danger; }
+QLabel#stepNumber { background: transparent; color: @text_faint; font-size: 12px; font-weight: 700; }
+QLabel#stepNumber[state="warn"]  { color: @warning; }
+QLabel#stepNumber[state="error"] { color: @danger; }
+QLabel#stepText { background: transparent; color: @text; font-size: 12px; }
+QPushButton#advancedToggle { text-align: left; padding: 4px 8px; color: @text_muted; border: none; background: transparent; }
+QPushButton#advancedToggle:hover { color: @text; }
+QLabel#temperatureValue { background: transparent; color: @text; font-size: 20px; font-weight: 700; }
+QLabel#temperatureValue[state="ok"]   { color: @success; }
+QLabel#temperatureValue[state="warn"] { color: @warning; }
+QStackedWidget#setupStack, QStackedWidget#setupStack > QWidget { background: transparent; border: none; }
+/* focus aid on the Setup tab: a full border in its level colour, like the step boxes */
+QFrame#focusPanel { border: 2px solid @border; border-radius: 8px; }
+QFrame#focusPanel[accent="ok"]   { border: 2px solid @success; }
+QFrame#focusPanel[accent="info"] { border: 2px solid @chart_2; }
+QFrame#focusPanel[accent="warn"] { border: 2px solid @warning; }

@@ -15,16 +15,20 @@ Colours and fonts live in ``themes/`` (``app.qss`` + one token JSON per theme); 
 only sets object names and the panel/accent properties.
 """
 import argparse
+import json
 import logging
 import threading
 import sys
+import time
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 from PyQt5.QtCore import QEvent, QPointF, QSettings, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QScrollArea, QSpinBox, QTabWidget, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QScrollArea, QSpinBox,
+                             QStackedWidget, QTabWidget, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
                              QSizePolicy, QSplitter, QVBoxLayout, QWidget)
 
 from focus import edge_contrast
@@ -33,17 +37,21 @@ from modules.compute_runtime import get_compute_capabilities, initialize_compute
 from modules.sharpness import sharpness_score
 from model_catalog import scan_models, session_entry
 from pipeline import LOST_CLASS, build_pipeline
+from pipeline_overview import (calibration_files, describe, flatfield_state, input_text, next_steps, slit_profiles,
+                               status_items)
 from quick_model import LabelSet
 from sim_config import load_config, parse_set_overrides
-from themes import apply_theme, make_panel, set_accent, use_dark_title_bar
+from themes import apply_theme, make_panel, repolish, set_accent, use_dark_title_bar
 from utils import generate_tab10_lut
 from widgets.class_legend_widget import ClassLegendWidget
 from widgets.composition_widget import CompositionWidget
 from widgets.focus_panel import FocusPanel
 from widgets.model_selector import ModelSelector
 from widgets.performance_panel import PerformancePanel, ThroughputStrip
+from widgets.line_plot import LinePlot, RangeBar
+from widgets.pipeline_view import PipelineView, drop_widget as _drop
 from widgets.reflectance_dialog import ReflectanceDialog
-from widgets.sensor_dialog import SensorDialog
+from widgets.sensor_dialog import SensorDialog, SensorForm
 from widgets.spectrum_panel import SpectrumPanel, TrainingBand
 
 #: binned lines kept before Flat-field/Reflectance while the calibration dialog is open
@@ -118,7 +126,9 @@ class PushbroomScannerMainWindow(QMainWindow):
         self.class_legend_widget.reset_requested.connect(self._forget_previous_counts)
         self.performance_panel.reset_requested.connect(lambda: self._pipeline.reset_perf())
         self._setup_backend_selector()
+        self._restore_steps()
         self._setup_step_switches()
+        self._build_sensor_form()
         self._setup_fps_control()
         self._forget_previous_counts()
         self._info_label.setText(self._plan_text())
@@ -389,14 +399,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         operation.addWidget(self._side_splitter, stretch=1)
         operation.addWidget(self.throughput_strip)
 
-        self._setup_page = QWidget()
-        setup = QVBoxLayout(self._setup_page)
-        setup.setContentsMargins(0, 0, 0, 0)
-        setup.addWidget(self._preview_row, stretch=2)
-        setup_scroll = QScrollArea()
-        setup_scroll.setWidgetResizable(True)
-        setup_scroll.setWidget(self._bottom_pane)
-        setup.addWidget(setup_scroll, stretch=1)
+        self._build_setup_page()
 
         diagnostics = QWidget()
         diagnostic_layout = QVBoxLayout(diagnostics)
@@ -421,6 +424,411 @@ class PushbroomScannerMainWindow(QMainWindow):
         container.setLayout(main)
         self.setCentralWidget(container)
         self._restore_layout()
+
+    # ----------------------------------------------------------- setup & calibration page ---
+
+    #: selected block -> workspace page (what is worth looking at for that step)
+    _WORKSPACES = {'sensor': 'sensor', 'dark': 'sensor', 'flip': 'sensor', 'smile': 'sensor', 'binning': 'sensor',
+                   'flatfield': 'profile', 'reflectance': 'profile', 'spatial_bin': 'model', 'model': 'model'}
+    _TEMPERATURE_PERIOD_S = 10.0          # one point per camera reading (camera_source.TemperaturePoll)
+
+    def _build_setup_page(self) -> None:
+        """Status bar and step blocks on top; the selected step's workspace on the left, its
+        detail and the calibration files on the right; the rest (line rate, backend, step
+        switches, the source of every value) folded away under Advanced."""
+        self._setup_page = QWidget()
+        setup = QVBoxLayout(self._setup_page)
+        setup.setContentsMargins(0, 0, 0, 0)
+        setup.setSpacing(8)
+        self.pipeline_view = PipelineView()
+        self.pipeline_view.action_requested.connect(self._on_pipeline_action)
+        self.pipeline_view.selected_changed.connect(self._show_workspace)
+        self._last_snapshot = None
+        self._profile_snapshot = None              # 'Check with white': the model input at that moment
+        self._temperature_history = deque(maxlen=8640)   # (wall time, °C): 24 h at one point per 10 s
+        setup.addWidget(self.pipeline_view)
+
+        # What to fix, in order, each with the button that does it (hidden when all is well)
+        self._next_frame = QFrame()
+        self._next_frame.setObjectName('nextSteps')
+        next_layout = QVBoxLayout(self._next_frame)
+        next_layout.setContentsMargins(12, 6, 12, 8)
+        next_layout.setSpacing(4)
+        caption = QLabel('NEXT STEPS, IN ORDER')
+        caption.setObjectName('workspaceTitle')
+        next_layout.addWidget(caption)
+        self._next_grid = QGridLayout()
+        self._next_grid.setHorizontalSpacing(10)
+        self._next_grid.setVerticalSpacing(4)
+        self._next_grid.setColumnStretch(1, 1)
+        next_layout.addLayout(self._next_grid)
+        self._next_shown = None
+        self._next_frame.setVisible(False)
+        setup.addWidget(self._next_frame)
+
+        # sensor: spectrogram + focus aid, camera values, peak signal, temperature over time
+        self._sensor_page = QWidget()
+        sensor = QVBoxLayout(self._sensor_page)
+        sensor.setContentsMargins(0, 0, 0, 0)
+        sensor.setSpacing(6)
+        sensor.addWidget(self._preview_row, stretch=3)
+        self._peak_label = QLabel('')
+        self._peak_label.setObjectName('rowSource')
+        sensor.addWidget(self._peak_label)
+        self._sensor_form_box = QVBoxLayout()
+        self._sensor_form = None
+        sensor.addLayout(self._sensor_form_box)
+        caption = QLabel('SENSOR TEMPERATURE')
+        caption.setObjectName('workspaceTitle')
+        self._temperature_value = QLabel('—')            # newest reading, large
+        self._temperature_value.setObjectName('temperatureValue')
+        self._temperature_note = QLabel('')               # its age and the distance to the calibration
+        self._temperature_note.setObjectName('rowSource')
+        head = QHBoxLayout()
+        head.addWidget(caption)
+        head.addStretch()
+        head.addWidget(self._temperature_note)
+        head.addWidget(self._temperature_value)
+        sensor.addLayout(head)
+        self.temperature_plot = LinePlot('°C', x_format=lambda x: 'now' if abs(x) < 0.5 else f"{-x:.0f} min ago")
+        self.temperature_plot.y_min_span = 2.0
+        self.temperature_plot.setMinimumHeight(110)
+        self.temperature_plot.setMaximumHeight(200)
+        sensor.addWidget(self.temperature_plot, stretch=1)
+
+        # flat-field / reflectance: brightness along the slit
+        self._profile_page = QWidget()
+        profile = QVBoxLayout(self._profile_page)
+        profile.setContentsMargins(0, 0, 0, 0)
+        profile.setSpacing(6)
+        caption = QLabel('BRIGHTNESS ALONG THE SLIT  (1 = brightest row)')
+        caption.setObjectName('workspaceTitle')
+        profile.addWidget(caption)
+        self.profile_plot = LinePlot('', x_format=lambda x: f"row {x:.0f}")
+        self.profile_plot.setMinimumHeight(160)
+        self.profile_plot.setMaximumHeight(320)
+        profile.addWidget(self.profile_plot, stretch=1)
+        self._profile_note = QLabel('')
+        self._profile_note.setObjectName('rowSource')
+        self._profile_note.setWordWrap(True)
+        profile.addWidget(self._profile_note)
+        row = QHBoxLayout()
+        self._white_button = QPushButton('Check with white')
+        self._white_button.setObjectName('quietButton')
+        self._white_button.setToolTip('Put the white target under the slit, then press: the brightness of what the '
+                                      'model receives now is drawn as a third line')
+        self._white_button.clicked.connect(self._check_with_white)
+        calibrate = QPushButton('Calibrate reflectance…')
+        calibrate.setObjectName('quietButton')
+        calibrate.clicked.connect(self._open_reflectance_dialog)
+        row.addWidget(self._white_button)
+        row.addWidget(calibrate)
+        row.addStretch()
+        profile.addLayout(row)
+        profile.addStretch()
+
+        # model: its bands inside the input range, and what it receives against its training spectra
+        # (expects / receives / classes are in the detail panel on the right)
+        self._model_page = QWidget()
+        model = QVBoxLayout(self._model_page)
+        model.setContentsMargins(0, 0, 0, 0)
+        model.setSpacing(6)
+        caption = QLabel('BANDS: MODEL INSIDE THE CAMERA INPUT')
+        caption.setObjectName('workspaceTitle')
+        model.addWidget(caption)
+        self.band_bar = RangeBar()
+        model.addWidget(self.band_bar)
+        self._model_summary = QLabel('')               # band check in words
+        self._model_summary.setObjectName('rowSource')
+        self._model_summary.setWordWrap(True)
+        model.addWidget(self._model_summary)
+        caption = QLabel('MODEL INPUT NOW  vs  TRAINING MEAN (model bands)')
+        caption.setObjectName('workspaceTitle')
+        model.addWidget(caption)
+        self.model_plot = LinePlot('', x_format=lambda x: f"{x:.0f} nm")
+        self.model_plot.setMinimumHeight(180)
+        self.model_plot.setMaximumHeight(360)
+        model.addWidget(self.model_plot, stretch=1)
+        self._model_note = QLabel('')
+        self._model_note.setObjectName('pipelineNote')
+        self._model_note.setWordWrap(True)
+        model.addWidget(self._model_note)
+        row = QHBoxLayout()
+        choose = QPushButton('Choose model…')
+        choose.setObjectName('quietButton')
+        choose.clicked.connect(lambda: self._on_pipeline_action('model'))
+        row.addWidget(choose)
+        row.addStretch()
+        model.addLayout(row)
+        model.addStretch()
+
+        self._work_stack = QStackedWidget()
+        self._work_stack.setObjectName('setupStack')
+        self._pages = {'sensor': self._sensor_page, 'profile': self._profile_page, 'model': self._model_page}
+        for page in self._pages.values():
+            self._work_stack.addWidget(page)
+        work = QFrame()
+        work.setObjectName('setupPanel')
+        work_layout = QVBoxLayout(work)
+        work_layout.setContentsMargins(10, 8, 10, 10)
+        work_layout.addWidget(self._work_stack)
+
+        files = QFrame()
+        files.setObjectName('setupPanel')
+        files_layout = QVBoxLayout(files)
+        files_layout.setContentsMargins(12, 8, 12, 10)
+        caption = QLabel('CALIBRATION FILES IN USE')
+        caption.setObjectName('workspaceTitle')
+        files_layout.addWidget(caption)
+        self._files_grid = QGridLayout()
+        self._files_grid.setHorizontalSpacing(10)
+        self._files_grid.setVerticalSpacing(3)
+        self._files_grid.setColumnStretch(2, 1)
+        files_layout.addLayout(self._files_grid)
+        self._files_shown = None
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(self.pipeline_view.detail)
+        right_layout.addWidget(files)
+        right_layout.addStretch()
+        right.setMinimumWidth(320)
+
+        middle = QSplitter(Qt.Horizontal)
+        middle.setObjectName('setupSplitter')
+        middle.setChildrenCollapsible(False)
+        middle.setHandleWidth(8)
+        middle.addWidget(work)
+        middle.addWidget(right)
+        middle.setStretchFactor(0, 3)
+        middle.setStretchFactor(1, 2)
+        setup.addWidget(middle, stretch=1)
+
+        self._advanced_button = QPushButton('▸  Advanced: line rate, correction backend, step switches, '
+                                            'where every value came from')
+        self._advanced_button.setObjectName('advancedToggle')
+        self._advanced_button.setCheckable(True)
+        self._advanced_scroll = QScrollArea()
+        self._advanced_scroll.setWidgetResizable(True)
+        self._advanced_scroll.setWidget(self._bottom_pane)
+        self._advanced_scroll.setMinimumHeight(220)
+        self._advanced_scroll.setVisible(False)
+        self._advanced_button.toggled.connect(self._set_advanced_visible)
+        setup.addWidget(self._advanced_button)
+        setup.addWidget(self._advanced_scroll)
+
+    def _set_advanced_visible(self, visible: bool) -> None:
+        self._advanced_scroll.setVisible(visible)
+        self._advanced_button.setText(('▾' if visible else '▸') + self._advanced_button.text()[1:])
+
+    def _show_workspace(self, key: str) -> None:
+        """The workspace of the selected block (sensor, slit profile or model)."""
+        self._work_stack.setCurrentWidget(self._pages[self._WORKSPACES.get(key, 'sensor')])
+        self._refresh_workspace()
+
+    def _build_sensor_form(self) -> None:
+        """Exposure / gain / bin of the live camera in the sensor workspace (made per pipeline)."""
+        if self._sensor_form is not None:
+            self._sensor_form_box.removeWidget(self._sensor_form)
+            _drop(self._sensor_form)
+        if self._live:
+            self._sensor_form = SensorForm(self.config, self._pipeline.plans[0], self._config_path, compact=True)
+            self._sensor_form.apply_requested.connect(self._apply_sensor_form)
+        else:
+            self._sensor_form = QLabel('File playback: exposure, gain and bin are those of the recording; '
+                                       'the line rate is under Advanced.')
+            self._sensor_form.setObjectName('rowSource')
+        self._sensor_form_box.addWidget(self._sensor_form)
+
+    def _apply_sensor_form(self) -> None:
+        values = self._sensor_form.values()
+        self._apply_sensor_values(values, lambda: self._sensor_form.save(values))
+
+    def _check_with_white(self) -> None:
+        self._profile_snapshot = self._last_snapshot
+        self._refresh_workspace()
+
+    def _record_temperature(self, snapshot) -> None:
+        value = getattr(snapshot, 'sensor_temperature_c', None)
+        if value is None:
+            return
+        now = time.time()
+        if not self._temperature_history or now - self._temperature_history[-1][0] >= self._TEMPERATURE_PERIOD_S - 0.5:
+            self._temperature_history.append((now, float(value)))
+
+    def _refresh_workspace(self) -> None:
+        """The visible workspace page and the calibration file list."""
+        page = self._work_stack.currentWidget()
+        plan = self._pipeline.plans[0]
+        if page is self._sensor_page:
+            history = list(self._temperature_history)
+            band = None
+            made = getattr(plan, 'reflectance_temperature_c', None)
+            limit = getattr(plan, 'reflectance_max_dtemp_c', 0.0) or 0.0
+            if made is not None and limit:
+                band = (made - limit, made + limit, 'success', f"reflectance made at {made:.1f} °C ± {limit:g}")
+            now = time.time()
+            if self._live:
+                message = 'waiting for the first reading (every 10 s)' if not history else ''
+            else:
+                message = ('file playback: recorded at ' + (f"{plan.temperature_c:.1f} °C" if plan.temperature_c
+                                                            is not None else 'unknown temperature'))
+            series = [('sensor', [(t - now) / 60.0 for t, _ in history], [v for _, v in history], 'accent', False)]
+            self.temperature_plot.set_series(series, band, message)
+            latest = history[-1] if history else None
+            if latest is None and not self._live and plan.temperature_c is not None:
+                latest = (None, float(plan.temperature_c))
+            self._temperature_value.setText('' if latest is None else f"{latest[1]:.1f} °C")
+            notes = [] if latest is not None else ['no reading']
+            if latest is not None and latest[0] is not None:
+                notes.append(f"read {now - latest[0]:.0f} s ago")
+            elif latest is not None:
+                notes.append('recorded')
+            state = 'neutral'
+            if latest is not None and made is not None:
+                diff = latest[1] - made
+                notes.append(f"{diff:+.1f} °C from the reflectance calibration")
+                state = 'warn' if limit and abs(diff) > limit else 'ok'
+            self._temperature_note.setText('  ·  '.join(notes))
+            if self._temperature_value.property('state') != state:
+                self._temperature_value.setProperty('state', state)
+                self._temperature_value.style().unpolish(self._temperature_value)
+                self._temperature_value.style().polish(self._temperature_value)
+        elif page is self._profile_page:
+            series, note = slit_profiles(self._pipeline, self._profile_snapshot)
+            self.profile_plot.set_series(series, message='no flat-field profile loaded')
+            self._profile_note.setText(note)
+        elif page is self._model_page:
+            self._refresh_model_page()
+        rows = calibration_files(self._pipeline)
+        if rows != self._files_shown:
+            self._files_shown = rows
+            while self._files_grid.count():
+                item = self._files_grid.takeAt(0)
+                if item.widget() is not None:
+                    _drop(item.widget())
+            for r, (step, name, age, state) in enumerate(rows):
+                dot = QLabel('●')
+                dot.setObjectName('blockDot')
+                dot.setProperty('state', state)
+                file_label = QLabel(name)
+                file_label.setProperty('state', state if state == 'warn' else '')
+                if step == 'Reflectance':
+                    file_label.setToolTip(str(plan.steps.get('reflectance', {}).get('why', '')))
+                for c, (widget, name_) in enumerate(((dot, None), (QLabel(step), 'fieldLabel'),
+                                                     (file_label, 'fileRow'), (QLabel(age), 'fileAge'))):
+                    if name_:
+                        widget.setObjectName(name_)
+                    self._files_grid.addWidget(widget, r, c)
+
+    #: slit rows averaged for the model page's live spectrum (spread over the slit)
+    _MODEL_PAGE_ROWS = 16
+
+    def _live_model_input(self) -> np.ndarray | None:
+        """Mean model-input spectrum (every input band) of the newest kept line, over the slit."""
+        snapshot = self._last_snapshot
+        lines = getattr(snapshot, 'canvas_lines', None)
+        if lines is None or not self._pipeline.spectrum_lines:
+            return None
+        slit = self._pipeline.slit_rows
+        rows = np.unique(np.linspace(0, slit - 1, min(slit, self._MODEL_PAGE_ROWS)).astype(int))
+        for line in [int(x) for x in np.asarray(lines)[::-1][:8] if x >= 0]:
+            spectra = [self._pipeline.spectrum_at(line, int(r)) for r in rows]
+            spectra = [v for v in spectra if v is not None]
+            if spectra:
+                with np.errstate(all='ignore'):
+                    return np.nanmean(np.asarray(spectra, np.float64), axis=0)
+        return None
+
+    def _refresh_model_page(self) -> None:
+        """Model bands inside the input range; the model input now against the training means."""
+        plan = self._pipeline.plans[0]
+        block = next((b for b in describe(self._pipeline)[1] if b.key == 'model'), None)
+        rows = dict(block.rows) if block is not None else {}
+        wl = None if plan.wavelengths is None else np.asarray(plan.wavelengths, np.float64)
+        train_wl, train = self.spectrum_panel.training_reference()
+        model_wl = self._model_bands(plan.columns, wl) if wl is not None and wl.size else None
+        if model_wl is None and train_wl.size:
+            model_wl = np.asarray(train_wl, np.float64)
+        inside = model_wl is None or wl is None or not wl.size or \
+            (model_wl.min() >= wl.min() - 1.0 and model_wl.max() <= wl.max() + 1.0)
+        self.band_bar.set_range(None if wl is None or not wl.size else (wl.min(), wl.max()),
+                                [] if model_wl is None else model_wl, 'accent' if inside else 'warning')
+        self._model_summary.setText(f"Bands: {rows.get('Bands', 'n/a')}   ·   expects {rows.get('Expects', 'n/a')}, "
+                                    f"receives {rows.get('Receives', 'n/a')}")
+        series = [(t.label, list(train_wl), list(t.mean), t.colour, True) for t in train
+                  if len(t.mean) == len(train_wl)]
+        live = self._live_model_input()
+        live_model = self._model_bands(plan.columns, live) if live is not None else None
+        notes, state = [], 'ok'
+        if live_model is not None and model_wl is not None and live_model.size == model_wl.size:
+            mismatch = block is not None and block.state == 'error'
+            series.append(('model input now (newest line, mean over the slit)', list(model_wl), list(live_model),
+                           'danger' if mismatch else 'accent', False))
+            finite = live_model[np.isfinite(live_model)]
+            means = np.concatenate([np.asarray(t.mean, np.float64) for t in train]) if train else np.zeros(0)
+            means = means[np.isfinite(means)]
+            if finite.size and means.size:
+                ratio = np.median(np.abs(finite)) / max(1e-12, np.median(np.abs(means)))
+                notes.append(f"Input now {finite.min():.3g} – {finite.max():.3g}, training means "
+                             f"{means.min():.3g} – {means.max():.3g}")
+                if not 1 / 3 <= ratio <= 3:
+                    notes.append(f"not on the same scale (×{ratio:.3g}): the classes will be wrong")
+                    state = 'error'
+        elif self._pipeline.spectrum_lines == 0:
+            notes.append('No model input kept: switch Spectrum on in the Operation tab to compare it here.')
+        else:
+            notes.append('Waiting for the first lines…')
+        if not train:
+            notes.append('this model brings no training spectra')
+        if block is not None and block.state == 'error':
+            state = 'error'                        # its note is in the detail panel beside
+        self.model_plot.set_series(series, message='no spectra yet')
+        self._model_note.setText('  ·  '.join(notes))
+        if self._model_note.property('state') != state:
+            self._model_note.setProperty('state', state)
+            repolish(self._model_note)
+
+    def _show_next_steps(self, blocks) -> None:
+        """The Next steps list: number, what to do, the button that does it (rebuilt only when the
+        steps or their buttons change; texts such as the measured fps are updated in place)."""
+        items = next_steps(blocks)
+        shape = [(state, action, button) for state, _, action, button in items]
+        if shape != self._next_shown:
+            self._next_shown = shape
+            while self._next_grid.count():
+                item = self._next_grid.takeAt(0)
+                if item.widget() is not None:
+                    _drop(item.widget())
+            for r, (state, text, action, button) in enumerate(items):
+                number = QLabel(str(r + 1))
+                number.setObjectName('stepNumber')
+                number.setProperty('state', state)
+                label = QLabel(text)
+                label.setObjectName('stepText')
+                label.setWordWrap(True)
+                self._next_grid.addWidget(number, r, 0, Qt.AlignTop)
+                self._next_grid.addWidget(label, r, 1)
+                if action:
+                    go = QPushButton(button)
+                    go.setObjectName('quietButton')
+                    go.clicked.connect(lambda _, a=action: self._on_pipeline_action(a))
+                    self._next_grid.addWidget(go, r, 2, Qt.AlignTop)
+            worst = 'error' if any(i[0] == 'error' for i in items) else 'warn'
+            self._next_frame.setProperty('state', worst)
+            repolish(self._next_frame)
+            self._next_frame.setVisible(bool(items))
+        else:
+            for r, (_, text, _, _) in enumerate(items):
+                label = self._next_grid.itemAtPosition(r, 1).widget()
+                if label.text() != text:
+                    label.setText(text)
+
+    def next_step_texts(self) -> list:
+        """Texts of the Next steps list (tests)."""
+        return [self._next_grid.itemAtPosition(r, 1).widget().text()
+                for r in range(len(self._next_shown or []))]
 
     # -------------------------------------------------------------------------- splitter ---
 
@@ -684,6 +1092,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._bin_box.blockSignals(False)
         self._show_flatfield_state()
         self._update_units_warning()
+        self._refresh_pipeline_view()
 
     def _on_spatial_bin_toggled(self, checked: bool) -> None:
         """2×2 bin of the model input on/off; kept for a pipeline restart (sensor settings)."""
@@ -693,44 +1102,68 @@ class PushbroomScannerMainWindow(QMainWindow):
         self.spectrum_panel.clear()
         self.spectrum_panel.set_note('Model input changed · click a newly acquired line to inspect the current input')
         self.performance_panel.reset_requested.emit()     # stage averages restart for the new chain
+        self._refresh_pipeline_view()
 
     def _reflectance_flatfield_state(self) -> tuple[str, str, str] | None:
-        """How the flat-field relates to the reflectance factors in use.
-
-        ``None`` while Reflectance is off. Else ``(state, profile in the factors, loaded profile)``
-        with state ``'in'`` (the factors contain it: it is active though its own step is off),
-        ``'mismatch'`` (they contain another profile than the one loaded) or ``'absent'``.
-        """
-        pipeline = self._pipeline
-        if not pipeline.effective_steps().get('reflectance'):
-            return None
-        plan = pipeline.plans[0]
-        inside = getattr(plan, 'reflectance_flatfield', None)
-        if not inside:
-            return 'absent', '', ''
-
-        def short(label: str) -> str:
-            return Path(label).parent.name or str(label)
-
-        loaded = getattr(plan, 'flatfield_profile', None)
-        if loaded is not None and short(loaded.label) != short(inside):     # profile id (folder name)
-            return 'mismatch', short(inside), short(loaded.label)
-        return 'in', short(inside), ''
+        """How the flat-field relates to the reflectance factors (``pipeline_overview.flatfield_state``)."""
+        return flatfield_state(self._pipeline)
 
     def _input_text(self) -> str:
         """What the model receives now, for the heading: counts or reflectance, with or without flat-field."""
-        steps = self._pipeline.effective_steps()
-        state = self._reflectance_flatfield_state()
-        if state is None:
-            return 'Counts + flat-field' if steps.get('flatfield') else 'Counts'
-        return 'Reflectance + flat-field' if state[0] in ('in', 'mismatch') else 'Reflectance'
+        return input_text(self._pipeline)
+
+    def _refresh_pipeline_view(self) -> None:
+        """Blocks of the Setup tab from the pipeline as it runs now (and the newest snapshot)."""
+        snapshot = self._last_snapshot
+        headline, blocks = describe(self._pipeline, snapshot, needed_fps=self._square_pixel_fps(), live=self._live)
+        self.pipeline_view.set_blocks(headline, blocks)
+        self._show_next_steps(blocks)
+        live_temperature = getattr(snapshot, 'sensor_temperature_c', None)
+        self.pipeline_view.set_status(status_items(self._pipeline, snapshot, self._live, live_temperature))
+        sensor = dict(next(b for b in blocks if b.key == 'sensor').rows)
+        self._peak_label.setText('   ·   '.join(f"{k}: {sensor[k]}" for k in ('Peak signal', 'Line rate', 'Lost lines')
+                                              if k in sensor))
+        self._refresh_workspace()
+
+    def _set_flatfield_in_reflectance(self, keep: bool) -> bool:
+        """Keep the flat-field inside the reflectance factors or take it out (hsi); a refusal is shown."""
+        try:
+            self._pipeline.set_flatfield_in_reflectance(keep)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Flat-field", f"Not taken out of the reflectance factors:\n{exc}")
+            return False
+        return True
+
+    def _on_pipeline_action(self, action: str) -> None:
+        """A button of the pipeline view's detail panel."""
+        if action.startswith('flatfield_in:'):
+            if self._set_flatfield_in_reflectance(action.endswith(':on')):
+                self._save_steps()
+                self.spectrum_panel.clear()
+            self._show_flatfield_state()
+            self._update_units_warning()
+        elif action.startswith('toggle:'):
+            step = action.split(':', 1)[1]
+            self._on_step_toggled(step, not self._pipeline.effective_steps().get(step, False))
+        elif action == 'spatial_bin':
+            self._bin_box.setChecked(not self._bin_box.isChecked())
+        elif action == 'sensor':
+            self._open_sensor_dialog()
+        elif action == 'reflectance':
+            self._open_reflectance_dialog()
+        elif action == 'model':
+            self._workspace.setCurrentWidget(self._operation_page)
+            self._side_tabs.setCurrentWidget(self.class_legend_widget)
+        self._refresh_pipeline_view()
 
     def _show_flatfield_state(self) -> None:
         """Make the Flat-field box show what happens to the data, not only its own switch.
 
         Factors of a "Flat-field + reference" calibration contain the flat-field, so its step is
         off while Reflectance is on (it must not divide twice) - but it is active: the box is then
-        shown checked and locked. Factors without it: unchecked and locked, with the way out.
+        shown checked. As in hsi, unticking it takes the profile out of the factors (factors x F /
+        F_ROI) when that profile is known, ticking puts it back; else it stays locked. Factors
+        without it: unchecked and locked, with the way out.
         """
         labels = dict(self._STEP_LABELS)
         plans = self._pipeline.plans
@@ -738,9 +1171,12 @@ class PushbroomScannerMainWindow(QMainWindow):
         infos = [plan.steps.get('flatfield', {'available': False, 'why': ''}) for plan in plans]
         reflectance_tip = plans[0].steps.get('reflectance', {}).get('why', '')
         state = self._reflectance_flatfield_state()
+        from flatfield_profile import reflectance_flat
+        switchable = state is not None and (state[0] == 'out' or (state[0] != 'absent'
+                                                                  and reflectance_flat(plans[0])[0] is not None))
         box.blockSignals(True)
-        box.setAttribute(Qt.WA_TransparentForMouseEvents, state is not None and state[0] != 'absent')
-        box.setFocusPolicy(Qt.NoFocus if state is not None else Qt.StrongFocus)
+        box.setAttribute(Qt.WA_TransparentForMouseEvents, state is not None and not switchable)
+        box.setFocusPolicy(Qt.NoFocus if state is not None and not switchable else Qt.StrongFocus)
         reflectance_box.setText(labels['reflectance'])
         if state is None:                                  # Reflectance off: the step is its own switch
             box.setText(labels['flatfield'])
@@ -755,12 +1191,23 @@ class PushbroomScannerMainWindow(QMainWindow):
                            "To use it with Reflectance: calibrate again with 'Flat-field + reference'.\n"
                            "To use the Flat-field step alone: untick Reflectance first.")
             reflectance_tip += "\nNo flat-field in this calibration"
+        elif state[0] == 'out':
+            box.setText(f"{labels['flatfield']} (out of reference)")
+            box.setEnabled(True)
+            box.setChecked(False)
+            box.setToolTip(f"Taken out of the reflectance factors: {state[1]} (factors × F / F_ROI).\n"
+                           "The white target stays at its reflectance, the falloff along the slit is left in.\n"
+                           "Tick to put it back into the factors.")
+            reflectance_tip += f"\nFlat-field {state[1]} taken out of the factors"
         else:
-            box.setText(f"{labels['flatfield']} 🔒 in reference")
+            box.setText(f"{labels['flatfield']} {'' if switchable else '🔒 '}in reference")
             box.setEnabled(True)
             box.setChecked(True)
             box.setToolTip(f"Active inside the reflectance factors: {state[1]}.\n"
-                           "It is not applied a second time; untick Reflectance to switch both off.")
+                           "It is not applied a second time. " +
+                           ("Untick to take it out of the factors (hsi: Flat-field off with Radiometric on)."
+                            if switchable else "Its values are not known here: untick Reflectance to switch "
+                            "both off."))
             reflectance_tip += f"\nIncludes flat-field: {state[1]}"
             if state[0] == 'mismatch':
                 reflectance_box.setText(f"{labels['reflectance']} ⚠")
@@ -769,7 +1216,15 @@ class PushbroomScannerMainWindow(QMainWindow):
         box.blockSignals(False)
         reflectance_box.setToolTip(reflectance_tip)
 
-    def _on_step_toggled(self, name: str, checked: bool) -> None:
+    def _switch_step(self, name: str, checked: bool) -> None:
+        """Turn one step on/off in the pipeline, with the Dark/Flip/Smile/Keystone it needs.
+
+        Flat-field while Reflectance runs with factors that hold the profile: not the step (it
+        would switch Reflectance off), but keeping it in / taking it out of the factors."""
+        if name == 'flatfield' and self._pipeline.effective_steps().get('reflectance') and \
+                getattr(self._pipeline.plans[0], 'reflectance_flatfield', None):
+            self._set_flatfield_in_reflectance(checked)
+            return
         if checked and name == 'flatfield':
             for plan in self._pipeline.plans:
                 flat = plan.flatfield_profile
@@ -782,6 +1237,59 @@ class PushbroomScannerMainWindow(QMainWindow):
                 if required:                 # factors of an hsi reference: the steps they were made with
                     self._pipeline.set_steps(**required)
         self._pipeline.set_steps(**{name: checked})
+
+    # Steps the operator switched on a live camera are kept for the next start: otherwise the
+    # program opens with the config's defaults (Flat-field off) and classifies differently.
+    _STEPS_KEY = "processing_steps_v1"
+    _KEPT_STEPS = ('dark', 'flip', 'smile', 'keystone', 'flatfield', 'reflectance')
+
+    def _steps_key(self) -> str:
+        camera = getattr(self._pipeline.plans[0], 'camera_id', None) or 'camera'
+        return f"{self._STEPS_KEY}/{camera}"
+
+    def _save_steps(self) -> None:
+        if not self._live:
+            return
+        on = self._pipeline.effective_steps()
+        kept = {k: bool(on.get(k)) for k in self._KEPT_STEPS}
+        kept['flatfield_in_reflectance'] = self._pipeline.flatfield_in_reflectance
+        self._settings().setValue(self._steps_key(), json.dumps(kept))
+
+    def _restore_steps(self) -> None:
+        """Live camera: start with the steps the operator last used on this camera."""
+        if not self._live:
+            return
+        try:
+            saved = json.loads(self._settings().value(self._steps_key()) or 'null')
+        except (TypeError, ValueError):
+            saved = None
+        if not isinstance(saved, dict):
+            return
+        plan = self._pipeline.plans[0]
+
+        def available(name):
+            return bool(plan.steps.get(name, {}).get('available'))
+        base = {k: bool(saved[k]) for k in ('dark', 'flip', 'smile', 'keystone') if k in saved and available(k)}
+        if base:
+            self._pipeline.set_steps(**base)
+        if saved.get('flatfield') and available('flatfield'):
+            self._switch_step('flatfield', True)
+        elif 'reflectance' in saved and available('reflectance'):
+            self._pipeline.set_steps(flatfield=False)
+            self._switch_step('reflectance', bool(saved['reflectance']))
+        elif 'flatfield' in saved and available('flatfield'):
+            self._pipeline.set_steps(flatfield=False)
+        if saved.get('flatfield_in_reflectance') is False and getattr(plan, 'reflectance_flatfield', None):
+            try:
+                self._pipeline.set_flatfield_in_reflectance(False)
+            except ValueError as exc:
+                logger.warning("Flat-field stays inside the reflectance factors: %s", exc)
+        logger.info("Processing steps restored from the last session: %s",
+                    ', '.join(f"{k}={'on' if v else 'off'}" for k, v in self._pipeline.effective_steps().items()))
+
+    def _on_step_toggled(self, name: str, checked: bool) -> None:
+        self._switch_step(name, checked)
+        self._save_steps()
         self.spectrum_panel.clear()
         self.spectrum_panel.set_note('Processing changed · click a newly acquired line to inspect the current input')
         for step, box in self._step_boxes.items():
@@ -791,6 +1299,7 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._show_flatfield_state()
         self.performance_panel.reset_requested.emit()     # stage averages restart for the new chain
         self._update_units_warning()
+        self._refresh_pipeline_view()
 
     def _update_units_warning(self) -> None:
         classifier = self._pipeline.classifier
@@ -986,6 +1495,10 @@ class PushbroomScannerMainWindow(QMainWindow):
         charts_due = self._tick % max(1, round(hz / 5)) == 0
         focus_due = self._tick % max(1, round(hz * FocusPanel.INTERVAL_S)) == 0
 
+        self._last_snapshot = s
+        self._record_temperature(s)
+        if self._tick % max(1, round(hz / 2)) == 0 and self.pipeline_view.isVisible():
+            self._refresh_pipeline_view()                  # 2 Hz, only on the Setup tab
         if s.raw_frame is not None and not self._preview_collapsed():
             self._set_pixmap(self._raw_label, _to_gray8(
                 s.raw_frame, self._raw_label.size()), Qt.KeepAspectRatio)
@@ -1377,6 +1890,9 @@ class PushbroomScannerMainWindow(QMainWindow):
         meta = src.metadata or {}
         temperature = next((meta[k] for k in ('sensor_temperature_c', 'temperature_c', 'sensor_temperature_c_start')
                             if meta.get(k) is not None), None)
+        live = getattr(self._last_snapshot, 'sensor_temperature_c', None)
+        if live is not None:                               # the sensor now, not at the start
+            temperature = live
         return {'camera': src.name, 'camera_id': plan.camera_id, 'camera_backend': plan.camera_backend,
                 'camera_bin': plan.camera_bin,
                 'exposure_ms': plan.exposure_ms, 'gain': plan.gain,
@@ -1474,10 +1990,18 @@ class PushbroomScannerMainWindow(QMainWindow):
         label = f"{path.name} ({kind} {factors.shape}, drawn in dialog, {info['reference']})"
         if inside:
             label += f", includes flat-field {Path(inside).parent.name or inside}"
+        from sim_config import flatfield_copy_path, roi_weights
+        flat = getattr(plan, 'flatfield_profile', None) if inside else None
+        flat_values = np.asarray(flat.values, np.float32) if flat is not None else None
         moved = []
         try:
             moved = backup_profile(path)
             save_profile(path.parent, [name], factors, plan.wavelengths, info)
+            copy = flatfield_copy_path(path)
+            if flat_values is not None:
+                np.save(copy, flat_values)              # F the factors hold (hsi keeps flatfield.npy)
+            elif copy.is_file():
+                copy.unlink()                           # an older F does not belong to these factors
         except Exception as exc:
             for backup in moved:                         # put the previous profile back
                 suffix = backup.name[len(path.stem) + 1 + len('YYYYmmdd-HHMMSS'):]
@@ -1489,14 +2013,19 @@ class PushbroomScannerMainWindow(QMainWindow):
             QMessageBox.critical(self, "Reflectance", f"Not saved, nothing changed:\n{exc}")
             return False
         try:
+            from modules.dark import valid_temperature
             self._pipeline.set_reflectance_factors(factors, label, flatfield=inside,
-                                                   requires=info.get('made_with'))
+                                                   flatfield_values=flat_values,
+                                                   roi_weights=roi_weights(info, factors),
+                                                   requires=info.get('made_with'),
+                                                   temperature_c=valid_temperature(info.get('temperature_c')))
         except Exception as exc:
             logger.exception("Reflectance calibration saved but not applied")
             QMessageBox.critical(self, "Reflectance", f"Saved to {path.name} but not applied:\n{exc}")
             return False
         logger.info("Reflectance calibrated on RAW: %s%s", path,
                     f" (previous moved to {moved[0].parent})" if moved else '')
+        self._save_steps()                                 # Reflectance is on now: so at the next start
         self._setup_step_switches()
         self.spectrum_panel.clear()
         self.spectrum_panel.set_note('Calibration applied · old spectra cleared; click a newly acquired line to verify')
@@ -1514,12 +2043,16 @@ class PushbroomScannerMainWindow(QMainWindow):
         if not dialog.exec_():
             return
         values = dialog.values()
+        self._apply_sensor_values(values, lambda: dialog.save(values))
+
+    def _apply_sensor_values(self, values: dict, save) -> None:
+        """Restart with new exposure / gain / bin; ``save()`` writes them when asked and they worked."""
         acquisition = replace(self.config.acquisition, exposure_ms=values['exposure_ms'], gain=values['gain'],
                               camera_bin=values['camera_bin'])
         new_config = replace(self.config, acquisition=acquisition).validate()
         if self._restart_pipeline(new_config) and values['save']:      # never save values that failed
             try:
-                dialog.save(values)
+                save()
             except Exception as exc:
                 QMessageBox.warning(self, "Sensor", f"Settings not saved to the config file:\n{exc}")
 
@@ -1556,7 +2089,9 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._show_model_classes(0)                    # the new pipeline starts with config.model.path
         self._scan_models()                            # other bands after a bin change: other models fit
         self._setup_backend_selector()
+        self._restore_steps()
         self._setup_step_switches()
+        self._build_sensor_form()
         self._forget_previous_counts()
         self._info_label.setText(self._plan_text())
         self._raw_range = None

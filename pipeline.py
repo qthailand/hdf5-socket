@@ -224,6 +224,7 @@ class Snapshot:
     raw_lines: np.ndarray | None = None   # line number of each raw_canvas column (-1 = none yet)
     calibration_lines: int = 0       # lines held by the calibration capture (0 = not capturing)
     model_generation: int = 0        # counts and canvas belong to this model (see Pipeline.set_classifier)
+    sensor_temperature_c: float | None = None   # live: read every 10 s while streaming (None: not reported)
     canvas_lines: np.ndarray | None = None   # line number of each canvas column (-1 = lost / none yet)
 
 
@@ -396,6 +397,7 @@ class Pipeline:
         self._lost = 0
         self._lost_camera = 0                    # live: frames the camera never delivered (in _lost too)
         self._grab_timeouts = 0                  # live: reads without a frame
+        self._sensor_temperature = None          # live: newest sensor temperature (camera_source.TemperaturePoll)
         self._line_clock = 'schedule' if camera is None else 'arrival'
         self._slips = 0
         self._camera_fps = 0.0
@@ -429,6 +431,9 @@ class Pipeline:
         # Spatial bin of the model input (processing.spatial_bin, set_spatial_bin): 2 pairs
         # consecutive lines at dispatch (the camera thread holds one line until the next comes).
         self._spatial_bin = int(config.processing.spatial_bin)
+        # False: "Flat-field + reference" factors are used with the profile taken out (hsi:
+        # Flat-field off with Radiometric on; set_flatfield_in_reflectance)
+        self._flatfield_in_reflectance = True
         self._waiting: _Job | None = None
         self._line_period = 0.0                  # s between handed-over lines (mean), for the idle flush
         self._last_queued = 0.0
@@ -793,8 +798,43 @@ class Pipeline:
             order = order[-int(max(1, max_mb * 1e6 // per_line)):]
             return ids[order].copy(), self._spec_ring[order]       # fancy index: a copy
 
+    @property
+    def flatfield_in_reflectance(self) -> bool:
+        """False: factors that hold a flat-field profile are used with it taken out
+        (:meth:`set_flatfield_in_reflectance`)."""
+        return self._flatfield_in_reflectance
+
+    def set_flatfield_in_reflectance(self, keep: bool) -> None:
+        """Keep the flat-field inside "Flat-field + reference" factors, or take it out (hsi: Flat-field
+        off with Radiometric on): ``factors x F / F_ROI``, the target's rows stay at ``R`` and the
+        falloff along the slit is left in. Factors without a profile are not touched.
+
+        Raises:
+            ValueError: taking out is asked but the profile inside some factors is not known.
+        """
+        from flatfield_profile import factors_without_flatfield, reflectance_flat
+        outs = []
+        for plan in self.plans:
+            out = None
+            if not keep and getattr(plan, 'reflectance_flatfield', None) and plan.reflectance_factors is not None:
+                flat, weights, why = reflectance_flat(plan)
+                if flat is None:
+                    raise ValueError(f"the flat-field inside the factors is not known: {why}")
+                out = factors_without_flatfield(plan.reflectance_factors, flat, weights)
+            outs.append(out)
+        with self._lock:
+            for plan, out in zip(self.plans, outs):
+                plan.reflectance_factors_flat_out = out
+            changed = self._flatfield_in_reflectance != bool(keep)
+            self._flatfield_in_reflectance = bool(keep)
+            if changed:
+                self._invalidate_spectra_locked()
+        logger.info("Flat-field inside the reflectance factors: %s", 'kept' if keep else 'taken out')
+
     def set_reflectance_factors(self, factors: np.ndarray, label: str, plan_index: int = 0,
-                                flatfield: str | None = None, requires: dict | None = None) -> None:
+                                flatfield: str | None = None, requires: dict | None = None,
+                                temperature_c: float | None = None, flatfield_values=None,
+                                roi_weights=None) -> None:
         """Use new reflectance factors from the next line on and switch the step on.
 
         ``flatfield``: label of the flat-field profile the factors already contain (a
@@ -810,6 +850,15 @@ class Pipeline:
         plan.reflectance_requires = dict(requires or {})
         plan.reflectance_placeholder = False
         plan.reflectance_flatfield = flatfield
+        plan.reflectance_flatfield_values = None if flatfield_values is None else np.asarray(flatfield_values, np.float32)
+        plan.reflectance_flatfield_note = 'kept with the factors' if flatfield_values is not None else ''
+        plan.reflectance_roi_weights = roi_weights
+        plan.reflectance_temperature_c = temperature_c
+        if not self._flatfield_in_reflectance:          # new factors: take their profile out too, if known
+            from flatfield_profile import factors_without_flatfield, reflectance_flat
+            flat, weights, _ = reflectance_flat(plan) if flatfield else (None, None, '')
+            plan.reflectance_factors_flat_out = (factors_without_flatfield(factors, flat, weights)
+                                                 if flat is not None else None)
         plan.steps['reflectance'] = {'available': True, 'on': True, 'why': label}
         plan.provenance['reflectance'] = (label, 'drawn on RAW')
         self.set_steps(reflectance=True)
@@ -892,7 +941,7 @@ class Pipeline:
                 line_clock=self._line_clock, raw_lines=raw_lines,
                 canvas_lines=self._canvas_lines[columns[offsets]],
                 calibration_lines=0 if self._cal_ids is None else int((self._cal_ids >= 0).sum()),
-                model_generation=self._drawn_generation)
+                model_generation=self._drawn_generation, sensor_temperature_c=self._sensor_temperature)
         return snap
 
     # --------------------------------------------------------------------------- camera ---
@@ -1004,7 +1053,7 @@ class Pipeline:
         frames it lost itself not, so an outage does not end in a spike), ``camera_fps`` the rate
         of frames that reached the buffers. Both fall to 0 while the camera delivers nothing.
         """
-        from camera_source import CameraClock, CameraFrameGaps
+        from camera_source import CameraClock, CameraFrameGaps, TemperaturePoll
         camera = self.camera
         timeout_ms = int(self.config.live.read_timeout_ms)
         shape = tuple(self._buffers.shape[1:])
@@ -1036,6 +1085,7 @@ class Pipeline:
                     return
                 raise
             gaps, clock = CameraFrameGaps(camera), CameraClock(camera)
+            temperature = TemperaturePoll(camera)
             gaps.start()
             self._t0 = time.perf_counter()
             self._state = 'running'
@@ -1048,6 +1098,8 @@ class Pipeline:
                 target = scratch if slot is None else self._buffers[slot]
                 frame = camera.read_frame_raw_into(provide, timeout_ms=timeout_ms)
                 t_arrival = time.perf_counter()
+                if temperature.due(t_arrival):
+                    self._sensor_temperature = temperature.read(t_arrival)
                 if frame is None:
                     if slot is not None:
                         self._free.put(slot)
@@ -1118,6 +1170,7 @@ class Pipeline:
             received = c['received']
             self._lost, self._lost_camera = c['lost'], c['lost_camera']
             self._grab_timeouts, self._line_clock = c['timeouts'], c['line_clock']
+            self._sensor_temperature = c.get('temperature_c')
             if rates and now - rate_t >= _RATE_PERIOD_S:
                 self._camera_fps = rate_n / (now - rate_t)
                 self._fps = (received - rate_received) / (now - rate_t)
@@ -1307,7 +1360,10 @@ class Pipeline:
                 binned = np.divide(binned, flat.values, dtype=np.float32)
         if on['reflectance']:                                     # last step before the model
             with prof.time('reflectance'):
-                binned = apply_reflectance(binned, plan.reflectance_factors)
+                factors = plan.reflectance_factors
+                if not self._flatfield_in_reflectance and plan.reflectance_factors_flat_out is not None:
+                    factors = plan.reflectance_factors_flat_out   # flat-field taken out (hsi)
+                binned = apply_reflectance(binned, factors)
         return binned, pre, clipped
 
     def _new_runtime(self, k: int, backend: str) -> PreprocessingRuntime:

@@ -97,6 +97,74 @@ def load_flatfield(path, plan) -> FlatField:
                      keystone and bool(key['smile_corrected']))
 
 
+def flatfield_fits(factors, flat) -> bool:
+    """True when ``factors`` were fitted with the profile ``flat`` (hsi ``check_flatfield_fits``:
+    ``factors x F`` the same at every slit row of each band); False for per-band factors."""
+    factors = np.asarray(factors)
+    if flat is None or factors.ndim != 2:
+        return False
+    from modules.radiometric.reference import check_flatfield_fits
+    try:
+        check_flatfield_fits(factors, flat)
+        return True
+    except ValueError:
+        return False
+
+
+def factors_without_flatfield(factors, flat, row_weights=None) -> np.ndarray:
+    """Factors with the flat-field profile ``F`` taken out (hsi ``ScanController._without_flatfield``).
+
+    ``factors = scale / F`` with ``F`` of median 1 over the slit, not 1 at the white target, so
+    ``factors x F`` alone gives ``R x F_ROI`` on the target. Divided by ``F_ROI`` - the mean of ``F``
+    over the ROI per band, weighted by ``row_weights`` (ROI pixels per slit row; ``None``: every
+    row) - the target's rows stay at ``R``, the falloff along the slit is left in.
+
+    Raises:
+        ValueError: shapes do not fit, no ROI row, or the result is not finite and positive.
+    """
+    factors = np.asarray(factors, np.float64)
+    flat = np.asarray(flat, np.float64)
+    if factors.ndim != 2 or flat.shape != factors.shape:
+        raise ValueError(f"flat-field {flat.shape} does not fit the factors {factors.shape}")
+    weights = np.ones(flat.shape[0]) if row_weights is None else np.asarray(row_weights, np.float64)
+    if weights.shape != (flat.shape[0],) or weights.sum() <= 0:
+        raise ValueError("the reference's ROI does not fit its factors")
+    flat_at_roi = weights @ flat / weights.sum()
+    out = (factors * flat / flat_at_roi[None, :]).astype(np.float32)
+    if not np.all(np.isfinite(out)) or np.any(out <= 0):
+        raise ValueError("the profile does not fit the reference")
+    return out
+
+
+def reflectance_flat(plan) -> tuple:
+    """``(F, ROI row weights, where F came from)`` of the flat-field inside the plan's reflectance
+    factors, or ``(None, weights, why not)``.
+
+    ``F`` kept with the factors (hsi's ``flatfield.npy``, the copied store, this project's
+    ``<name>.flatfield.npy``) comes first; else the loaded profile when the factors were fitted
+    with it. Cached per factors / loaded profile (called at 2 Hz by the Setup tab).
+    """
+    factors = getattr(plan, 'reflectance_factors', None)
+    loaded = getattr(plan, 'flatfield_profile', None)
+    key = (id(factors), id(loaded), id(getattr(plan, 'reflectance_flatfield_values', None)))
+    cached = getattr(plan, '_reflectance_flat_cache', None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    weights = getattr(plan, 'reflectance_roi_weights', None)
+    kept = getattr(plan, 'reflectance_flatfield_values', None)
+    if not getattr(plan, 'reflectance_flatfield', None) or factors is None:
+        result = (None, weights, 'the factors hold no flat-field')
+    elif kept is not None:
+        result = (kept, weights, getattr(plan, 'reflectance_flatfield_note', '') or 'kept with the factors')
+    elif loaded is not None and flatfield_fits(factors, loaded.values):
+        result = (np.asarray(loaded.values, np.float32), weights, f"loaded profile {Path(loaded.label).parent.name}")
+    else:
+        note = getattr(plan, 'reflectance_flatfield_note', '')
+        result = (None, weights, note or 'the profile inside the factors is neither kept nor loaded')
+    plan._reflectance_flat_cache = (key, result)
+    return result
+
+
 def install_flatfield(plan, profile, enabled=False):
     plan.flatfield_profile = profile
     plan.steps['flatfield'] = {'available': True, 'on': enabled,

@@ -196,13 +196,49 @@ def scan_full_scale(meta: dict) -> int | None:
 class HsiReference:
     """An active hsi reference chosen for a stream (:func:`find_reference`)."""
 
-    def __init__(self, reference, factors: np.ndarray, bands: np.ndarray, camera_folder: Path, steps: dict):
+    def __init__(self, reference, factors: np.ndarray, bands: np.ndarray, camera_folder: Path, steps: dict,
+                 rows=None):
         self.reference = reference             # modules.radiometric.reference.RadiometricReference
         self.factors = factors                 # float32 (slit rows, stream bands)
         self.bands = bands                     # indices of the reference's bands the stream uses
         self.camera_folder = camera_folder
         #: Dark / Flip / Smile / Keystone as the reference was made: the stream must run so
         self.steps = steps
+        self.rows = rows                       # slit rows of the reference the stream keeps (None: all)
+
+    def flatfield_parts(self) -> tuple:
+        """``(F, ROI pixels per slit row, note)`` of a "Flat-field + reference" reference, cut to
+        the stream like :attr:`factors`; ``(None, weights, note)`` when ``F`` is not known.
+
+        ``F`` is the copy hsi keeps with the reference (``flatfield.npy``), else, for a reference
+        stored before that, the profile of that id in the copied camera folder - each accepted only
+        when the factors were fitted with it (hsi ``check_flatfield_fits``)."""
+        flat_id = self.reference.info.get('flatfield')
+        weights = None
+        try:
+            weights = np.asarray(self.reference.roi_mask(), bool).sum(axis=1).astype(np.float64)
+        except Exception as exc:                                   # missing / unreadable mask
+            logger.warning("hsi %s: ROI mask not readable: %s", self.id, exc)
+        if weights is not None and self.rows is not None:
+            weights = weights[self.rows]
+        if not flat_id:
+            return None, weights, ''
+        from modules.radiometric.reference import check_flatfield_fits
+        try:
+            flat = self.reference.flatfield()
+            source = 'kept with the reference'
+            if flat is None:
+                path = self.camera_folder / 'flatfield' / str(flat_id) / 'profile.npy'
+                if not path.is_file():
+                    return None, weights, f"{flat_id} is not in the copied camera folder"
+                flat = check_flatfield_fits(self.reference.factors(), np.load(path, allow_pickle=False))
+                source = 'from the copied flat-field folder'
+        except (ValueError, OSError) as exc:
+            return None, weights, str(exc)
+        flat = np.asarray(flat, np.float32)
+        if self.rows is not None:
+            flat = flat[self.rows]
+        return np.ascontiguousarray(flat[:, self.bands]), weights, source
 
     @property
     def id(self) -> str:
@@ -347,17 +383,19 @@ def find_reference(plan, meta: dict, now: datetime.datetime | None = None):
         except Exception as exc:                    # missing, truncated, wrong shape ... (as hsi)
             rejected[ref.id] = (f"{UNREADABLE}: factors: {exc or type(exc).__name__}",)
             continue
+        rows = None
         if not state[2] and factors.shape[0] != plan.n_slit:
-            factors = factors[plan.slit_rows]       # hsi kept every row; the plan crops the keystone margin
-        fitting.append((ref, state, factors[:, bands], bands))
+            rows = plan.slit_rows                   # hsi kept every row; the plan crops the keystone margin
+            factors = factors[rows]
+        fitting.append((ref, state, factors[:, bands], bands, rows))
     if not fitting:
         return None, ReferenceMatch(None, rejected).reason()
-    ref, state, factors, bands = next((f for f in fitting if f[1] == start), fitting[0])
+    ref, state, factors, bands, rows = next((f for f in fitting if f[1] == start), fitting[0])
     if not np.isfinite(factors).all() or (factors <= 0).any():
         # hsi records such a scan in counts and calibrates it afterwards with this reference;
         # a live model cannot wait, and an older reference is not what hsi would use
         return None, (f"{ref.id} not applied: factors have NaN or non-positive values in the stream's "
                       "bands (bands outside the reflectance table)")
     steps = {'dark': state[0], 'flip': bool(ref.key.raw_inverted), 'smile': state[1], 'keystone': state[2]}
-    return (HsiReference(ref, np.ascontiguousarray(factors, dtype=np.float32), bands, folder, steps),
+    return (HsiReference(ref, np.ascontiguousarray(factors, dtype=np.float32), bands, folder, steps, rows),
             f"calibrated with {ref.id}")

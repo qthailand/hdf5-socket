@@ -335,3 +335,21 @@ def test_ticking_reflectance_that_its_steps_keep_off_leaves_flatfield_on():
     assert fake._steps.get('flatfield') is None
     Pipeline.set_steps(fake, smile=True, reflectance=True)
     assert fake._steps['flatfield'] is False
+
+
+def test_older_hsi_reference_takes_its_flatfield_from_the_copied_folder():
+    """A reference stored before hsi kept flatfield.npy: F comes from flatfield/<id>/profile.npy,
+    accepted because the factors were fitted with it; the ROI rows come from roi_mask.npy."""
+    import numpy as np
+    from hsi_profiles import HsiReference
+    from modules.radiometric.reference import RadiometricReferenceStore
+    folder = ROOT / 'camera_profiles' / 'genicam' / 'fxo992MXGE-T_151498'
+    if not (folder / 'radiometric' / 'ref_20261118_111526').is_dir():
+        pytest.skip('copied fxo camera folder not present')
+    ref = RadiometricReferenceStore(folder / 'radiometric').load('ref_20261118_111526')
+    bands = np.arange(10, 50)
+    rows = slice(2, -2)
+    wrapped = HsiReference(ref, ref.factors()[rows][:, bands], bands, folder, {}, rows)
+    flat, weights, where = wrapped.flatfield_parts()
+    assert flat.shape == wrapped.factors.shape and 'flat-field folder' in where
+    assert weights.shape == (flat.shape[0],) and weights.sum() > 0

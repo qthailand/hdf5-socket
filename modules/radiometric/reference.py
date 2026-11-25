@@ -17,6 +17,9 @@ Layout of a store folder (in the application: the camera profile's ``radiometric
             factors.wavelength.npy     (bands,) float64 band centres, nm
             roi_mask.npy               bool (lines, samples) ROI of the reference scan
             roi_mean_spectrum.npy      (bands,) float64 mean ROI counts (when given)
+            flatfield.npy              (lines, bands) float32 flat-field profile F the factors hold
+                                       (``factors = scale / F``; only for a reference fitted with
+                                       one, whose ``info.flatfield`` names it; older ones have none)
         active.json                    {"format_version": 1, "active": ["ref_...", ...]}
 
 At most one active reference per key: activating one deactivates the others with the same key.
@@ -72,7 +75,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ReferenceKey", "RadiometricReference", "RadiometricReferenceStore", "ReferenceMatch",
            "reference_problems", "scan_temperature_c", "REFERENCE_FORMAT_VERSION", "UNREADABLE",
-           "DEFAULT_MAX_AGE_H", "DEFAULT_TEMPERATURE_TOLERANCE_C"]
+           "DEFAULT_MAX_AGE_H", "DEFAULT_TEMPERATURE_TOLERANCE_C", "check_flatfield_fits"]
 
 #: ``format_version`` of ``reference.json`` and ``active.json``.
 REFERENCE_FORMAT_VERSION = 1
@@ -86,6 +89,10 @@ _REFERENCE_FILE = "reference.json"
 _FACTORS_FILE = "factors.npy"
 _MASK_FILE = "roi_mask.npy"
 _MEAN_FILE = "roi_mean_spectrum.npy"
+_FLATFIELD_FILE = "flatfield.npy"
+#: Largest relative spread along the slit of ``factors x F`` (one scale per band when the factors
+#: were fitted with ``F``; float32 rounding gives about 1e-7).
+_FLATFIELD_FIT_RTOL = 1e-4
 _ACTIVE_FILE = "active.json"
 #: Temperatures at or below this are a camera's "no reading" value (-999), not a reading.
 _NO_TEMPERATURE_C = -273.15
@@ -488,6 +495,23 @@ class RadiometricReference:
         path = self.folder / _MEAN_FILE
         return np.load(path) if path.is_file() else None
 
+    def flatfield(self) -> Optional[np.ndarray]:
+        """The flat-field profile ``F`` the factors hold (``flatfield.npy``), float32 ``(lines,
+        bands)``, or ``None`` when none is stored (made without a profile, or before profiles were
+        stored with references: :attr:`info` ``["flatfield"]`` then names it in the flat-field store).
+
+        Raises:
+            ValueError: The stored profile is not the one the factors were fitted with
+                (:func:`check_flatfield_fits`).
+        """
+        path = self.folder / _FLATFIELD_FILE
+        if not path.is_file():
+            return None
+        try:
+            return check_flatfield_fits(self.factors(), np.load(path))
+        except ValueError as exc:
+            raise ValueError(f"{self.id}: {_FLATFIELD_FILE}: {exc}") from None
+
     def header_fields(self) -> dict:
         """Export-header metadata of a cube calibrated with this reference (``SCAN_HEADER_FIELDS`` keys)."""
         source = self.info.get("source")
@@ -531,6 +555,31 @@ class RadiometricReference:
                    avg_window_size=int(data.get("avg_window_size") or 0),
                    span=(int(span[0]), int(span[1])), roi_pixels=int(roi.get("pixels") or 0),
                    sensor_temperature_c=_temperature(data.get("sensor_temperature_c")), info=dict(info))
+
+
+def check_flatfield_fits(factors, flatfield) -> np.ndarray:
+    """``flatfield`` as float32 ``(lines, bands)``, refused unless it is the profile ``factors`` were
+    fitted with: finite and positive, the factors' shape, and ``factors x F`` the same at every slit
+    row of each band (``factors = scale / F``). Bands without factors (NaN) are not compared.
+
+    Raises:
+        ValueError: Otherwise.
+    """
+    factors = np.asarray(factors, dtype=np.float64)
+    flat = np.asarray(flatfield, dtype=np.float32)
+    if flat.shape != factors.shape:
+        raise ValueError(f"flat-field profile {flat.shape} does not fit the factors {factors.shape}")
+    if not np.all(np.isfinite(flat)) or np.any(flat <= 0):
+        raise ValueError("the flat-field profile must be finite and positive everywhere")
+    scale = factors * flat
+    bands = np.all(np.isfinite(scale), axis=0)
+    if bands.any():
+        per_band = scale[:, bands]
+        spread = np.max(np.abs(per_band / np.median(per_band, axis=0) - 1.0))
+        if spread > _FLATFIELD_FIT_RTOL:
+            raise ValueError(f"the factors were not fitted with this flat-field profile (factors x F differ "
+                             f"by {spread:.2%} along the slit)")
+    return flat
 
 
 def _sync_files(folder: Path) -> None:
@@ -639,7 +688,7 @@ class RadiometricReferenceStore:
 
     # ── writing ──
     def save(self, factors, key: ReferenceKey, *, reflectance_profile: str, avg_window_size: int, mask,
-             roi_mean_spectrum=None, sensor_temperature_c: Optional[float] = None,
+             roi_mean_spectrum=None, flatfield=None, sensor_temperature_c: Optional[float] = None,
              info: Optional[dict] = None, acquired_at=None,
              created_at: Optional[datetime.datetime] = None, activate: bool = False) -> RadiometricReference:
         """Store a new reference (and activate it when ``activate``).
@@ -651,6 +700,10 @@ class RadiometricReferenceStore:
             avg_window_size: ROI rows averaged per slit row.
             mask: Boolean ROI ``(lines, samples)`` the factors were fitted on.
             roi_mean_spectrum: Optional mean ROI counts per band.
+            flatfield: The flat-field profile ``F`` ``(lines, bands)`` the factors were fitted with
+                (:func:`~modules.radiometric.core.compute_flatfield_factors_array`), kept as
+                ``flatfield.npy`` so the reference holds it (name it in ``info["flatfield"]``).
+                ``None``: fitted without one.
             sensor_temperature_c: Mean sensor temperature of the reference scan.
             info: Further JSON-serialisable data (QC numbers, table range, source cube, ...).
             acquired_at: When the reference target was scanned: the scan's ``started_at`` (ISO text
@@ -663,7 +716,8 @@ class RadiometricReferenceStore:
 
         Raises:
             ValueError: The key is incomplete, or factors / mask / spectrum do not fit the key,
-                or no factor is a finite positive number.
+                or no factor is a finite positive number, or ``flatfield`` is not the profile the
+                factors were fitted with (:func:`check_flatfield_fits`).
             OSError: The folder cannot be written.
         """
         problems = key.missing()
@@ -683,6 +737,8 @@ class RadiometricReferenceStore:
             roi_mean_spectrum = np.asarray(roi_mean_spectrum, dtype=np.float64).ravel()
             if roi_mean_spectrum.size != n_bands:
                 raise ValueError(f"ROI mean spectrum has {roi_mean_spectrum.size} values for {n_bands} bands")
+        if flatfield is not None:
+            flatfield = check_flatfield_fits(factors, flatfield)
         created = created_at or datetime.datetime.now().astimezone()
         if created.tzinfo is None:
             created = created.astimezone()
@@ -715,6 +771,8 @@ class RadiometricReferenceStore:
             np.save(staging / _MASK_FILE, mask)
             if roi_mean_spectrum is not None:
                 np.save(staging / _MEAN_FILE, roi_mean_spectrum)
+            if flatfield is not None:
+                np.save(staging / _FLATFIELD_FILE, flatfield)
             for n in range(1, 1000):
                 ref_id = base if n == 1 else f"{base}_{n}"
                 target = self.folder / ref_id

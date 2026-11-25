@@ -419,6 +419,14 @@ class AcquisitionPlan:
     # Flat-field profile (its label) the reflectance factors already contain ("Flat-field +
     # reference" calibration): the Flat-field step must not run again, but it is active.
     reflectance_flatfield: str | None = None
+    #: that profile ``F`` (slit, bands) when kept with the factors (hsi ``flatfield.npy`` / store,
+    #: this project's ``<name>.flatfield.npy``); checked to be the one they were fitted with
+    reflectance_flatfield_values: np.ndarray | None = None
+    reflectance_flatfield_note: str = ''           # where F came from, or why it is not known
+    #: ROI pixels per slit row of the white the factors were fitted on (None: unknown -> every row)
+    reflectance_roi_weights: np.ndarray | None = None
+    #: the factors with that profile taken out (Pipeline.set_flatfield_in_reflectance(False))
+    reflectance_factors_flat_out: np.ndarray | None = None
     flatfield_profile: object = None               # portable HSI profile; immutable per-frame snapshot
     exposure_ms: float | None = None             # of the frames: a white of another exposure is scaled to it
     gain: float | None = None
@@ -431,6 +439,7 @@ class AcquisitionPlan:
     #: switches the reflectance factors were made with (an hsi reference): another setting of
     #: Dark / Flip / Smile / Keystone turns Reflectance off, as hsi refuses the reference
     reflectance_requires: dict = field(default_factory=dict)
+    reflectance_temperature_c: float | None = None   # sensor temperature the factors in use were made at
     reflectance_max_age_h: float = 0.0           # from corrections (0 = no age check)
     reflectance_max_dtemp_c: float = 0.0
     #: per step: {'available': bool, 'on': bool, 'why': str} for dark (+hot pixel), flip, smile, binning
@@ -953,10 +962,13 @@ def _reflectance_step(config, plan, source) -> None:
     if made_exp and plan.exposure_ms and abs(float(made_exp) - float(plan.exposure_ms)) > 1e-9:
         factors = factors * np.float32(float(made_exp) / float(plan.exposure_ms))
         label += f", scaled from {float(made_exp):g} ms to {float(plan.exposure_ms):g} ms"
+    plan.reflectance_temperature_c = _made_temperature(info)
     for note in _reflectance_warnings(plan, info):
         label += f", WARNING {note}"
         logger.warning("Reflectance %s: %s", path.name, note)
     plan.reflectance_flatfield = reflectance_flatfield(info)
+    plan.reflectance_flatfield_values, plan.reflectance_flatfield_note = kept_flatfield(path, factors)
+    plan.reflectance_roi_weights = roi_weights(info, factors)
     if plan.reflectance_flatfield:
         label += f", includes flat-field {Path(plan.reflectance_flatfield).parent.name or plan.reflectance_flatfield}"
     made_with = info.get('made_with') if isinstance(info.get('made_with'), dict) else {}
@@ -1012,12 +1024,16 @@ def _hsi_reflectance(config, plan, source, profile_path, wanted) -> bool:
     plan.reflectance_requires = dict(reference.steps)
     if wanted:
         label += _start_steps_as(plan, reference.steps, f"hsi reference {reference.id}")
+    plan.reflectance_temperature_c = _made_temperature(reference.info())
     for note in _reflectance_warnings(plan, reference.info()):
         label += f", WARNING {note}"
         logger.warning("Reflectance %s: %s", reference.id, note)
     plan.reflectance_factors = reference.factors
     plan.reflectance_placeholder = False
     plan.reflectance_flatfield = reference.flatfield
+    flat, weights, note = reference.flatfield_parts()
+    plan.reflectance_flatfield_values, plan.reflectance_roi_weights = flat, weights
+    plan.reflectance_flatfield_note = note
     if plan.reflectance_flatfield:
         label += f", includes flat-field {Path(plan.reflectance_flatfield).parent.name}"
     label += f"; made with {_steps_text(reference.steps)}"
@@ -1067,6 +1083,41 @@ def _own_factors_fit(plan, path) -> bool:
         return False
 
 
+def flatfield_copy_path(path) -> Path:
+    """``<name>.flatfield.npy`` beside factors ``<name>.npy``: the profile F they were fitted with."""
+    path = Path(path)
+    return path.with_name(path.stem + '.flatfield.npy')
+
+
+def kept_flatfield(path, factors) -> tuple:
+    """``(F, note)`` from ``<name>.flatfield.npy``, accepted only when ``factors`` were fitted with it."""
+    copy = flatfield_copy_path(path)
+    if not copy.is_file():
+        return None, ''
+    from flatfield_profile import flatfield_fits
+    try:
+        flat = np.load(copy, allow_pickle=False).astype(np.float32)
+    except (OSError, ValueError) as exc:
+        return None, f"{copy.name}: {exc}"
+    if not flatfield_fits(factors, flat):
+        return None, f"{copy.name} is not the profile the factors were fitted with"
+    return flat, f"kept as {copy.name}"
+
+
+def roi_weights(info: dict, factors) -> np.ndarray | None:
+    """Slit rows of the white (``info['rows']`` = [first, end)) as weights, else ``None``."""
+    rows = info.get('rows')
+    factors = np.asarray(factors)
+    if factors.ndim != 2 or not isinstance(rows, (list, tuple)) or len(rows) != 2:
+        return None
+    r0, r1 = int(rows[0]), int(rows[1])
+    if not 0 <= r0 < r1 <= factors.shape[0]:
+        return None
+    weights = np.zeros(factors.shape[0])
+    weights[r0:r1] = 1.0
+    return weights
+
+
 def reflectance_flatfield(info: dict) -> str | None:
     """Label of the flat-field profile inside factors with this ``<name>.json`` record, else ``None``.
 
@@ -1099,6 +1150,12 @@ def _check_binding(plan, path) -> None:
         raise ValueError(f"does not record the bin/gain it was made at; camera {plan.camera_id} needs factors "
                          "bound to its bin/gain (calibrate with Reflectance... or move them into its profile "
                          "with tools/migrate_profiles.py)")
+
+
+def _made_temperature(info: dict) -> float | None:
+    """Sensor temperature in a factor record (``temperature_c``), ``None`` when not recorded."""
+    from modules.dark import valid_temperature
+    return valid_temperature(info.get('temperature_c')) if isinstance(info, dict) else None
 
 
 def _reflectance_warnings(plan, info: dict) -> list[str]:

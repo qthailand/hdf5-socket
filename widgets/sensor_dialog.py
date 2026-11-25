@@ -11,18 +11,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                             QLabel, QSpinBox, QVBoxLayout)
+                             QGridLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from modules.dark import DarkFrameLibrary
 from sim_config import DEFAULT_CONFIG_PATH
 
 
-class SensorDialog(QDialog):
-    def __init__(self, parent, config, plan, config_path=None) -> None:
+class SensorForm(QWidget):
+    """Exposure, gain, bin and what they select (dark, reflectance), with an Apply button.
+
+    ``compact``: the Setup tab's layout (values in one row); else the dialog's form.
+    ``apply_requested`` is emitted by Apply; :meth:`values` / :meth:`save` as in the dialog.
+    """
+
+    apply_requested = pyqtSignal()
+
+    def __init__(self, config, plan, config_path=None, compact: bool = False, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Sensor settings")
-        self.setModal(True)
         self._config = config
         self._backend = plan.camera_backend or config.acquisition.camera_backend
         self._config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
@@ -77,25 +84,48 @@ class SensorDialog(QDialog):
                       "are scaled to the new one.")
         note.setWordWrap(True)
         note.setObjectName("metricCaption")
+        self.apply_button = QPushButton("Apply (restart)")
+        self.apply_button.setToolTip(note.text())
+        self.apply_button.clicked.connect(self.apply_requested.emit)
+        for label in (self.dark_note, self.refl_note):
+            label.setObjectName("rowSource")
 
-        form = QFormLayout()
-        form.addRow("Stored darks", self.preset)
-        form.addRow("Exposure", self.exposure)
-        form.addRow("Gain", self.gain)
-        form.addRow("Bin", self.camera_bin)
-        form.addRow("Dark frame", self.dark_note)
-        form.addRow("Reflectance", self.refl_note)
-        form.addRow("", self.rate_note)
-        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
-        buttons.addButton("Apply (restart)", QDialogButtonBox.AcceptRole)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(note)
-        layout.addWidget(self.save_box)
-        layout.addWidget(buttons)
-        self.setMinimumWidth(480)
+        if compact:
+            grid = QGridLayout(self)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(4)
+            for column, (text, widget) in enumerate((("Exposure", self.exposure), ("Gain", self.gain),
+                                                     ("Bin", self.camera_bin))):
+                caption = QLabel(text)
+                caption.setObjectName("fieldLabel")
+                grid.addWidget(caption, 0, column)
+                grid.addWidget(widget, 1, column)
+            grid.addWidget(self.apply_button, 1, 3)
+            stored = QLabel("Stored darks")
+            stored.setObjectName("fieldLabel")
+            grid.addWidget(stored, 0, 4)
+            grid.addWidget(self.preset, 1, 4)
+            grid.setColumnStretch(4, 1)
+            grid.addWidget(self.dark_note, 2, 0, 1, 5)
+            grid.addWidget(self.refl_note, 3, 0, 1, 5)
+            grid.addWidget(self.rate_note, 4, 0, 1, 3)
+            grid.addWidget(self.save_box, 4, 3, 1, 2)
+        else:
+            form = QFormLayout()
+            form.addRow("Stored darks", self.preset)
+            form.addRow("Exposure", self.exposure)
+            form.addRow("Gain", self.gain)
+            form.addRow("Bin", self.camera_bin)
+            form.addRow("Dark frame", self.dark_note)
+            form.addRow("Reflectance", self.refl_note)
+            form.addRow("", self.rate_note)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addLayout(form)
+            layout.addWidget(note)
+            layout.addWidget(self.save_box)
+            self.apply_button.setVisible(False)          # the dialog has its own buttons
         for widget in (self.exposure, self.gain):
             widget.valueChanged.connect(self._check)
         self.camera_bin.valueChanged.connect(self._check)
@@ -133,9 +163,32 @@ class SensorDialog(QDialog):
                     "Reflectance in the processing steps after the restart")
         path = profile_reflectance_path(replace(self._plan, camera_bin=values['camera_bin'], gain=values['gain']))
         if path is not None and path.is_file():
+            misfit = self._band_misfit(path, values)
+            if misfit:
+                return f"⚠ {path.name} is there but does not fit: {misfit}. Calibrate again (Reflectance...)"
             return f"✓ {path.name} (scaled to the exposure)"
         return (f"⚠ no {path.name if path else 'factors'} for bin {values['camera_bin']}, gain {values['gain']:g}: "
                 "Reflectance will be off until you calibrate (Reflectance...)")
+
+    def _band_misfit(self, path: Path, values) -> str:
+        """Why stored factors do not fit the bands the model gets now ('' = they fit or unknown).
+
+        Only checked at the running bin: another bin has other bands, known after the restart."""
+        if int(values['camera_bin']) != int(self._plan.camera_bin or 0) or self._plan.wavelengths is None:
+            return ''
+        sidecar = path.with_name(path.stem + '.wavelength.npy')
+        try:
+            import numpy as np
+            factors = np.load(path, mmap_mode='r')
+            stored = np.load(sidecar) if sidecar.is_file() else None
+        except (OSError, ValueError):
+            return ''
+        now = np.asarray(self._plan.wavelengths, np.float64)
+        if factors.shape[-1] == now.size and (stored is None or np.allclose(stored, now, atol=0.5)):
+            return ''
+        made = (f"{factors.shape[-1]} bands" + (f" {stored[0]:.0f}–{stored[-1]:.0f} nm" if stored is not None
+                                                 and stored.size else ''))
+        return f"{made}, the input has {now.size} bands {now[0]:.0f}–{now[-1]:.0f} nm"
 
     def values(self) -> dict:
         return {'exposure_ms': float(self.exposure.value()), 'gain': float(self.gain.value()),
@@ -148,3 +201,27 @@ class SensorDialog(QDialog):
         acquisition = data.setdefault('acquisition', {})
         acquisition.update(exposure_ms=values['exposure_ms'], gain=values['gain'], camera_bin=values['camera_bin'])
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding='utf-8')
+
+
+class SensorDialog(QDialog):
+    """:class:`SensorForm` in a modal window with Apply (restart) / Cancel."""
+
+    def __init__(self, parent, config, plan, config_path=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Sensor settings")
+        self.setModal(True)
+        self.form = SensorForm(config, plan, config_path)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        buttons.addButton("Apply (restart)", QDialogButtonBox.AcceptRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.form)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(480)
+
+    def values(self) -> dict:
+        return self.form.values()
+
+    def save(self, values: dict) -> None:
+        self.form.save(values)

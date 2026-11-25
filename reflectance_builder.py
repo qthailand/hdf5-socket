@@ -744,12 +744,12 @@ def verify_lines(lines: np.ndarray, rows: tuple[int, int], factors: np.ndarray, 
 
 
 def backup_profile(path) -> list[Path]:
-    """Move ``<name>.npy`` (+ ``.wavelength.npy``, ``.json``) to ``<folder>/history/<name>_<time>.*``."""
+    """Move ``<name>.npy`` (+ ``.wavelength.npy``, ``.flatfield.npy``, ``.json``) to ``<folder>/history/<name>_<time>.*``."""
     path = Path(path)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     history = path.parent / 'history'
     moved = []
-    for suffix in ('.npy', '.wavelength.npy', '.json'):
+    for suffix in ('.npy', '.wavelength.npy', '.flatfield.npy', '.json'):
         old = path.with_name(path.stem + suffix)
         if old.is_file():
             history.mkdir(parents=True, exist_ok=True)
