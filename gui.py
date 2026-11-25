@@ -633,7 +633,8 @@ class PushbroomScannerMainWindow(QMainWindow):
             self._sensor_form_box.removeWidget(self._sensor_form)
             _drop(self._sensor_form)
         if self._live:
-            self._sensor_form = SensorForm(self.config, self._pipeline.plans[0], self._config_path, compact=True)
+            self._sensor_form = SensorForm(self.config, self._pipeline.plans[0], self._config_path, compact=True,
+                                           cooling=getattr(self._pipeline.sources[0], 'cooling', None))
             self._sensor_form.apply_requested.connect(self._apply_sensor_form)
         else:
             self._sensor_form = QLabel('File playback: exposure, gain and bin are those of the recording; '
@@ -690,6 +691,11 @@ class PushbroomScannerMainWindow(QMainWindow):
                 diff = latest[1] - made
                 notes.append(f"{diff:+.1f} °C from the reflectance calibration")
                 state = 'warn' if limit and abs(diff) > limit else 'ok'
+            cooling = getattr(self._pipeline.sources[0], 'cooling', None) or {}
+            if cooling.get('error'):
+                notes.append('⚠ cooler target not applied')
+            elif cooling.get('target_c') is not None:
+                notes.append(f"cooler target {cooling['target_c']:.1f} °C")
             self._temperature_note.setText('  ·  '.join(notes))
             if self._temperature_value.property('state') != state:
                 self._temperature_value.setProperty('state', state)
@@ -1893,10 +1899,13 @@ class PushbroomScannerMainWindow(QMainWindow):
         live = getattr(self._last_snapshot, 'sensor_temperature_c', None)
         if live is not None:                               # the sensor now, not at the start
             temperature = live
-        return {'camera': src.name, 'camera_id': plan.camera_id, 'camera_backend': plan.camera_backend,
-                'camera_bin': plan.camera_bin,
-                'exposure_ms': plan.exposure_ms, 'gain': plan.gain,
-                'temperature_c': None if temperature is None else float(temperature)}
+        values = {'camera': src.name, 'camera_id': plan.camera_id, 'camera_backend': plan.camera_backend,
+                  'camera_bin': plan.camera_bin,
+                  'exposure_ms': plan.exposure_ms, 'gain': plan.gain,
+                  'temperature_c': None if temperature is None else float(temperature)}
+        if meta.get('target_temperature_c') is not None:     # cooler target, as hsi records it
+            values['target_temperature_c'] = float(meta['target_temperature_c'])
+        return values
 
     def eventFilter(self, obj, event) -> bool:
         if (obj is self._canvas_label and event.type() == QEvent.MouseButtonPress
@@ -2039,17 +2048,22 @@ class PushbroomScannerMainWindow(QMainWindow):
         if self._reflectance_dialog is not None:
             return
         plan = self._pipeline.plans[0]
-        dialog = SensorDialog(self, self.config, plan, self._config_path)
+        dialog = SensorDialog(self, self.config, plan, self._config_path,
+                              cooling=getattr(self._pipeline.sources[0], 'cooling', None))
         if not dialog.exec_():
             return
         values = dialog.values()
         self._apply_sensor_values(values, lambda: dialog.save(values))
 
     def _apply_sensor_values(self, values: dict, save) -> None:
-        """Restart with new exposure / gain / bin; ``save()`` writes them when asked and they worked."""
+        """Restart with new exposure / gain / bin (/ cooler target); ``save()`` writes them when asked
+        and they worked."""
         acquisition = replace(self.config.acquisition, exposure_ms=values['exposure_ms'], gain=values['gain'],
                               camera_bin=values['camera_bin'])
-        new_config = replace(self.config, acquisition=acquisition).validate()
+        live = self.config.live
+        if 'target_temperature_c' in values:
+            live = replace(live, target_temperature_c=values['target_temperature_c'])
+        new_config = replace(self.config, acquisition=acquisition, live=live).validate()
         if self._restart_pipeline(new_config) and values['save']:      # never save values that failed
             try:
                 save()

@@ -139,6 +139,12 @@ def _sensor(pipeline, snapshot, needed_fps, live) -> Block:
     b.rows.append(('Exposure', _num(plan.exposure_ms, '{:g}', ' ms')))
     b.rows.append(('Gain', _num(plan.gain)))
     b.rows.append(('Sensor temperature', _num(plan.temperature_c, '{:.1f}', ' °C') + (' (at start)' if live else '')))
+    cooling = getattr(src, 'cooling', None) or {}
+    if cooling.get('error'):
+        b.rows.append(('Cooler target', f"not applied: {cooling['error']}"))
+    elif meta.get('target_temperature_c') is not None:
+        state = f" · {meta['cooling_state']}" if meta.get('cooling_state') else ''
+        b.rows.append(('Cooler target', _num(meta['target_temperature_c'], '{:.1f}', ' °C') + state))
     b.rows.append(('Bin / frame', f"bin {plan.camera_bin} · {src.frame_shape[0]} × {src.frame_shape[1]} · {src.dtype}"))
     b.line1 = f"{_num(plan.exposure_ms, '{:g}', ' ms')} · gain {_num(plan.gain)}"
     fps = None

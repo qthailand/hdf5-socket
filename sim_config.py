@@ -89,6 +89,9 @@ class LiveConfig:
     read_timeout_ms: int = 100           # longest wait for one frame (1..10000); a stop waits for one read
     reader: str = 'process'              # 'process': the camera is read in a process of its own (own GIL,
                                          # camera_process.py); 'thread': in a thread of this process
+    target_temperature_c: float | None = None   # TEC cooler target set at every camera open (as hsi's
+                                         # camera.target_temperature_c); None = the cooler is left as the
+                                         # camera has it. Cameras without a settable target ignore it.
 
 
 @dataclass(frozen=True)
@@ -260,6 +263,9 @@ class SimulationConfig:
                 raise ValueError(f"live.reader must be 'process' or 'thread', got {self.live.reader!r}")
             if self.live.camera_index < 0:
                 raise ValueError("live.camera_index must be >= 0")
+            target = self.live.target_temperature_c
+            if target is not None and not -100.0 <= float(target) <= 60.0:
+                raise ValueError(f"live.target_temperature_c must be -100..60 °C or null, got {target!r}")
         if self.source.stage not in ('auto', 'raw', 'binned'):
             raise ValueError(f"source.stage: {self.source.stage!r}")
         if self.camera.fps < 0:

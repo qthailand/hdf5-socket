@@ -7,8 +7,9 @@ camera delivers exactly what the HDF5 "Keep Spectrogram" recordings store: the r
 sensor frame ``(slit, spectral)`` at the hardware bin.
 
 * :func:`open_camera` builds the backend named by ``acquisition.camera_backend`` with hsi's
-  ``create_backend``, opens it, applies ``acquisition.camera_bin``, ``exposure_ms`` and ``gain``,
-  and describes it as a :class:`LiveSource`. Its ``metadata`` holds the keys hsi writes into a
+  ``create_backend``, opens it, applies ``acquisition.camera_bin``, ``exposure_ms`` and ``gain``
+  and the cooler target ``live.target_temperature_c`` (TEC cameras, as hsi), and describes it as
+  a :class:`LiveSource`. Its ``metadata`` holds the keys hsi writes into a
   recording (``camera_backend``, ``camera_bin``, ``exposure_ms``, ``gain``, sensor temperature ...),
   read back from the opened camera, so ``sim_config.build_plan`` selects the dark, Smile and
   wavelength files exactly as it does for a recording.
@@ -57,6 +58,7 @@ class LiveSource:
     name: str
     frame_shape: tuple
     metadata: dict = field(default_factory=dict)
+    cooling: dict = field(default_factory=dict)  # see :func:`apply_target_temperature`
     dtype: np.dtype = np.dtype(np.uint16)
     stage: str = 'raw'                   # a camera delivers raw sensor frames
     wavelengths: None = None
@@ -104,10 +106,16 @@ def open_camera(config):
         if camera.current_bin != wanted_bin:
             raise RuntimeError(f"{backend} camera stayed at bin {camera.current_bin}, "
                                f"acquisition.camera_bin is {wanted_bin}")
-        return camera_metadata(camera, backend, int(live.camera_index), acq)
+        cooling = apply_target_temperature(camera, getattr(live, 'target_temperature_c', None))
+        metadata = camera_metadata(camera, backend, int(live.camera_index), acq)
+        if cooling.get('target_c') is not None:
+            metadata['target_temperature_c'] = float(cooling['target_c'])
+        if cooling.get('state'):
+            metadata['cooling_state'] = cooling['state']
+        return metadata, cooling
 
     try:
-        metadata = _run_on_helper_thread(configure, f"open-{backend}")
+        metadata, cooling = _run_on_helper_thread(configure, f"open-{backend}")
     except BaseException:
         _close_quietly(camera)
         raise
@@ -115,7 +123,7 @@ def open_camera(config):
     label = backend if backend == 'poa' else f"{backend} #{int(live.camera_index)}"
     model, serial = metadata.get('camera_model'), metadata.get('camera_serial')
     name = label + (f" {model}" if model else '') + (f" ({serial})" if serial else '')
-    source = LiveSource(path=f"live_{backend}", name=name, frame_shape=shape, metadata=metadata)
+    source = LiveSource(path=f"live_{backend}", name=name, frame_shape=shape, metadata=metadata, cooling=cooling)
     logger.info("Camera %s open: %s uint16, bin %d, exposure %s ms, gain %s, sensor %s", name, shape,
                 metadata['camera_bin'], metadata.get('exposure_ms'), metadata.get('gain'),
                 'n/a' if metadata.get('sensor_temperature_c_start') is None
@@ -176,6 +184,52 @@ def camera_metadata(camera, backend: str, camera_index: int, acq) -> dict:
         'sensor_temperature_c_start': valid_temperature(camera.get_temperature()),
     }
     return {key: value for key, value in values.items() if value is not None}
+
+
+def apply_target_temperature(camera, target_c) -> dict:
+    """Set the TEC cooler target of an opened camera, as hsi's ``ScanController._setup_cooling``.
+
+    ``target_c`` ``None`` leaves the cooler as the camera has it (only read back). A camera without
+    a settable target, or one that refuses the value, does not stop the start: the reason is
+    logged and returned (the camera then runs uncooled or at its own target).
+
+    Returns:
+        ``{'supported', 'range', 'requested', 'target_c', 'state', 'error'}``: ``range`` the
+        camera's ``(min, max)`` °C or ``None``, ``target_c`` the target read back after the
+        write, ``state`` the regulation state text (GenICam), ``error`` why it was not applied.
+    """
+    result = {'supported': False, 'range': None, 'requested': None if target_c is None else float(target_c),
+              'target_c': None, 'state': None, 'error': None}
+    try:
+        result['supported'] = bool(camera.cooling_supported())
+        if result['supported']:
+            value_range = camera.target_temperature_range()
+            result['range'] = None if value_range is None else (float(value_range[0]), float(value_range[1]))
+    except Exception as exc:
+        logger.warning("Could not query the camera's cooling: %s", exc)
+        result['supported'] = False
+    if target_c is not None:
+        if not result['supported']:
+            result['error'] = 'the camera has no settable target temperature'
+            logger.warning("live.target_temperature_c = %g °C ignored: %s", float(target_c), result['error'])
+        else:
+            try:
+                camera.set_target_temperature(float(target_c))
+            except Exception as exc:
+                result['error'] = str(exc) or type(exc).__name__
+                logger.warning("Target temperature %g °C not applied: %s", float(target_c), result['error'])
+    if result['supported']:
+        for key, read in (('target_c', camera.get_target_temperature), ('state', camera.cooling_state)):
+            try:
+                result[key] = read()
+            except Exception:
+                result[key] = None
+        target = valid_temperature(result['target_c'])
+        result['target_c'] = target
+        if target_c is not None and result['error'] is None:
+            logger.info("Cooler on, target %s °C (asked %g)%s", 'n/a' if target is None else f"{target:g}",
+                        float(target_c), f", state {result['state']}" if result['state'] else '')
+    return result
 
 
 def _run_on_helper_thread(function, name: str):

@@ -89,6 +89,7 @@ wavelength files, as the attributes of a recording do (origin `camera:...` in th
 | `live.cti_path` | GenICam GenTL producer; `null` = the SVS producer (`sv_gev_tl_x64.cti`, `libsv_gev_tl_x64.cti`) in one of the `GENICAM_GENTL64_PATH` folders; a missing file is an error naming the path |
 | `live.sensor_pixel_size` | GenICam `SensorPixelSize` 8/10/12 bits: must be what the darks were recorded with (it changes the value scaling) |
 | `live.read_timeout_ms` | longest wait for one frame, 1–10000 (default 100); a stop waits for one read plus 1 s |
+| `live.target_temperature_c` | TEC cooler target (°C) set at every camera open, as hsi's `camera.target_temperature_c`: the cooler is switched on and regulated to it. `null` (default) leaves the cooler as the camera has it. A camera without a settable target, or one that refuses the value, still starts (warning in the log, Sensor block and Setup tab). The Setup tab's *Cooler target* field changes it (Apply restarts); the target read back is recorded as `target_temperature_c` with the calibrations |
 | `live.reader` | `process` (default): the camera is opened and read in a process of its own, writing into shared-memory frame buffers, so the GUI and the workers cannot slow the camera through the GIL (`camera_process.py`); `thread`: read by a thread of this process (the tests' fake cameras) |
 
 The sensor temperature at start picks the nearest dark, as in hsi. Reflectance `auto` looks for

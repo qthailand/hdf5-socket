@@ -82,7 +82,8 @@
     "cti_path": null,
     "sensor_pixel_size": 10,
     "read_timeout_ms": 100,
-    "reader": "process"
+    "reader": "process",
+    "target_temperature_c": null
   },
   "white_reference": {
     "path": "reflectance",

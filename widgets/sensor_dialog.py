@@ -13,7 +13,7 @@ from pathlib import Path
 
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                             QGridLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
+                             QGridLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from modules.dark import DarkFrameLibrary
 from sim_config import DEFAULT_CONFIG_PATH
@@ -28,9 +28,10 @@ class SensorForm(QWidget):
 
     apply_requested = pyqtSignal()
 
-    def __init__(self, config, plan, config_path=None, compact: bool = False, parent=None) -> None:
+    def __init__(self, config, plan, config_path=None, compact: bool = False, cooling=None, parent=None) -> None:
         super().__init__(parent)
         self._config = config
+        self._cooling = dict(cooling or {})              # LiveSource.cooling of the running camera
         self._backend = plan.camera_backend or config.acquisition.camera_backend
         self._config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
         from sim_config import calibration_folders
@@ -63,6 +64,7 @@ class SensorForm(QWidget):
         self.camera_bin.setRange(1, 8)
         self.camera_bin.setValue(int(plan.camera_bin or config.acquisition.camera_bin))
         self.camera_bin.setToolTip("Hardware bin; Smile and wavelength files exist per bin")
+        self._build_cooler(config)
         self.preset = QComboBox()
         self.preset.addItem("— pick a stored dark —", None)
         for key in sorted(self._darks, key=lambda k: (k['bin'], k['exposure'], k['gain'])):
@@ -77,8 +79,8 @@ class SensorForm(QWidget):
         self.rate_note = QLabel("")
         self.rate_note.setObjectName("metricCaption")
         self.save_box = QCheckBox(f"Save to {self._config_path.name}")
-        self.save_box.setToolTip("Write acquisition.exposure_ms / gain / camera_bin into the config file "
-                                 "(otherwise only for this run)")
+        self.save_box.setToolTip("Write acquisition.exposure_ms / gain / camera_bin (and "
+                                 "live.target_temperature_c) into the config file (otherwise only for this run)")
         note = QLabel("Apply restarts the pipeline (camera closed and opened with the new values); the dark, "
                       "Smile and wavelength files follow them. Reflectance factors made at another exposure "
                       "are scaled to the new one.")
@@ -96,27 +98,32 @@ class SensorForm(QWidget):
             grid.setHorizontalSpacing(8)
             grid.setVerticalSpacing(4)
             for column, (text, widget) in enumerate((("Exposure", self.exposure), ("Gain", self.gain),
-                                                     ("Bin", self.camera_bin))):
+                                                     ("Bin", self.camera_bin), ("Cooler target", self.cooler_row))):
                 caption = QLabel(text)
                 caption.setObjectName("fieldLabel")
+                caption.setVisible(self._cooler_supported or widget is not self.cooler_row)
                 grid.addWidget(caption, 0, column)
                 grid.addWidget(widget, 1, column)
-            grid.addWidget(self.apply_button, 1, 3)
+            grid.addWidget(self.apply_button, 1, 4)
             stored = QLabel("Stored darks")
             stored.setObjectName("fieldLabel")
-            grid.addWidget(stored, 0, 4)
-            grid.addWidget(self.preset, 1, 4)
-            grid.setColumnStretch(4, 1)
-            grid.addWidget(self.dark_note, 2, 0, 1, 5)
-            grid.addWidget(self.refl_note, 3, 0, 1, 5)
-            grid.addWidget(self.rate_note, 4, 0, 1, 3)
-            grid.addWidget(self.save_box, 4, 3, 1, 2)
+            grid.addWidget(stored, 0, 5)
+            grid.addWidget(self.preset, 1, 5)
+            grid.setColumnStretch(5, 1)
+            grid.addWidget(self.dark_note, 2, 0, 1, 6)
+            grid.addWidget(self.refl_note, 3, 0, 1, 6)
+            grid.addWidget(self.cooler_note, 4, 0, 1, 6)
+            grid.addWidget(self.rate_note, 5, 0, 1, 4)
+            grid.addWidget(self.save_box, 5, 4, 1, 2)
         else:
             form = QFormLayout()
             form.addRow("Stored darks", self.preset)
             form.addRow("Exposure", self.exposure)
             form.addRow("Gain", self.gain)
             form.addRow("Bin", self.camera_bin)
+            if self._cooler_supported:
+                form.addRow("Cooler target", self.cooler_row)
+            form.addRow("", self.cooler_note)
             form.addRow("Dark frame", self.dark_note)
             form.addRow("Reflectance", self.refl_note)
             form.addRow("", self.rate_note)
@@ -130,6 +137,55 @@ class SensorForm(QWidget):
             widget.valueChanged.connect(self._check)
         self.camera_bin.valueChanged.connect(self._check)
         self._check()
+
+    def _build_cooler(self, config) -> None:
+        """Cooler on/off + target °C, shown only for a camera with a settable target (TEC).
+
+        Off = ``live.target_temperature_c`` null: the cooler is left as the camera has it (it is
+        not switched off), as hsi does without a configured target."""
+        cooling = self._cooling
+        self._cooler_supported = bool(cooling.get('supported'))
+        configured = getattr(getattr(config, 'live', None), 'target_temperature_c', None)
+        self.cooler_on = QCheckBox("On")
+        self.cooler_on.setToolTip("Set the TEC cooler target at every camera start (live.target_temperature_c). "
+                                  "Off: the cooler is left as the camera has it (not switched off)")
+        self.cooler_target = QDoubleSpinBox()
+        self.cooler_target.setDecimals(1)
+        self.cooler_target.setSuffix(" °C")
+        low, high = cooling.get('range') or (-100.0, 60.0)
+        self.cooler_target.setRange(float(low), float(high))
+        start = configured if configured is not None else cooling.get('target_c')
+        self.cooler_target.setValue(float(start) if start is not None else min(max(0.0, low), high))
+        self.cooler_target.setToolTip("Sensor temperature the cooler regulates to; darks are matched by "
+                                      "sensor temperature, so keep it where the darks were recorded")
+        self.cooler_on.setChecked(configured is not None)
+        self.cooler_target.setEnabled(configured is not None)
+        self.cooler_on.toggled.connect(self.cooler_target.setEnabled)
+        self.cooler_row = QWidget(self)
+        row = QHBoxLayout(self.cooler_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.cooler_on)
+        row.addWidget(self.cooler_target, 1)
+        self.cooler_row.setVisible(self._cooler_supported)
+        self.cooler_note = QLabel(self._cooler_text())
+        self.cooler_note.setObjectName("rowSource")
+        self.cooler_note.setWordWrap(True)
+        self.cooler_note.setVisible(bool(self.cooler_note.text()))
+
+    def _cooler_text(self) -> str:
+        cooling = self._cooling
+        if cooling.get('error'):
+            return f"⚠ cooler target not applied: {cooling['error']}"
+        if not cooling.get('supported'):
+            return ''
+        parts = []
+        if cooling.get('target_c') is not None:
+            parts.append(f"camera target {cooling['target_c']:.1f} °C")
+        if cooling.get('state'):
+            parts.append(f"state {cooling['state']}")
+        if cooling.get('requested') is None:
+            parts.append("not set by this program (live.target_temperature_c is null)")
+        return "Cooler: " + ", ".join(parts) if parts else ''
 
     def _use_preset(self) -> None:
         data = self.preset.currentData()
@@ -191,26 +247,34 @@ class SensorForm(QWidget):
         return f"{made}, the input has {now.size} bands {now[0]:.0f}–{now[-1]:.0f} nm"
 
     def values(self) -> dict:
-        return {'exposure_ms': float(self.exposure.value()), 'gain': float(self.gain.value()),
-                'camera_bin': int(self.camera_bin.value()), 'save': self.save_box.isChecked()}
+        """The form's values; ``target_temperature_c`` is only there for a camera with a cooler
+        (``None`` = leave the cooler as the camera has it)."""
+        values = {'exposure_ms': float(self.exposure.value()), 'gain': float(self.gain.value()),
+                  'camera_bin': int(self.camera_bin.value()), 'save': self.save_box.isChecked()}
+        if self._cooler_supported:
+            values['target_temperature_c'] = (float(self.cooler_target.value()) if self.cooler_on.isChecked()
+                                              else None)
+        return values
 
     def save(self, values: dict) -> None:
-        """Write the values into ``acquisition`` of the config file, other keys untouched."""
+        """Write the values into ``acquisition`` (and ``live``) of the config file, other keys untouched."""
         path = self._config_path
         data = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
         acquisition = data.setdefault('acquisition', {})
         acquisition.update(exposure_ms=values['exposure_ms'], gain=values['gain'], camera_bin=values['camera_bin'])
+        if 'target_temperature_c' in values:
+            data.setdefault('live', {})['target_temperature_c'] = values['target_temperature_c']
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding='utf-8')
 
 
 class SensorDialog(QDialog):
     """:class:`SensorForm` in a modal window with Apply (restart) / Cancel."""
 
-    def __init__(self, parent, config, plan, config_path=None) -> None:
+    def __init__(self, parent, config, plan, config_path=None, cooling=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Sensor settings")
         self.setModal(True)
-        self.form = SensorForm(config, plan, config_path)
+        self.form = SensorForm(config, plan, config_path, cooling=cooling)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
         buttons.addButton("Apply (restart)", QDialogButtonBox.AcceptRole)
         buttons.accepted.connect(self.accept)

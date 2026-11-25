@@ -576,6 +576,121 @@ def test_cti_path_and_index_reach_the_backend(tmp_path, install):
         cam.close()
 
 
+class CooledCamera(FakeLineCamera):
+    """A TEC camera: target -40..20 °C, starts at 10 °C with the cooler off; ``refuse`` fails the write."""
+
+    def __init__(self, refuse=False, **kwargs):
+        super().__init__(**kwargs)
+        self.target, self.cooler, self.refuse, self.set_calls = 10.0, False, refuse, []
+
+    def cooling_supported(self):
+        return True
+
+    def target_temperature_range(self):
+        return (-40.0, 20.0)
+
+    def get_target_temperature(self):
+        return self.target
+
+    def cooling_state(self):
+        return 'stable' if self.cooler else 'off'
+
+    def set_target_temperature(self, temp_c):
+        self._note('cool')
+        self.set_calls.append(temp_c)
+        if self.refuse:
+            raise RuntimeError('TECTargetTemperature refused')
+        self.target, self.cooler = min(max(float(temp_c), -40.0), 20.0), True
+
+
+def cooled_config(tmp_path, target):
+    config = live_config(tmp_path)
+    return replace(config, live=replace(config.live, target_temperature_c=target)).validate()
+
+
+def test_target_temperature_is_set_at_camera_open(tmp_path, install):
+    camera = CooledCamera()
+    install(camera)
+    cam, live = open_camera(cooled_config(tmp_path, -15.0))
+    try:
+        assert camera.set_calls == [-15.0] and camera.cooler
+        assert 'MainThread' not in camera.threads['cool']           # with the open, off the main thread
+        assert live.metadata['target_temperature_c'] == -15.0 and live.metadata['cooling_state'] == 'stable'
+        assert live.cooling == {'supported': True, 'range': (-40.0, 20.0), 'requested': -15.0,
+                                'target_c': -15.0, 'state': 'stable', 'error': None}
+    finally:
+        cam.close()
+
+
+def test_no_target_leaves_the_cooler_as_the_camera_has_it(tmp_path, install):
+    camera = CooledCamera()
+    install(camera)
+    cam, live = open_camera(cooled_config(tmp_path, None))
+    try:
+        assert camera.set_calls == [] and not camera.cooler
+        assert live.cooling['supported'] and live.cooling['target_c'] == 10.0 and live.cooling['error'] is None
+        assert live.metadata['target_temperature_c'] == 10.0          # the camera's own target, recorded
+    finally:
+        cam.close()
+
+
+def test_target_on_an_uncooled_or_refusing_camera_does_not_stop_the_start(tmp_path, install):
+    install(FakeLineCamera())
+    cam, live = open_camera(cooled_config(tmp_path, -15.0))
+    cam.close()
+    assert live.cooling['supported'] is False and 'no settable target' in live.cooling['error']
+    assert 'target_temperature_c' not in live.metadata
+    camera = CooledCamera(refuse=True)
+    install(camera)
+    cam, live = open_camera(cooled_config(tmp_path, -15.0))
+    cam.close()
+    assert camera.set_calls == [-15.0] and 'refused' in live.cooling['error']
+    assert live.metadata['target_temperature_c'] == 10.0               # what the camera really regulates to
+
+
+def test_sensor_form_cooler_field(tmp_path, install):
+    pytest.importorskip('PyQt5')
+    from PyQt5.QtWidgets import QApplication
+    from widgets.sensor_dialog import SensorForm
+    app = QApplication.instance() or QApplication([])
+    camera = CooledCamera()
+    install(camera)
+    config = cooled_config(tmp_path, -15.0)
+    cam, live = open_camera(config)
+    cam.close()
+    plan = build_plan(config, live)
+    path = tmp_path / 'simulation.json'
+    path.write_text('{"live": {"reader": "thread"}}', encoding='utf-8')
+    form = SensorForm(config, plan, path, compact=True, cooling=live.cooling)
+    assert form._cooler_supported and form.cooler_on.isChecked() and form.cooler_target.value() == -15.0
+    assert form.cooler_target.minimum() == -40.0 and form.cooler_target.maximum() == 20.0
+    assert 'stable' in form.cooler_note.text()
+    form.cooler_target.setValue(-20.0)
+    values = form.values()
+    assert values['target_temperature_c'] == -20.0
+    form.save(values)
+    saved = json.loads(path.read_text(encoding='utf-8'))
+    assert saved['live'] == {'reader': 'thread', 'target_temperature_c': -20.0}
+    form.cooler_on.setChecked(False)                                   # off: leave the cooler alone
+    assert form.values()['target_temperature_c'] is None and not form.cooler_target.isEnabled()
+    # a camera without a cooler: no field, and the config's live section is not touched
+    plain = SensorForm(config, plan, path, compact=True, cooling={'supported': False})
+    assert not plain._cooler_supported and 'target_temperature_c' not in plain.values()
+    for widget in (form, plain):
+        widget.deleteLater()
+    app.processEvents()
+
+
+def test_target_temperature_config(tmp_path):
+    assert LiveConfig().target_temperature_c is None                   # hsi's default: cooler untouched
+    with pytest.raises(ValueError, match='target_temperature_c'):
+        cooled_config(tmp_path, -150.0)
+    path = tmp_path / 'simulation.json'
+    path.write_text('{"source": {"kind": "camera"}, "acquisition": {"exposure_ms": 2.0, "gain": 1.0}, '
+                    '"live": {"target_temperature_c": -10}}', encoding='utf-8')
+    assert load_config(path).live.target_temperature_c == -10
+
+
 def test_genicam_producer_is_looked_up_in_the_gentl_path(tmp_path, monkeypatch):
     a, b = tmp_path / 'a', tmp_path / 'b'
     a.mkdir()
