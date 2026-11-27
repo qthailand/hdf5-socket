@@ -353,7 +353,6 @@ def test_derivative_package_that_is_not_the_implemented_one_is_refused(tmp_path)
              ('order', parameters(polyorder=5), 'polyorder'),
              ('order0', parameters(polyorder=0), 'polyorder'),
              ('float', parameters(window=5.5), 'whole window'),
-             ('nodelta', parameters(delta=None), 'delta'),
              ('units', parameters(units='per_band'), 'per_band'),
              ('inf', parameters(window=float('inf')), 'whole window'),
              ('deriv2', parameters(deriv=2), 'deriv'),
@@ -370,6 +369,11 @@ def test_derivative_package_that_is_not_the_implemented_one_is_refused(tmp_path)
             load_package(build_package(tmp_path, name='-'.join(steps), steps=steps))
     package = load_package(build_package(tmp_path, name='noraw', steps=('first_derivative',), change=no_raw))
     assert any('first derivative NOT verified' in text for text in package.checks)
+    # no delta stated (HSI MLOps schema 2.0): the uniform grid's spacing, still checked by the reference
+    package = load_package(build_package(tmp_path, name='nodelta', steps=('first_derivative',),
+                                         change=parameters(delta=None)))
+    assert package.derivative_parameters['delta'] == 5.0
+    assert any('1st derivative of the raw means reproduced' in text for text in package.checks)
 
 
 def test_package_binds_every_training_band(package_path):

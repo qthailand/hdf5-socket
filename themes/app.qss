@@ -256,6 +256,8 @@ QGraphicsView#referenceView { background-color: @image_bg; border: 1px solid @bo
 
 QLabel#dialogTitle { background: transparent; font-size: 17px; font-weight: 700; color: @text; }
 QLabel#fieldLabel { background: transparent; color: @text_muted; font-size: 11px; }
+QLabel#fieldValue { background: transparent; color: @text; font-size: 12px; font-weight: 600; }
+QLabel#fieldValue[state="warn"] { color: @warning; }
 QLabel#rowName { background: transparent; color: @text; font-size: 12px; font-weight: 600; }
 QLabel#rowSource { background: transparent; color: @text_muted; font-size: 11px; }
 QLabel#issueList { background: transparent; color: @text_muted; font-size: 11px; }

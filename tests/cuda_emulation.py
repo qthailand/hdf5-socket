@@ -104,9 +104,24 @@ def _flip(src, code, dst=None, stream=None):
     return _store(dst, np.ascontiguousarray(src.data[::-1] if code == 0 else src.data[:, ::-1]), stream)
 
 
+def _gemm(src1, src2, alpha, src3, beta, dst=None, flags=0, stream=None):
+    """``cv2.cuda.gemm``: ``alpha * src1 @ src2 + beta * src3`` (float32 matrices, no transposes)."""
+    assert flags == 0 and src1.data.dtype == np.float32 and src2.data.dtype == np.float32
+    values = np.float32(alpha) * (src1.data @ src2.data)
+    if src3 is not None:
+        values = values + np.float32(beta) * src3.data
+    return _store(dst, values.astype(np.float32), stream)
+
+
+def _sqr(src, dst=None, stream=None):
+    return _store(dst, (src.data * src.data).astype(src.data.dtype), stream)
+
+
 def fake_cv2():
     """Return a ``cv2`` proxy whose ``cuda`` namespace is emulated."""
     cuda = SimpleNamespace(
+        gemm=_gemm,
+        sqr=_sqr,
         setDevice=lambda device: None,
         getCudaEnabledDeviceCount=lambda: 1,
         getDevice=lambda: 0,
@@ -265,4 +280,7 @@ def fake_cupy():
         ones=lambda shape, dtype: np.ones(shape, dtype).view(DeviceArray),
         asarray=_device,
         maximum=np.maximum, subtract=np.subtract, where=np.where, rint=np.rint,
+        # array calls of regression_engines.CupyEngine
+        sqrt=np.sqrt, isfinite=np.isfinite,
+        stack=lambda arrays: np.stack(arrays).view(DeviceArray),
     )

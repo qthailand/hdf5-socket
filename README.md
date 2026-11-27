@@ -329,6 +329,79 @@ Things to know:
   `predict_confidence` is the Gaussian posterior, which the package itself calls uncalibrated;
   `tools/check_calibration.py` still expects a joblib artifact.
 
+## Regression models (e.g. moisture)
+
+Instead of a classification model, a **regression** package predicts one continuous value per
+pixel (e.g. moisture in %). The operator picks one model, classification **or** regression (no
+chaining); a regression package is a `.hsipkg` like the others and shows up in the same model
+tiles.
+
+**Package** (`manifest.json` `task_type: "regression"`, read by `hsi_package._load_regression`):
+the same feature chain as a classification package (SNV **or** Savitzky-Golay first derivative,
+band selection, optional PCA, StandardScaler), then a linear response: `algorithm` `PLSR`
+(sklearn `PLSRegression`, one response), `Ridge` or `LinearRegression`. Extra manifest fields:
+
+```json
+"target": {"name": "moisture", "units": "%", "valid_range": [0, 70], "display_range": [5, 60], "decimals": 1},
+"object_mask": {"min_mean": 0.2}
+```
+
+`valid_range` is what the model was validated for (pixels outside are counted and flagged);
+`display_range` the default colour scale; `object_mask.min_mean` (optional) makes pixels whose
+mean input is below it belt/background. `training_spectral_reference.json` holds mean spectra of
+three target bins (low / mid / high, for the spectrum views and the scaler / derivative checks),
+the fit statistics (`r2`, `rmsec`, `rmsecv`, target range) and a few training spectra with the
+predictions the training software made: the loader predicts them with its own chain and refuses
+the package if they differ (relative 1e-6).
+
+**HSI MLOps exports** (schema 2.0, e.g. `PLS-DA_436001-regression_*.hsipkg`) are read as they
+come: `algorithm: "PLS-DA"` with `task_type: "regression"` is a one-response `PLSRegression`
+(PLSR); the target is `target_col` (`"Weight Loss (%)"` → *Weight Loss*, unit `%`); the steps
+`savitzky_golay` + `first_derivative` are SG smoothing, then the SG first derivative of the
+smoothed spectrum (`mode='interp'`, `delta` = the grid spacing from `pipeline_audit.spectral_axis`
+when the step states none). Such a package has no training reference, so:
+
+* the training targets are recovered from the PLS's stored training scores (every component must
+  give the same targets, with the regression's own mean and SD): they give the valid range
+  (training min–max ± 10 %), the colour range (min–max) and the fit R² / RMSEC;
+* without `input_contract` the input units are inferred from the scale of the scaler's feature
+  means (reflectance for that package) and shown as *assumed*;
+* the preprocessing chain is **not verified** against the training software (the check line says
+  so): the reading of the two SG steps is the order the audit lists them. On 5 nm cubes a
+  derivative-only reading would differ by about 0.7 % weight loss.
+
+**Building one** from labelled spectra (`regression_builder.py`; PLS components by 5-fold
+cross-validation, the fewest within one standard error of the best):
+
+```bash
+python regression_builder.py samples.npz -o models/moisture_plsr.hsipkg --target moisture --units % --valid-range 0 70
+python regression_builder.py samples.csv --preprocessing first_derivative --object-min-mean 0.2
+```
+
+`samples.npz` holds `spectra` (n, bands), `target` (n,), `wavelengths` (bands,); a CSV has a header
+of wavelengths and the target as the last column.
+
+**Running.** `inference_engine.HsiRegressor` folds the chain after SNV into one weight per band
+and runs it on the engines of `regression_engines.py`: the CPU kernel (numba; ~0.2 ms per
+1024-pixel line with SNV), CuPy or OpenCV CUDA (`model.regression_engine` or *Advanced → Regression
+engine*; a GPU engine is self-tested against the CPU when a worker makes it and falls back in hsi's
+order, then to the CPU). `auto` runs the CPU kernel per line: the work is a dot product per pixel,
+less than one upload to a discrete GPU. The belt map stays `uint8`: codes 0–253 are the value over
+the valid range, 254 = no object, 255 = lost line, so the ring, the lost lines and the counts
+(= a histogram of the values) work unchanged; the exact values and sums travel beside it
+(`Snapshot.value_canvas`, `value_stats`).
+
+**GUI.** With a regression model running, a colour bar with the units sits above the belt map
+(black = no object, magenta = lost line) and the *Composition* / *Materials* tabs give way to one
+tab named after the target: mean / median / SD / P10–P90 of the object pixels since the batch
+reset, the object share of the belt, the share outside the valid range, the colour range (spin
+boxes, *Auto* = 2nd–98th percentile of what was scanned, *Model* = the package's range), the
+object mask, a histogram coloured like the map, the connected objects of the predicted zone (map
+pixels, largest first) and the model tiles. A click on the map gives the pixel's predicted value
+with its spectrum; the spectrum views show the training spectra of the three target bins. In
+*Setup & Calibration* the Model block shows the target, valid range, engine and object mask, and
+warns when more than 5 % of the object pixels are predicted outside the valid range.
+
 ## Confidence and calibration (offline)
 
 The running system classifies with `predict` only (the class, no probability), so confidence

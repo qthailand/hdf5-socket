@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from modules.preprocessing import PreprocessingRuntime
+from regression import line_stats
 from sim_config import STEP_NAMES, apply_reflectance, geometry_model
 
 #: A raw pixel at or above this fraction of the camera's full scale counts as clipped. Below
@@ -226,6 +227,13 @@ class Snapshot:
     model_generation: int = 0        # counts and canvas belong to this model (see Pipeline.set_classifier)
     sensor_temperature_c: float | None = None   # live: read every 10 s while streaming (None: not reported)
     canvas_lines: np.ndarray | None = None   # line number of each canvas column (-1 = lost / none yet)
+    # regression model (classifier.task == 'regression'): ``canvas`` holds value codes
+    # (regression.encode), ``counts`` their histogram; these carry the exact values
+    task: str = 'classification'     # of the model whose lines counts / canvas hold
+    value_canvas: np.ndarray | None = None   # float32 like canvas: predicted value, NaN = no object / lost
+    value_stats: np.ndarray | None = None    # [object pixels, sum, sum of squares, outside valid range]
+    regression_engine: str = ''      # engine(s) the workers run a regression on ('' = none yet)
+    regression_engine_note: str = ''  # why it differs from model.regression_engine
 
 
 # ----------------------------------------------------------------------------- pipeline ---
@@ -346,6 +354,7 @@ class Pipeline:
         # set_classifier() changes it at one line: (generation, classifier, columns per plan).
         self._model = (0, classifier, [plan.columns for plan in plans])
         self._drawn_generation = 0               # generation of the lines in counts / canvas (lock)
+        self._task = getattr(classifier, 'task', 'classification')   # of the drawn model (lock)
         self.camera = camera
         cam, disp = config.camera, config.display
         # A live camera free-runs; its measured rate takes the place of the simulated line clock.
@@ -445,6 +454,15 @@ class Pipeline:
         recent = int(np.ceil(disp.canvas_width * disp.canvas_line_stride * disp.raw_zone_fraction)) + 1
         self._recent_counts = np.zeros((recent, 256), np.int32)
         self._recent_counted = np.zeros(recent, bool)
+        # regression: exact statistics of the object pixels (regression.line_stats), in total and per
+        # recent line like the counts, and the predicted values beside the code canvas
+        self._value_stats = np.zeros(4, np.float64)
+        self._recent_stats = np.zeros((recent, 4), np.float64)
+        self._value_canvas: np.ndarray | None = None          # allocated with the first regression line
+        # regression engine per worker (regression_engines.RegressionRuntime, made in the worker thread)
+        self._reg_runtimes: list = [None] * self._n_workers
+        self._reg_requested = str(getattr(config.model, 'regression_engine', 'auto'))
+        self._reg_generation = 0
         self._position = (sources[0].name, 0, sources[0].n_frames, 0)
         self._stage_ms: dict[str, float] = {}
         self._stage_totals: dict[str, dict[str, list]] = {}   # backend -> stage -> [ms sum, n]
@@ -534,14 +552,19 @@ class Pipeline:
             self._stage_totals.clear()
             self._stage_peak.clear()
 
-    def _held(self, lines: int) -> tuple[np.ndarray, int]:
-        """(class counts, counted lines) of the newest ``lines`` belt lines. Lock held."""
+    def _held(self, lines: int, with_stats: bool = False):
+        """(class counts, counted lines[, regression statistics]) of the newest ``lines`` belt lines.
+        Lock held."""
         ring = len(self._recent_counted)
         hold = min(int(lines), ring, self._canvas_line)
         if hold <= 0:
-            return np.zeros(256, np.int64), 0
+            empty = np.zeros(256, np.int64), 0
+            return (*empty, np.zeros(4)) if with_stats else empty
         held = (self._canvas_line - 1 - np.arange(hold)) % ring
-        return self._recent_counts[held].sum(axis=0, dtype=np.int64), int(self._recent_counted[held].sum())
+        counts, counted = self._recent_counts[held].sum(axis=0, dtype=np.int64), int(self._recent_counted[held].sum())
+        if with_stats:
+            return counts, counted, self._recent_stats[held].sum(axis=0)
+        return counts, counted
 
     def reset_counts(self, pending_lines: int = 0) -> None:
         """Start a new batch: class counts restart from zero (throughput counters keep running).
@@ -550,9 +573,10 @@ class Pipeline:
         to the new batch; they are counted as they cross into the classified zone.
         """
         with self._lock:
-            counts, lines = self._held(pending_lines)
+            counts, lines, stats = self._held(pending_lines, with_stats=True)
             self._counts[:] = counts
             self._counted_lines = lines
+            self._value_stats[:] = stats
 
     def set_classifier(self, classifier, tolerance_nm: float | None = None) -> int:
         """Classify with another model from the next camera line on, while running.
@@ -597,6 +621,29 @@ class Pipeline:
             self._requested_backend = name
             self._backend_generation += 1
         logger.info("Backend switch requested: %s", name)
+
+    def set_regression_engine(self, name: str) -> None:
+        """Engine of a regression model's per-line prediction (``model.regression_engine``):
+        ``auto`` (CPU kernel), ``cpu``, ``cupy_cuda`` or ``opencv_cuda``; each worker makes it anew
+        at its next regression line (hsi's fallback order if a GPU engine cannot run)."""
+        from regression_engines import ENGINES
+        if name not in ENGINES:
+            raise ValueError(f"regression engine must be one of {ENGINES}, got {name!r}")
+        with self._lock:
+            if name == self._reg_requested:
+                return
+            self._reg_requested = name
+            self._reg_generation += 1
+        logger.info("Regression engine switch requested: %s", name)
+
+    @property
+    def regression_engine_name(self) -> str:
+        names = {rt.name for rt in self._reg_runtimes if rt is not None}
+        return '/'.join(sorted(names))
+
+    def _regression_engine_note(self) -> str:
+        return '; '.join(sorted({rt.fallback_reason for rt in self._reg_runtimes
+                                 if rt is not None and rt.fallback_reason}))
 
     def set_fps(self, fps: float) -> None:
         """Change the simulated line rate while running (``0`` = as fast as the chain takes:
@@ -916,11 +963,16 @@ class Pipeline:
             raw_canvas = self._raw_canvas[::rs, raw_columns_idx]
             raw_lines = self._canvas_lines[raw_columns_idx]
             counts, counted_lines = self._counts.copy(), self._counted_lines
+            value_stats = self._value_stats.copy()
             if count_delay_lines > 0:       # leave out the newest lines (still in the raw zone)
-                held_counts, held_lines = self._held(count_delay_lines)
+                held_counts, held_lines, held_stats = self._held(count_delay_lines, with_stats=True)
                 # never below zero when the zone was resized after a reset
                 counts = np.maximum(counts - held_counts, 0)
                 counted_lines = max(counted_lines - held_lines, 0)
+                value_stats = np.maximum(value_stats - held_stats, 0.0)
+            regression = self._task == 'regression'
+            value_canvas = (self._value_canvas[::rs, columns[offsets]]
+                            if regression and self._value_canvas is not None else None)
             snap = Snapshot(
                 state=self._state, error=self._error, elapsed_s=time.perf_counter() - self._t0,
                 target_fps=self._fps, camera_fps=self._camera_fps, processed_fps=self._processed_fps,
@@ -941,7 +993,9 @@ class Pipeline:
                 line_clock=self._line_clock, raw_lines=raw_lines,
                 canvas_lines=self._canvas_lines[columns[offsets]],
                 calibration_lines=0 if self._cal_ids is None else int((self._cal_ids >= 0).sum()),
-                model_generation=self._drawn_generation, sensor_temperature_c=self._sensor_temperature)
+                model_generation=self._drawn_generation, sensor_temperature_c=self._sensor_temperature,
+                task=self._task, value_canvas=value_canvas, value_stats=value_stats if regression else None,
+                regression_engine=self.regression_engine_name, regression_engine_note=self._regression_engine_note())
         return snap
 
     # --------------------------------------------------------------------------- camera ---
@@ -1269,8 +1323,11 @@ class Pipeline:
         raw = self.plans[0].stage == 'raw'
         try:
             generation = self._backend_generation
+            reg_generation = self._reg_generation
             if raw:
                 runtime = self._new_runtime(k, self._requested_backend)
+            if getattr(self.classifier, 'task', 'classification') == 'regression':
+                self._new_regression_runtime(k)                   # in this thread (CUDA context)
             self._warm_up(runtime, prof)
             self._ready[k].set()
             while True:
@@ -1303,7 +1360,15 @@ class Pipeline:
                 x = bin_2x2(inputs) if job.spatial_bin == 2 else inputs[0]    # (ceil(slit / 2), bands)
                 t1 = time.perf_counter()
                 _, classifier, columns = job.model
-                ids = classifier.predict(x, columns[job.source])
+                values = valid = None
+                if getattr(classifier, 'task', 'classification') == 'regression':
+                    if reg_generation != self._reg_generation or self._reg_runtimes[k] is None:
+                        reg_generation = self._reg_generation
+                        self._new_regression_runtime(k)
+                    values, valid = classifier.predict_values(x, columns[job.source], self._reg_runtimes[k])
+                    ids = classifier.encode(values, valid)
+                else:
+                    ids = classifier.predict(x, columns[job.source])
                 t2 = time.perf_counter()
                 for _line in lines:                                  # stage times per line, as 'total'
                     if job.spatial_bin == 2:
@@ -1312,6 +1377,11 @@ class Pipeline:
                 slit = inputs[0].shape[0]
                 if job.spatial_bin == 2:                              # the block's class to its pixels
                     ids = np.repeat(ids, 2)[:slit]
+                    if values is not None:
+                        values, valid = np.repeat(values, 2)[:slit], np.repeat(valid, 2)[:slit]
+                reg = None
+                if values is not None:                                # per line: what the aggregator sums
+                    reg = (values, line_stats(values, valid, classifier.value_range))
                 # spectrum preview: what the model receives, per slit pixel (a copy: buffers are reused)
                 spec = None
                 if self._spec_ring is not None:
@@ -1329,7 +1399,7 @@ class Pipeline:
                         self._raw_frame = self._buffers[line_job.slot].copy()
                     line_job.partner = None                          # the result travels per line
                     self._free.put(line_job.slot)                    # buffer back to the camera
-                    self._results.put((line_job, ids, intensity, pre, spec, clipped))
+                    self._results.put((line_job, ids, intensity, pre, spec, clipped, reg))
         except Exception as exc:
             self._fail(f'worker-{k}', exc)
         finally:
@@ -1386,6 +1456,15 @@ class Pipeline:
         self._runtimes[k] = runtime
         return runtime
 
+    def _new_regression_runtime(self, k: int):
+        """The regression engine of worker ``k`` (made in its thread: a CUDA context is per thread)."""
+        from regression_engines import RegressionRuntime
+        runtime = RegressionRuntime(self._reg_requested)
+        self._reg_runtimes[k] = runtime
+        logger.info("worker-%d regression engine %s (requested %s)%s", k, runtime.name, self._reg_requested,
+                    f": {runtime.fallback_reason}" if runtime.fallback_reason else '')
+        return runtime
+
     def _warm_up(self, runtime, prof) -> None:
         """Select the backend, JIT-compile binning and touch the model before the clock starts."""
         frame = np.zeros(self._buffers.shape[1:], self._buffers.dtype)
@@ -1424,9 +1503,9 @@ class Pipeline:
                 elif item:
                     pending[item[0].seq] = item
                 while next_seq in pending:
-                    job, ids, intensity, pre, spec, clipped = pending.pop(next_seq)
+                    job, ids, intensity, pre, spec, clipped, reg = pending.pop(next_seq)
                     next_seq += 1
-                    self._account(job, ids, job.line - last_line - 1, intensity, pre, spec, clipped)
+                    self._account(job, ids, job.line - last_line - 1, intensity, pre, spec, clipped, reg)
                     last_line = job.line
                     rate_n += 1
 
@@ -1472,8 +1551,9 @@ class Pipeline:
 
     def _account(self, job: _Job, ids: np.ndarray, gap: int, intensity: np.ndarray | None = None,
                  pre: np.ndarray | None = None, spec: np.ndarray | None = None,
-                 clipped: np.ndarray | None = None) -> None:
-        """One line, in order. ``gap`` lines before it were lost to overrun."""
+                 clipped: np.ndarray | None = None, reg: tuple | None = None) -> None:
+        """One line, in order. ``gap`` lines before it were lost to overrun. ``reg``: ``(values,
+        line statistics)`` of a regression line (``None`` for classes)."""
         counts = np.bincount(ids, minlength=256)
         t_done = time.perf_counter()
         with self._lock:
@@ -1485,6 +1565,13 @@ class Pipeline:
                 self._recent_counts[:] = 0
                 self._recent_counted[:] = False
                 self._canvas[:] = 0
+                self._task = getattr(job.model[1], 'task', 'classification')
+                self._value_stats[:] = 0.0
+                self._recent_stats[:] = 0.0
+                if self._value_canvas is not None:
+                    self._value_canvas[:] = np.nan
+            if reg is not None and self._value_canvas is None:
+                self._value_canvas = np.full(self._canvas.shape, np.nan, np.float32)
             if gap > 0:
                 self._draw_lost(gap)
             if pre is not None and self._cal_ring is not None and pre.shape == self._cal_ring.shape[1:]:
@@ -1504,9 +1591,16 @@ class Pipeline:
             k = self._canvas_line % len(self._recent_counted)
             self._recent_counts[k] = counts
             self._recent_counted[k] = True
+            if reg is not None:
+                self._value_stats += reg[1]
+                self._recent_stats[k] = reg[1]
+            else:
+                self._recent_stats[k] = 0.0
             self._processed += 1
             if self._canvas_line % self._stride == 0:
                 self._canvas[:, self._canvas_col] = ids
+                if self._value_canvas is not None:
+                    self._value_canvas[:, self._canvas_col] = np.nan if reg is None else reg[0]
                 self._raw_canvas[:, self._canvas_col] = np.nan if intensity is None else intensity
                 self._canvas_lines[self._canvas_col] = self._canvas_line
                 self._advance_canvas(1)
@@ -1522,11 +1616,14 @@ class Pipeline:
         lost = np.arange(first, first + min(gap, ring)) % ring       # lost lines count nothing
         self._recent_counts[lost] = 0
         self._recent_counted[lost] = False
+        self._recent_stats[lost] = 0.0
         self._canvas_line += gap
         columns = len(range(-(-first // self._stride) * self._stride, self._canvas_line, self._stride))
         width = self._canvas.shape[1]
         for _ in range(min(columns, width)):
             self._canvas[:, self._canvas_col] = LOST_CLASS
+            if self._value_canvas is not None:
+                self._value_canvas[:, self._canvas_col] = np.nan
             self._raw_canvas[:, self._canvas_col] = np.nan
             self._canvas_lines[self._canvas_col] = -1
             self._advance_canvas(1)

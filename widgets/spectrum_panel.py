@@ -214,7 +214,7 @@ class SpectrumPanel(QFrame):
         self.note_label.setText(text)
 
     def set_training(self, wavelengths=None, bands=(), snv_bands=(), derivative_bands=(), derivative=None,
-                     selected=None) -> None:
+                     selected=None, groups: str = 'classes') -> None:
         """The training spectra of the model in use (``None`` / empty: the model brings none).
 
         Args:
@@ -224,6 +224,7 @@ class SpectrumPanel(QFrame):
             derivative_bands: the same after the first derivative; empty when the model does not use it.
             derivative: (B, B) matrix, ``D @ x`` = that derivative of a spectrum on the training axis.
             selected: nm of the bands the model's features use (marked in the SNV / derivative view).
+            groups: what the bands are ('classes'; a regression model: target bins, e.g. 'moisture bins').
         """
         had = bool(self._training['input'])
         self._training_wavelengths = np.zeros(0) if wavelengths is None else np.asarray(wavelengths, np.float64)
@@ -233,7 +234,7 @@ class SpectrumPanel(QFrame):
                           'derivative': list(derivative_bands) if has_derivative else []}
         self._selected = np.zeros(0) if selected is None else np.asarray(selected, np.float64).ravel()
         self.reference_label.setText(
-            f"Model reference: {len(bands)} classes · shaded mean ± 1 SD · dashed mean · solid clicked spectra"
+            f"Model reference: {len(bands)} {groups} · shaded mean ± 1 SD · dashed mean · solid clicked spectra"
             if bands else "No training reference supplied by this model · captured spectra remain available")
         self.training_button.setEnabled(bool(bands))
         self.snv_button.setEnabled(bool(snv_bands))

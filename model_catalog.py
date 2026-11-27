@@ -91,8 +91,17 @@ def model_files(folders) -> list[Path]:
 
 def _describe(classifier) -> tuple[str, str]:
     """``(kind for the label, lines for the tooltip)`` of a loaded classifier."""
-    names = [str(classifier.category_names.get(int(c), int(c))) for c in classifier.classes_]
     package = getattr(classifier, 'package', None)
+    if getattr(classifier, 'task', 'classification') == 'regression':
+        target = classifier.target
+        lo, hi = classifier.value_range
+        kind = f"{package.algorithm} · {target.label}"
+        lines = [getattr(classifier, 'chain', package.chain), f"fit: {package.metric}",
+                 f"predicts {target.label}, valid {lo:g} – {hi:g}",
+                 f"hsi_lab_core {package.lab_core_version}, exported {package.exported_at}",
+                 f"input: {classifier.input_units}"]
+        return kind, '\n'.join(lines)
+    names = [str(classifier.category_names.get(int(c), int(c))) for c in classifier.classes_]
     if package is not None:
         kind = f"{package.algorithm} · {len(names)} classes"
         lines = [getattr(classifier, 'chain', package.chain), f"score: {package.metric}", f"hsi_lab_core {package.lab_core_version}, "

@@ -365,12 +365,20 @@ def _spatial_bin(pipeline) -> Block:
     return b
 
 
-def _model(pipeline) -> Block:
+#: regression: share of object pixels outside the model's valid range that makes the Model block 'warn'
+OUT_OF_RANGE_WARN = 0.05
+#: regression: fewest object pixels before the out-of-range share is judged
+OUT_OF_RANGE_MIN_PIXELS = 1000
+
+
+def _model(pipeline, snapshot=None) -> Block:
     plan = pipeline.plans[0]
     classifier = pipeline.classifier
     units = getattr(classifier, 'input_units', 'any')
     receives = input_text(pipeline)
     name = Path(str(getattr(classifier, 'path', '') or 'model')).name
+    if getattr(classifier, 'task', 'classification') == 'regression':
+        return _regression_model(pipeline, classifier, name, units, receives, snapshot)
     classes = getattr(classifier, 'category_names', {}) or {}
     b = Block('model', 'Model', 'ok', line1=name, line2=f"{len(classes)} classes" if classes else '',
               actions=[('model', 'Choose model…')])
@@ -383,13 +391,52 @@ def _model(pipeline) -> Block:
     return b
 
 
+def _regression_model(pipeline, model, name, units, receives, snapshot) -> Block:
+    """Model block of a regression package: target, ranges, engine, object mask and two checks
+    (input units; share of the objects predicted outside the valid range)."""
+    plan = pipeline.plans[0]
+    target = model.target
+    lo, hi = model.value_range
+    b = Block('model', 'Model', 'ok', line1=name, line2=f"{target.label} · {model.package.algorithm}",
+              actions=[('model', 'Choose model…')])
+    mask = model.object_min_mean
+    stats = getattr(snapshot, 'value_stats', None) if getattr(snapshot, 'task', '') == 'regression' else None
+    engine = getattr(snapshot, 'regression_engine', '') or getattr(pipeline, 'regression_engine_name', '')
+    b.rows = [('Model', name), ('Predicts', f"{target.label} (regression, {model.package.algorithm})"),
+              ('Valid range', f"{lo:g} – {hi:g} {target.units}".rstrip()),
+              ('Fit', model.package.metric), ('Expects', units), ('Receives', receives),
+              ('Bands', _prov(plan, 'model bands') or 'n/a'),
+              ('Object mask', 'off: every valid pixel' if mask is None else f"mean input ≥ {mask:g}"),
+              ('Engine', engine or 'not running yet')]
+    if units != 'any' and (units == 'reflectance') != receives.startswith('Reflectance'):
+        b.state = 'error'
+        b.note = (f"The model was trained on {units}, it receives {receives.lower()}: the predicted "
+                  f"{target.name} will be wrong.")
+        return b
+    if stats is not None and stats[0] >= OUT_OF_RANGE_MIN_PIXELS:
+        share = float(stats[3] / stats[0])
+        mean = float(stats[1] / stats[0])
+        b.rows.append(('Now', f"mean {target.format(mean)}, {100 * share:.1f} % outside the valid range"))
+        if share > OUT_OF_RANGE_WARN:
+            b.state = 'warn'
+            b.line2 = f"{100 * share:.0f} % out of range"
+            b.note = (f"{100 * share:.0f} % of the object pixels are predicted outside {lo:g} – {hi:g} "
+                      f"{target.units}: other material than the training set, the belt counted as objects "
+                      "(set the object mask), or an input that differs from the training spectra (check the "
+                      "Reflectance step and the model page).").replace('  ', ' ')
+    elif stats is not None and stats[0] == 0 and getattr(snapshot, 'counted_lines', 0) > 100:
+        b.state = 'warn'
+        b.note = 'No object pixels in the counted lines: the object mask may be set above every pixel.'
+    return b
+
+
 def describe(pipeline, snapshot=None, needed_fps: float | None = None, live: bool = False):
     """``(headline, blocks)`` of the pipeline now (first file / the live camera)."""
     plan = pipeline.plans[0]
     steps = pipeline.effective_steps()
     blocks = [_sensor(pipeline, snapshot, needed_fps, live), _dark(pipeline),
               _switch_block(pipeline, 'flip', 'Flip', 'slit reversed'), _smile(pipeline), _binning(pipeline),
-              _flatfield(pipeline), _reflectance(pipeline), _spatial_bin(pipeline), _model(pipeline)]
+              _flatfield(pipeline), _reflectance(pipeline), _spatial_bin(pipeline), _model(pipeline, snapshot)]
     if plan.stage != 'raw':
         for b in blocks[1:4]:
             b.state, b.line1, b.line2, b.actions, b.note = 'off', 'done in file', '', [], ''

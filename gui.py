@@ -40,6 +40,8 @@ from pipeline import LOST_CLASS, build_pipeline
 from pipeline_overview import (calibration_files, describe, flatfield_state, input_text, next_steps, slit_profiles,
                                status_items)
 from quick_model import LabelSet
+from regression import (BACKGROUND_CODE, colour_hex, histogram_quantiles, objects as find_objects,
+                        summary as value_summary, value_lut)
 from sim_config import load_config, parse_set_overrides
 from themes import apply_theme, make_panel, repolish, set_accent, use_dark_title_bar
 from utils import generate_tab10_lut
@@ -51,6 +53,7 @@ from widgets.performance_panel import PerformancePanel, ThroughputStrip
 from widgets.line_plot import LinePlot, RangeBar
 from widgets.pipeline_view import PipelineView, drop_widget as _drop
 from widgets.reflectance_dialog import ReflectanceDialog
+from widgets.regression_panel import ColorBar, RegressionPanel
 from widgets.sensor_dialog import SensorDialog, SensorForm
 from widgets.spectrum_panel import SpectrumPanel, TrainingBand
 
@@ -125,6 +128,11 @@ class PushbroomScannerMainWindow(QMainWindow):
             lambda: self._pipeline.reset_counts(getattr(self, '_count_delay', 0)))
         self.class_legend_widget.reset_requested.connect(self._forget_previous_counts)
         self.performance_panel.reset_requested.connect(lambda: self._pipeline.reset_perf())
+        self.regression_panel.reset_requested.connect(
+            lambda: self._pipeline.reset_counts(getattr(self, '_count_delay', 0)))
+        self.regression_panel.display_range_changed.connect(self._on_display_range_changed)
+        self.regression_panel.object_mask_changed.connect(self._on_object_mask_changed)
+        self.regression_panel.auto_range_requested.connect(self._auto_display_range)
         self._setup_backend_selector()
         self._restore_steps()
         self._setup_step_switches()
@@ -244,6 +252,16 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._backend_combo.setToolTip("Dark / hot pixel / flip / Smile / binning backend (hsi modules.preprocessing).\n"
                                        "Switches at the next line in every worker; nothing is skipped.")
         backend_row.addWidget(self._backend_combo)
+        caption = QLabel("Regression engine")
+        caption.setObjectName("metricCaption")
+        backend_row.addWidget(caption)
+        self._regression_combo = QComboBox()
+        self._regression_combo.setToolTip(
+            "Engine of a regression model's per-pixel prediction (model.regression_engine).\n"
+            "Auto = the CPU kernel: a dot product per pixel (~0.2 ms per 1024-pixel line), less than an upload\n"
+            "to a discrete GPU. CuPy / OpenCV CUDA run it on the GPU (self-tested against the CPU, falling back\n"
+            "in hsi's order). Classification models are not affected.")
+        backend_row.addWidget(self._regression_combo)
         self._backend_label = QLabel("")
         self._backend_label.setObjectName("backendLabel")
         make_panel(self._backend_label, accent='neutral')
@@ -342,6 +360,10 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._spectrum_height = None
 
         left = QVBoxLayout()
+        # regression model: colour scale of the belt map (hidden for classes)
+        self.color_bar = ColorBar()
+        self.color_bar.setVisible(False)
+        left.addWidget(self.color_bar)
         left.addWidget(self._splitter)
 
         # Keep the existing statistics; performance charts have their own Diagnostics workspace.
@@ -358,6 +380,12 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._side_tabs.tabBar().setExpanding(False)
         self._side_tabs.addTab(self.composition_widget, "Composition")
         self._side_tabs.addTab(self.class_legend_widget, "Materials")
+        # regression model (e.g. moisture): replaces Composition and Materials while it runs
+        self.regression_panel = RegressionPanel()
+        self._side_tabs.addTab(self.regression_panel, "Prediction")
+        self._side_tabs.setTabVisible(self._side_tabs.indexOf(self.regression_panel), False)
+        self._regression = None                    # the regression model shown (None: classes)
+        self._display_ranges: dict = {}            # model path -> colour range chosen by the operator
         self._side_tabs.setMinimumWidth(300)
         left.setContentsMargins(0, 0, 0, 0)
         left_pane = QWidget()
@@ -780,8 +808,16 @@ class PushbroomScannerMainWindow(QMainWindow):
                 notes.append(f"Input now {finite.min():.3g} – {finite.max():.3g}, training means "
                              f"{means.min():.3g} – {means.max():.3g}")
                 if not 1 / 3 <= ratio <= 3:
-                    notes.append(f"not on the same scale (×{ratio:.3g}): the classes will be wrong")
+                    wrong = ('the predictions will be wrong' if self._regression is not None
+                             else 'the classes will be wrong')
+                    notes.append(f"not on the same scale (×{ratio:.3g}): {wrong}")
                     state = 'error'
+            if self._regression is not None and live is not None:
+                # the mean spectrum itself through the model (training bins are drawn per target range)
+                value, ok = self._regression.predict_values(np.asarray(live, np.float32)[None], plan.columns)
+                target = self._regression.target
+                notes.append(f"this mean spectrum predicts {target.name} {target.format(float(value[0]))}"
+                             if ok[0] else "this mean spectrum is no object (object mask / invalid)")
         elif self._pipeline.spectrum_lines == 0:
             notes.append('No model input kept: switch Spectrum on in the Operation tab to compare it here.')
         else:
@@ -1433,6 +1469,12 @@ class PushbroomScannerMainWindow(QMainWindow):
         classifier = self._generation_models.get(generation, self._pipeline.classifier)
         self._generation_models = {g: c for g, c in self._generation_models.items() if g >= generation}
         self._shown_generation = generation
+        self._prev_counts = np.zeros(256, np.int64)
+        self._prev_counted_lines = 0
+        if getattr(classifier, 'task', 'classification') == 'regression':
+            self._show_regression_model(classifier)
+            return
+        self._leave_regression()
         # a model package brings the class colours chosen at training (ids without one keep Tab10)
         colors = getattr(classifier, 'class_colors', None) or {}
         self._lut = generate_tab10_lut(colors)
@@ -1448,11 +1490,122 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._prev_counts = np.zeros(256, np.int64)
         self._prev_counted_lines = 0
 
+    # ------------------------------------------------------------------- regression display ---
+
+    def _regression_display_range(self, model) -> tuple:
+        return self._display_ranges.get(str(model.path), tuple(model.target.display_range))
+
+    def _show_regression_model(self, model) -> None:
+        """A regression model (``task == 'regression'``): value colours, colour bar, the Prediction tab."""
+        self._regression = model
+        display = self._regression_display_range(model)
+        self._lut = value_lut(model.value_range, display)
+        self.color_bar.set_scale(model.target.label, display, model.value_range)
+        self.color_bar.setVisible(True)
+        self.regression_panel.setup(model.target, model.value_range, display, model.object_min_mean)
+        self.regression_panel.add_section(self.model_selector)       # the model tiles stay at hand
+        tabs = self._side_tabs
+        index = tabs.indexOf(self.regression_panel)
+        name = model.target.name
+        tabs.setTabText(index, f"{name[:1].upper()}{name[1:]}")
+        tabs.setTabVisible(index, True)
+        for widget in (self.composition_widget, self.class_legend_widget):
+            tabs.setTabVisible(tabs.indexOf(widget), False)
+        tabs.setCurrentWidget(self.regression_panel)
+        self._canvas_label.setToolTip(f"Belt map at true proportions: predicted {model.target.label} per pixel "
+                                      "(colour bar above; black = no object; magenta = lines lost to overrun). "
+                                      "New lines enter the RAW zone on the right (grey) and continue into the "
+                                      "PREDICTED zone")
+        self._show_training_spectra(model)
+
+    def _leave_regression(self) -> None:
+        """Back to the class display (a classification model runs)."""
+        if self._regression is None and self.color_bar.isHidden() and \
+                not self._side_tabs.isTabVisible(self._side_tabs.indexOf(self.regression_panel)):
+            return
+        self._regression = None
+        self.color_bar.setVisible(False)
+        tabs = self._side_tabs
+        current = tabs.currentWidget()
+        for widget in (self.composition_widget, self.class_legend_widget):
+            tabs.setTabVisible(tabs.indexOf(widget), True)
+        tabs.setTabVisible(tabs.indexOf(self.regression_panel), False)
+        self.class_legend_widget.add_section(self.model_selector)
+        if current is self.regression_panel:
+            tabs.setCurrentWidget(self.composition_widget)
+        self._canvas_label.setToolTip("Belt map at true proportions (display.line_aspect, canvas_line_stride); "
+                                      "the belt moves right to left: new lines enter the RAW zone on the right "
+                                      "(grey: what the model receives, before classification) and continue "
+                                      "into the CLASSIFIED zone (class colours); magenta = lines lost to overrun")
+
+    def _on_display_range_changed(self, lo: float, hi: float) -> None:
+        """New colour range: the whole map recolours (it holds value codes)."""
+        model = self._regression
+        if model is None or not hi > lo:
+            return
+        self._display_ranges[str(model.path)] = (float(lo), float(hi))
+        self._lut = value_lut(model.value_range, (lo, hi))
+        self.color_bar.set_scale(model.target.label, (lo, hi), model.value_range)
+        self._repaint_belt()
+
+    def _auto_display_range(self) -> None:
+        """Colour range = 2nd - 98th percentile of the object pixels counted so far."""
+        model, snap = self._regression, self._last_snapshot
+        if model is None or snap is None or getattr(snap, 'task', '') != 'regression':
+            return
+        hist = np.asarray(snap.counts[:BACKGROUND_CODE], np.float64)
+        if hist.sum() <= 0:
+            return
+        lo, hi = histogram_quantiles(hist, model.value_range, (0.02, 0.98))
+        if hi <= lo:
+            hi = lo + (model.value_range[1] - model.value_range[0]) / 100.0
+        self.regression_panel.set_display_range(lo, hi, emit=True)
+
+    def _on_object_mask_changed(self, min_mean) -> None:
+        """Object mask of the running regression model (applies from the next line)."""
+        if self._regression is not None:
+            self._regression.set_object_mask(min_mean)
+            logger.info("Object mask: %s", 'off' if min_mean is None else f"mean input >= {min_mean:g}")
+
+    def _update_regression(self, s, objects_due: bool) -> None:
+        """Summary, histogram and (at ``objects_due``) the objects of the predicted zone."""
+        model = self._regression
+        background = int(s.counts[BACKGROUND_CODE])
+        stats = value_summary(s.value_stats, s.counts, model.value_range, background)
+        found = None
+        if objects_due and s.value_canvas is not None:
+            raw = 0 if s.raw_canvas is None else s.raw_canvas.shape[1]
+            zone = s.value_canvas[:, :max(0, s.value_canvas.shape[1] - raw)]
+            found = find_objects(zone) if zone.size else []
+        self.regression_panel.update_values(stats, s.counts, found)
+
     _BACKEND_CHOICES = (('auto', 'Auto (GPU if usable, else CPU fused)'), ('cpu_fused', 'CPU fused (fast, checked vs hsi)'),
                         ('cpu', 'CPU (hsi reference)'),
                         ('cupy_cuda', 'CuPy CUDA'), ('opencv_cuda', 'OpenCV CUDA'))
 
+    _REGRESSION_ENGINE_CHOICES = (('auto', 'Auto (CPU kernel per line)'), ('cpu', 'CPU'),
+                                  ('cupy_cuda', 'CuPy CUDA'), ('opencv_cuda', 'OpenCV CUDA'))
+
+    def _setup_regression_engine_selector(self) -> None:
+        caps = get_compute_capabilities()
+        combo = self._regression_combo
+        if combo.count():                       # pipeline replaced: only the selection follows it
+            self._pipeline.set_regression_engine(combo.currentData())
+            return
+        for key, text in self._REGRESSION_ENGINE_CHOICES:
+            capability = getattr(caps, key, None)
+            if capability is not None and not capability.available:
+                text += "  — not available"
+            combo.addItem(text, key)
+            if capability is not None:
+                combo.setItemData(combo.count() - 1, capability.reason or capability.device_name, Qt.ToolTipRole)
+                if not capability.available:
+                    combo.model().item(combo.count() - 1).setEnabled(False)
+        combo.setCurrentIndex(max(0, combo.findData(getattr(self.config.model, 'regression_engine', 'auto'))))
+        combo.currentIndexChanged.connect(lambda _: self._pipeline.set_regression_engine(combo.currentData()))
+
     def _setup_backend_selector(self) -> None:
+        self._setup_regression_engine_selector()
         caps = get_compute_capabilities()
         combo = self._backend_combo
         if combo.count():                       # pipeline replaced: only the selection follows it
@@ -1511,12 +1664,16 @@ class PushbroomScannerMainWindow(QMainWindow):
         if focus_due:
             self._update_focus(s.raw_frame)
         if s.canvas.shape[1] > 0:
-            self._belt = {'canvas': s.canvas, 'raw': s.raw_canvas, 'lines': s.canvas_lines, 'step': step}
+            self._belt = {'canvas': s.canvas, 'raw': s.raw_canvas, 'lines': s.canvas_lines, 'step': step,
+                          'values': getattr(s, 'value_canvas', None)}
             self._show_belt(s.canvas, s.raw_canvas, step[1])
 
+        regression = getattr(s, 'task', 'classification') == 'regression' and self._regression is not None
+        if legend_due and regression:
+            self._update_regression(s, objects_due=self._tick % max(1, round(hz / 2)) == 0)
         # Counts accumulate per line in the pipeline; "real-time" is every line since the
         # previous refresh. A reset makes the totals smaller than the previous values.
-        if legend_due:
+        elif legend_due:
             if s.counted_lines < self._prev_counted_lines:
                 self._prev_counts[:] = 0
             recent = s.counts - self._prev_counts
@@ -1560,6 +1717,9 @@ class PushbroomScannerMainWindow(QMainWindow):
         source_text = 'LIVE CAMERA' if s.source_kind == 'camera' else 'PLAYBACK'
         self._run_label.setText(f"{run_text} · {source_text}")
         model_name = Path(str(getattr(self._pipeline.classifier, 'path', 'model'))).name
+        target = getattr(self._pipeline.classifier, 'target', None)
+        if target is not None:
+            model_name += f" (predicts {target.label})"
         context = f"{name}  ·  Model: {model_name}  ·  Input: {self._input_text()}"
         if s.error:
             context = f"{s.error}  ·  {context}"
@@ -1567,9 +1727,13 @@ class PushbroomScannerMainWindow(QMainWindow):
         self._context_label.setToolTip(context)
         set_accent(self._run_label, 'error' if s.error else 'warn' if s.lines_lost or stalled else 'ok')
         note = f" — {s.backend_note}" if s.backend_note else ""
+        engine = getattr(s, 'regression_engine', '')
+        engine_note = getattr(s, 'regression_engine_note', '')
+        if engine:
+            note += f" · regression on {engine}" + (f" — {engine_note}" if engine_note else "")
         self._backend_label.setText(
             f"running: {s.backend}  (requested {s.requested_backend}){note}")
-        set_accent(self._backend_label, 'warn' if s.backend_note else 'ok')
+        set_accent(self._backend_label, 'warn' if s.backend_note or engine_note else 'ok')
         # ok / warn / error: stripe and text colours come from the theme
         set_accent(self._status_label,
                    'error' if s.error else 'warn' if s.lines_lost or stalled else 'ok')
@@ -1664,7 +1828,10 @@ class PushbroomScannerMainWindow(QMainWindow):
             x = int(round(w * (needed - zone) / needed))
             painter.setPen(QPen(QColor(tokens['accent']), 2, Qt.DashLine))
             painter.drawLine(x, 0, x, h)
-            for text, left in (("◀ CLASSIFIED  (inference zone)", 6), ("RAW  (before classification)", x + 6)):
+            done = (f"◀ PREDICTED  ({self._regression.target.name})" if self._regression is not None
+                    else "◀ CLASSIFIED  (inference zone)")
+            before = "RAW  (before prediction)" if self._regression is not None else "RAW  (before classification)"
+            for text, left in ((done, 6), (before, x + 6)):
                 box = metrics.boundingRect(text).adjusted(-5, -2, 5, 2)
                 box.moveTo(left, 6)
                 painter.fillRect(box, QColor(tokens['image_overlay']))   # #AARRGGBB
@@ -1727,9 +1894,14 @@ class PushbroomScannerMainWindow(QMainWindow):
         package = getattr(classifier, 'package', None)
         training = getattr(package, 'training', None) or {}
 
+        def colour(row):
+            target_mean = getattr(row, 'target_mean', None)
+            if getattr(classifier, 'task', '') == 'regression' and target_mean is not None:
+                return colour_hex(target_mean, self._regression_display_range(classifier))
+            return '#%02X%02X%02X' % tuple(int(v) for v in self._lut[row.class_id])
+
         def bands(rows):
-            return [TrainingBand(row.label, '#%02X%02X%02X' % tuple(int(v) for v in self._lut[row.class_id]),
-                                 row.mean, row.sd, row.n_spectra) for row in rows]
+            return [TrainingBand(row.label, colour(row), row.mean, row.sd, row.n_spectra) for row in rows]
 
         if not training.get('input'):
             self.spectrum_panel.set_training(None)
@@ -1742,7 +1914,9 @@ class PushbroomScannerMainWindow(QMainWindow):
             snv_bands=preprocessed if package.snv else (),
             derivative_bands=preprocessed if derivative is not None and not package.snv else (),
             derivative=derivative,
-            selected=None if selected is None else package.wavelengths[np.asarray(selected, int)])
+            selected=None if selected is None else package.wavelengths[np.asarray(selected, int)],
+            groups=(f"{classifier.target.name} bins" if getattr(classifier, 'task', '') == 'regression'
+                    else 'classes'))
 
     def _probe_spectrum(self, pos) -> None:
         """Add the spectrum of the belt-map pixel under ``pos`` (label pixels) to the preview."""
@@ -1775,6 +1949,13 @@ class PushbroomScannerMainWindow(QMainWindow):
         classifier = self._generation_models.get(self._shown_generation, self._pipeline.classifier)
         names = classifier.category_names
         label = str(names.get(class_id, class_id) if hasattr(names, 'get') else class_id)
+        values_map = self._belt.get('values')
+        if getattr(classifier, 'task', '') == 'regression':
+            value = np.nan
+            if values_map is not None:
+                value = float(values_map[min(row // self._belt['step'][0], values_map.shape[0] - 1), column])
+            label = (f"{classifier.target.name} {classifier.target.format(value)}" if np.isfinite(value)
+                     else 'no object (background)')
         on = self._pipeline.effective_steps()
         panel.set_unit("model input: reflectance" if on.get('reflectance') else
                        "model input: counts" if plan.stage == 'raw' else "model input")

@@ -330,6 +330,8 @@ class PushbroomLineClassifier:
 
     #: True for a model trained in this session (never a file: gone when the program closes)
     session = False
+    #: 'classification' (predict -> class ids) or 'regression' (:class:`HsiRegressor`: value codes)
+    task = 'classification'
 
     def __init__(self, model_artifact_path: str) -> None:
         self._load(joblib.load(model_artifact_path), str(model_artifact_path))
@@ -529,6 +531,8 @@ def load_classifier(model_artifact_path, mlc_reg_covar: float = 0.0) -> Pushbroo
     from hsi_package import is_package, load_package
     if is_package(model_artifact_path):
         package = load_package(model_artifact_path)
+        if package.is_regression:
+            return HsiRegressor(model_artifact_path, mlc_reg_covar, package=package)
         if package.svm is not None:
             return HsiSvmClassifier(model_artifact_path, mlc_reg_covar, package=package)
         if package.linear is not None:
@@ -555,7 +559,7 @@ class _HsiPackageBase(PushbroomLineClassifier):
         self.package = package
         self.path = str(model_artifact_path)
         self.classes_ = package.classes
-        if self.classes_.min() < 0 or self.classes_.max() > 254:
+        if self.classes_.size and (self.classes_.min() < 0 or self.classes_.max() > 254):
             raise ValueError("class ids must be 0..254 (255 marks lost lines)")
         self._class_ids = self.classes_.astype(np.uint8)
         self.category_names = dict(package.labels)
@@ -996,6 +1000,92 @@ class HsiLinearClassifier(_HsiPackageBase):
             if self._invalid_class is not None:
                 ids[~good] = self._invalid_class
         return ids, confidence
+
+
+class HsiRegressor(_HsiPackageBase):
+    """A regression package (``task_type`` "regression", e.g. moisture): one value per slit pixel.
+
+    The chain after the preprocessing is linear (band selection or the Savitzky-Golay first
+    derivative, optional PCA, StandardScaler, then a PLSR / Ridge / LinearRegression response), so it
+    folds into one weight per training band and a bias: ``y = z @ w + b`` with ``z`` the spectrum
+    (after SNV if the package uses it). The engines of ``regression_engines`` run it (CPU kernel,
+    CuPy, OpenCV CUDA); the worker passes its own :class:`regression_engines.RegressionRuntime`.
+
+    A pixel is an *object* pixel when its spectrum is valid (finite; with SNV not constant) and,
+    when an object mask is set (``object_min_mean``: the package's ``object_mask.min_mean``, or set
+    by the operator), the mean of its input bands reaches it; every other pixel is background.
+
+    :meth:`predict` returns ``uint8`` codes (``regression.encode`` over the target's valid
+    range), so the pipeline's belt map, counts and lost lines work as for classes; the float
+    values come from :meth:`predict_values`. ``mlc_reg_covar`` does not apply.
+    """
+
+    task = 'regression'
+
+    def __init__(self, model_artifact_path, mlc_reg_covar: float = 0.0, package=None) -> None:
+        from regression_engines import RegressionRuntime
+        to_features, shift = self._setup(model_artifact_path, mlc_reg_covar, package)
+        package = self.package
+        model = package.regression
+        if model is None:
+            raise ValueError(f"{self.path}: {package.algorithm} package, not a regression (use load_classifier)")
+        project = to_features.T / package.scaler_scale                     # (B, F)
+        self._weights64 = np.ascontiguousarray(project @ model.coef)        # (B,)
+        self._bias = float(model.intercept + ((shift - package.scaler_mean) / package.scaler_scale) @ model.coef)
+        self.target = package.target
+        self.input_units_declared = package.input_units_declared
+        self.value_range = tuple(package.target.valid_range)
+        self.object_min_mean = package.object_mask.get('min_mean')
+        self.category_names = {}
+        self.class_colors = {}
+        self._cpu = RegressionRuntime('cpu')
+        # compile (or load from the Numba cache) now, not on the first camera line
+        self.predict(np.zeros((1, self.n_bands), np.float32), self.selected_bands)
+
+    @property
+    def chain(self) -> str:
+        if not self.mlc_reg_covar:
+            return self.package.chain
+        return f"{self.package.chain} (model.mlc_reg_covar {self.mlc_reg_covar:g} ignored: not an MLC)"
+
+    def set_object_mask(self, min_mean: float | None) -> None:
+        """Background below this mean of the input bands (``None``: every valid pixel is an object)."""
+        self.object_min_mean = None if min_mean is None else float(min_mean)
+
+    def predict_values(self, binned: np.ndarray, columns, runtime=None) -> tuple[np.ndarray, np.ndarray]:
+        """``(values (n,) float32, object (n,) bool)`` of one ``(slit, n_bins)`` frame; NaN off objects."""
+        if isinstance(columns, Resampled):
+            binned, columns = columns.apply(binned), self.selected_bands
+        values, means, valid = (runtime or self._cpu).predict(binned, columns, self._weights64, self._bias,
+                                                              self._snv)
+        threshold = self.object_min_mean
+        if threshold is not None:
+            valid &= means >= threshold
+        if not valid.all():
+            values[~valid] = np.nan
+        return values, valid
+
+    def encode(self, values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        from regression import encode
+        return encode(values, valid, self.value_range)
+
+    def predict(self, binned: np.ndarray, columns, runtime=None) -> np.ndarray:
+        """Value codes (``uint8``, see ``regression.encode``) of every slit pixel of one frame."""
+        return self.encode(*self.predict_values(binned, columns, runtime))
+
+    def predict_spectra(self, spectra: np.ndarray, columns, runtime=None) -> tuple[np.ndarray, np.ndarray]:
+        """:meth:`predict_values` of many pixels ``(..., C)`` (e.g. a spectrum history), in chunks."""
+        from regression_engines import predict_bulk
+        spectra = np.asarray(spectra)
+        if isinstance(columns, Resampled):
+            flat = columns.apply(spectra.reshape(-1, spectra.shape[-1]))
+            spectra, columns = flat.reshape(spectra.shape[:-1] + (flat.shape[-1],)), self.selected_bands
+        values, means, valid = predict_bulk(runtime or self._cpu, spectra, columns, self._weights64, self._bias,
+                                            self._snv)
+        if self.object_min_mean is not None:
+            valid &= means >= self.object_min_mean
+        values[~valid] = np.nan
+        return values, valid
 
 
 class SpeedTestClassifier(PushbroomLineClassifier):

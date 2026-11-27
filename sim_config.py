@@ -210,6 +210,13 @@ class ModelConfig:
     # trained. Raise it (0.03 .. 1) when live data falls to Background: the input is noisier than
     # the training cubes. Not the validated model any more: check the result on known material.
     mlc_reg_covar: float = 0.0
+    # regression packages (e.g. moisture): engine of the per-line prediction. 'auto' = the CPU
+    # kernel per line (a dot product per pixel: microseconds, less than one upload to a GPU);
+    # 'cupy_cuda' / 'opencv_cuda' run it on the GPU (falling back in hsi's order, then CPU).
+    regression_engine: str = 'auto'
+
+
+REGRESSION_ENGINES = ('auto', 'cpu', 'cupy_cuda', 'opencv_cuda')
 
 
 @dataclass(frozen=True)
@@ -281,6 +288,9 @@ class SimulationConfig:
         reg = self.model.mlc_reg_covar
         if isinstance(reg, bool) or not isinstance(reg, (int, float)) or not 0 <= reg < float('inf'):
             raise ValueError(f"model.mlc_reg_covar must be a number >= 0, got {reg!r}")
+        if self.model.regression_engine not in REGRESSION_ENGINES:
+            raise ValueError(f"model.regression_engine must be one of {REGRESSION_ENGINES}, "
+                             f"got {self.model.regression_engine!r}")
         if self.acquisition.resolution_nm <= 0 or self.acquisition.m_nm_per_px_bin1 <= 0:
             raise ValueError("acquisition.m_nm_per_px_bin1 and resolution_nm must be > 0")
         if self.corrections.backend not in ('auto', 'cpu_fused', 'cpu', 'cupy_cuda', 'opencv_cuda'):

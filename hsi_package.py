@@ -57,7 +57,9 @@ import io
 import json
 import logging
 import lzma
+import math
 import pickle
+import re
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -79,7 +81,21 @@ _SGD_LOSS_HOLDERS = ({(module, name) for module in ('sklearn.linear_model._sgd_f
 _PCA_HOLDERS = {('spectral_pipeline', 'SafePCA'), ('sklearn.decomposition._pca', 'PCA')}
 _PLS_HOLDERS = {('sklearn.cross_decomposition._pls', 'PLSRegression'),
                 ('sklearn.cross_decomposition.pls_', 'PLSRegression')}
-_FOREIGN_HOLDERS = _SVM_HOLDERS | _SGD_HOLDERS | _SGD_LOSS_HOLDERS | _PCA_HOLDERS | _PLS_HOLDERS
+# linear regressions of a regression package (one response: y = f @ coef + intercept)
+_LINEAR_REGRESSION_HOLDERS = {('sklearn.linear_model._ridge', 'Ridge'), ('sklearn.linear_model.ridge', 'Ridge'),
+                              ('sklearn.linear_model._base', 'LinearRegression'),
+                              ('sklearn.linear_model.base', 'LinearRegression')}
+# a plain sklearn StandardScaler (regression packages of regression_builder.py)
+_SCALER_HOLDERS = {('sklearn.preprocessing._data', 'StandardScaler'), ('sklearn.preprocessing.data', 'StandardScaler')}
+_FOREIGN_HOLDERS = (_SVM_HOLDERS | _SGD_HOLDERS | _SGD_LOSS_HOLDERS | _PCA_HOLDERS | _PLS_HOLDERS
+                    | _LINEAR_REGRESSION_HOLDERS | _SCALER_HOLDERS)
+#: regression algorithms (``task_type`` "regression"): one continuous target per pixel
+SUPPORTED_REGRESSIONS = ('PLSR', 'Ridge', 'LinearRegression')
+# HSI MLOps exports a PLSRegression of one target as algorithm 'PLS-DA' with task_type 'regression'
+_REGRESSION_ALIASES = {'PLSR': 'PLSR', 'PLS-R': 'PLSR', 'PLS': 'PLSR', 'PLSREGRESSION': 'PLSR', 'PLS-DA': 'PLSR',
+                       'RIDGE': 'Ridge',
+                       'LINEARREGRESSION': 'LinearRegression', 'MLR': 'LinearRegression'}
+_CHECK_TOLERANCE = 1e-6               # regression: reader's predictions of the check spectra vs the package's
 # the 'loss' of a PLS-DA LinearModel: its scores are regression responses (confidence = their softmax)
 PLS_RESPONSE = 'pls_response'
 _PLS_TOLERANCE = 1e-6                 # PLS coef_ vs its rotations / loadings, recovered one-hot responses
@@ -88,8 +104,10 @@ _SGD_LOSSES = ('hinge', 'log_loss', 'log', 'modified_huber', 'squared_hinge', 'p
 _SCALER_TOLERANCE = 1e-8              # scaler mean / variance vs the ones the reference gives (relative)
 _GAMMA_TOLERANCE = 1e-8               # SVM gamma 'scale' vs the one the reference gives (relative)
 # preprocessing step lists of pipeline_audit this reader implements (in this order, nothing else)
-SUPPORTED_STEPS = ('snv', 'first_derivative')
-_SUPPORTED_CHAINS = ((), ('snv',), ('first_derivative',))
+SUPPORTED_STEPS = ('snv', 'first_derivative', 'savitzky_golay')
+# savitzky_golay then first_derivative (HSI MLOps use_sg + use_d1): Savitzky-Golay smoothing, then the
+# Savitzky-Golay first derivative of the smoothed spectrum (both linear: one matrix)
+_SUPPORTED_CHAINS = ((), ('snv',), ('first_derivative',), ('savitzky_golay', 'first_derivative'))
 _DERIVATIVE_IMPLEMENTATION = 'hsi_lab_core.preprocessing.savgol_derivative'
 _REFERENCE_DOMAIN = 'preprocessed_wavelength_selected'
 _RAW_DOMAIN = 'raw_wavelength_selected'
@@ -107,6 +125,7 @@ class TrainingClass:
     n_spectra: int
     mean: np.ndarray                 # (B,) on HsiPackage.wavelengths
     sd: np.ndarray                   # (B,)
+    target_mean: float | None = None  # regression package: mean target of this bin of training spectra
 
 
 @dataclass
@@ -154,6 +173,42 @@ class LinearModel:
 
 
 @dataclass
+class TargetSpec:
+    """What a regression package predicts (manifest ``target``)."""
+    name: str                        # e.g. 'moisture'
+    units: str                       # e.g. '%' ('' = unitless)
+    valid_range: tuple               # (lo, hi): what the model was validated for; outside = flagged
+    display_range: tuple             # (lo, hi): default colour scale of the map
+    decimals: int = 1                # digits shown
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} ({self.units})" if self.units else self.name
+
+    def format(self, value) -> str:
+        if value is None or not np.isfinite(value):
+            return '—'
+        return f"{value:.{self.decimals}f}" + (f" {self.units}" if self.units else '')
+
+
+@dataclass
+class RegressionModel:
+    """A linear regression after the features: ``y = f @ coef + intercept`` (f = scaled features).
+
+    For a PLSR the regression's own centring and scaling are folded into ``coef`` / ``intercept``
+    (``PLSRegression.predict``). Fit statistics are those the package reports (training software).
+    """
+    coef: np.ndarray                 # (F,)
+    intercept: float
+    kind: str                        # 'PLSR' | 'Ridge' | 'LinearRegression'
+    components: int | None = None    # PLSR: latent components
+    stats: dict = field(default_factory=dict)   # n, target_mean, target_sd, rmsec, r2, rmsecv, ... (as reported)
+    # PLSR: what its stored training scores give back (training targets, fit), and the check of it
+    recovered: dict = field(default_factory=dict)
+    evidence: str = ''
+
+
+@dataclass
 class HsiPackage:
     """One trained model as plain arrays (float64, exactly as stored)."""
     path: str
@@ -193,9 +248,22 @@ class HsiPackage:
     pca_components: np.ndarray | None = None  # (P, F)
     pca_variance: np.ndarray | None = None    # (P,) explained_variance_ (sample variance of the scores), if stored
     pca_samples: float | None = None          # rows the PCA was fitted on, if stored
+    task: str = 'classification'              # 'classification' | 'regression'
+    regression: RegressionModel | None = None  # the model of a regression package
+    target: TargetSpec | None = None          # what a regression package predicts
+    object_mask: dict = field(default_factory=dict)   # regression: {'min_mean': x} background below (optional)
+    input_units_declared: bool = True         # False: the manifest has no input_contract (units inferred)
+
+    @property
+    def is_regression(self) -> bool:
+        return self.task == 'regression'
 
     @property
     def model_text(self) -> str:
+        if self.regression is not None:
+            reg = self.regression
+            parts = f"{reg.components} components" if reg.components else 'linear'
+            return f"{reg.kind} -> {self.target.label} ({parts})"
         if self.svm is not None:
             return (f"SVM {self.classes.size} classes (RBF, {self.svm.support_vectors.shape[0]} support vectors, "
                     "one-vs-one vote)")
@@ -212,6 +280,8 @@ class HsiPackage:
             steps.append('SNV')
         if self.derivative is not None:
             p = self.derivative_parameters
+            if p.get('smooth'):
+                steps.append(f"SG smoothing {p['smooth']['window']}/{p['smooth']['polyorder']}")
             steps.append(f"1st derivative (Savitzky-Golay {p['window']}/{p['polyorder']})")
         if self.selected.size != self.wavelengths.size:
             steps.append(f"{self.selected.size} bands")
@@ -225,9 +295,14 @@ class HsiPackage:
         lines = [f"{Path(self.path).name}: {self.algorithm} '{self.name}', hsi_lab_core {self.lab_core_version}, "
                  f"exported {self.exported_at}",
                  f"  chain    {self.chain}",
-                 f"  bands    {wl.size} at {wl[0]:.2f}-{wl[-1]:.2f} nm; the model uses {self.selected.size}",
-                 f"  classes  " + ', '.join(f"{int(c)} {self.labels[int(c)]}" for c in self.classes),
-                 f"  score    {self.metric}"]
+                 f"  bands    {wl.size} at {wl[0]:.2f}-{wl[-1]:.2f} nm; the model uses {self.selected.size}"]
+        if self.is_regression:
+            t = self.target
+            lines.append(f"  target   {t.label}, valid {t.valid_range[0]:g}-{t.valid_range[1]:g}, "
+                         f"display {t.display_range[0]:g}-{t.display_range[1]:g}")
+        else:
+            lines.append("  classes  " + ', '.join(f"{int(c)} {self.labels[int(c)]}" for c in self.classes))
+        lines.append(f"  score    {self.metric}")
         lines += [f"  check    {text}" for text in self.checks]
         return '\n'.join(lines)
 
@@ -257,14 +332,14 @@ def load_package(path) -> HsiPackage:
     checks = [_check_sha256(path, manifest, files, ('model.joblib', 'scaler.joblib', 'pca.joblib',
                                                     'training_spectral_reference.json'))]
 
+    if manifest.get('task_type') == 'regression':
+        return _load_regression(path, manifest, files, checks)
     algorithm = str(manifest.get('algorithm'))
     if algorithm not in SUPPORTED_ALGORITHMS or manifest.get('task_type') != 'classification':
         raise ValueError(f"{path.name}: algorithm {algorithm!r} ({manifest.get('task_type')}) is not supported; "
                          f"this reader runs {', '.join(SUPPORTED_ALGORITHMS)} classification packages")
     wavelengths, snv, derivative_parameters, selected = _feature_chain(path, manifest)
-    derivative = None if not derivative_parameters else savgol_derivative_matrix(
-        wavelengths.size, derivative_parameters['window'], derivative_parameters['polyorder'],
-        derivative_parameters['delta'])
+    derivative = derivative_matrix(derivative_parameters, wavelengths.size)
     pca_mean = pca_components = pca_variance = pca_samples = None
     if (manifest.get('pipeline_audit') or {}).get('pca') is not None:
         if algorithm == 'SVM':                  # its gamma check needs the band features
@@ -296,11 +371,7 @@ def load_package(path) -> HsiPackage:
     flags = manifest.get('class_background') or {}
     background = tuple(cid for cid, name in names.items() if flags.get(name) is True)
 
-    contract = manifest.get('input_contract') or {}
-    mode, units = contract.get('measurement_mode'), contract.get('units')
-    if mode == 'reflectance' and units not in (None, 'fraction'):
-        raise ValueError(f"{path.name}: the model expects reflectance in {units!r}; this pipeline gives a fraction")
-    input_units = 'reflectance' if mode == 'reflectance' else 'counts'
+    input_units = _input_units(path, manifest)
 
     package = HsiPackage(
         path=str(path), name=str(manifest.get('name', '')), algorithm=algorithm, classes=classes, labels=names,
@@ -315,6 +386,345 @@ def load_package(path) -> HsiPackage:
     package.training = _training_spectra(package, files.get('training_spectral_reference.json'))
     logger.info("Model package loaded\n%s", package.describe())
     return package
+
+
+def _input_units(path: Path, manifest: dict) -> str:
+    contract = manifest.get('input_contract') or {}
+    mode, units = contract.get('measurement_mode'), contract.get('units')
+    if mode == 'reflectance' and units not in (None, 'fraction'):
+        raise ValueError(f"{path.name}: the model expects reflectance in {units!r}; this pipeline gives a fraction")
+    return 'reflectance' if mode == 'reflectance' else 'counts'
+
+
+# --------------------------------------------------------------------------- regression ---
+
+def _load_regression(path: Path, manifest: dict, files: dict, checks: list) -> HsiPackage:
+    """A regression package (``task_type`` "regression"): same feature chain as a classification
+    package (SNV | first derivative, band selection, optional PCA, StandardScaler), then one
+    linear response (a PLSR, Ridge or LinearRegression), see :class:`RegressionModel`."""
+    raw_algorithm = str(manifest.get('algorithm'))
+    algorithm = _REGRESSION_ALIASES.get(raw_algorithm.replace(' ', '').replace('_', '').upper())
+    if algorithm is None:
+        raise ValueError(f"{path.name}: regression algorithm {raw_algorithm!r} is not supported; this reader runs "
+                         f"{', '.join(SUPPORTED_REGRESSIONS)} regression packages")
+    wavelengths, snv, derivative_parameters, selected = _feature_chain(path, manifest)
+    derivative = derivative_matrix(derivative_parameters, wavelengths.size)
+    pca_mean = pca_components = pca_variance = pca_samples = None
+    if (manifest.get('pipeline_audit') or {}).get('pca') is not None:
+        pca_mean, pca_components, pca_variance, pca_samples = _pca(path, manifest, files, selected.size)
+    n_scaled = selected.size if pca_components is None else pca_components.shape[0]
+    scaler_mean, scaler_scale, scaler_var, scaler_samples = _scaler(path, manifest, files, n_scaled)
+    blob = files.get('training_spectral_reference.json')
+    reference = _regression_reference(blob)
+    model = _plsr(path, files, n_scaled) if algorithm == 'PLSR' else _linear_regression(path, files, n_scaled,
+                                                                                        algorithm)
+    model.stats = dict(model.recovered)          # the training targets the PLS scores give back
+    model.stats.update({k: v for k, v in (reference.get('stats') or {}).items() if isinstance(v, (int, float))})
+    target = _target(path, manifest, model.stats)
+    declared = bool(manifest.get('input_contract'))
+    input_units = _input_units(path, manifest) if declared else _inferred_units(snv, derivative, pca_components,
+                                                                                scaler_mean)
+    mask = manifest.get('object_mask') or {}
+    object_mask = {}
+    if isinstance(mask, dict) and isinstance(mask.get('min_mean'), (int, float)) and np.isfinite(mask['min_mean']):
+        object_mask['min_mean'] = float(mask['min_mean'])
+    package = HsiPackage(
+        path=str(path), name=str(manifest.get('name', '')), algorithm=algorithm, classes=np.zeros(0, np.int64),
+        labels={}, colors={}, background=(), wavelengths=wavelengths, snv=snv, selected=selected,
+        scaler_mean=scaler_mean, scaler_scale=scaler_scale, means=None, covariances=None, priors=None,
+        input_units=input_units, metric=_regression_metric(manifest, model.stats),
+        exported_at=str(manifest.get('exported_at', '?')),
+        lab_core_version=str(manifest.get('hsi_lab_core_version', '?')), checks=checks,
+        derivative=derivative, derivative_parameters=derivative_parameters, scaler_var=scaler_var,
+        scaler_samples=scaler_samples, pca_mean=pca_mean, pca_components=pca_components, pca_variance=pca_variance,
+        pca_samples=pca_samples, task='regression', regression=model, target=target, object_mask=object_mask,
+        input_units_declared=declared)
+    if model.evidence:
+        checks.append(model.evidence)
+    if not declared:
+        checks.append(f"input units: {input_units} (inferred: the manifest has no input_contract; the scaler's "
+                      "feature means are on that scale)")
+    checks.append(_check_regression_reference(path, package, blob, reference))
+    package.training = _training_spectra(package, blob)
+    logger.info("Model package loaded\n%s", package.describe())
+    return package
+
+
+def _inferred_units(snv: bool, derivative, pca_components, scaler_mean: np.ndarray) -> str:
+    """Input units of a package without ``input_contract``, from the scale of its features: the
+    StandardScaler's means are first-derivative values per nm (reflectance: below ~0.01 / nm) or
+    band values (reflectance: below ~2); counts are orders of magnitude larger. With SNV or a PCA
+    the scale is gone: HSI MLOps trains on calibrated cubes, so reflectance is assumed."""
+    if snv or pca_components is not None:
+        return 'reflectance'
+    level = float(np.median(np.abs(scaler_mean)))
+    limit = 0.05 if derivative is not None else 3.0
+    return 'reflectance' if level < limit else 'counts'
+
+
+_UNITS_IN_NAME = re.compile(r'^(.*?)\s*[\(\[]\s*([^()\[\]]*?)\s*[\)\]]\s*$')
+
+
+def _range(value) -> tuple | None:
+    try:
+        lo, hi = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    return (lo, hi) if np.isfinite(lo) and np.isfinite(hi) and lo < hi else None
+
+
+def _target(path: Path, manifest: dict, stats: dict) -> TargetSpec:
+    """``manifest['target']``: name, units, valid and display range (the valid range defaults to the
+    training targets' range widened by 10 %, when the reference gives it)."""
+    spec = manifest.get('target')
+    if isinstance(spec, str):
+        spec = {'name': spec}
+    if spec is None and str(manifest.get('target_col') or '').strip():
+        # HSI MLOps: the training table's column, e.g. "Weight Loss (%)" -> name and units
+        column = str(manifest['target_col']).strip()
+        match = _UNITS_IN_NAME.match(column)
+        spec = {'name': match.group(1), 'units': match.group(2)} if match and match.group(1) else {'name': column}
+        if 'target_min' in stats and 'target_max' in stats and stats['target_max'] > stats['target_min']:
+            spec['display_range'] = [stats['target_min'], stats['target_max']]
+    if not isinstance(spec, dict) or not str(spec.get('name') or '').strip():
+        raise ValueError(f"{path.name}: a regression package must name its target (manifest target.name or "
+                         "target_col)")
+    valid = _range(spec.get('valid_range'))
+    if valid is None and 'target_min' in stats and 'target_max' in stats:
+        lo, hi = float(stats['target_min']), float(stats['target_max'])
+        if hi > lo:
+            pad = 0.1 * (hi - lo)
+            valid = (lo - pad, hi + pad)
+    if valid is None:
+        raise ValueError(f"{path.name}: the regression target has no valid_range (and the training reference "
+                         "gives no target range)")
+    display = _range(spec.get('display_range')) or valid
+    decimals = spec.get('decimals', 1)
+    decimals = int(decimals) if isinstance(decimals, int) and not isinstance(decimals, bool) and 0 <= decimals <= 6 \
+        else 1
+    return TargetSpec(str(spec['name']).strip(), str(spec.get('units') or ''), valid, display, decimals)
+
+
+def _regression_metric(manifest: dict, stats: dict) -> str:
+    parts = [f"{name} = {stats[key]:.4g}" for key, name in (('r2', 'R²'), ('rmsec', 'RMSEC'), ('rmsecv', 'RMSECV'),
+                                                            ('rmsep', 'RMSEP')) if key in stats]
+    reported = manifest.get('metric_name') or (manifest.get('evaluation_evidence') or {}).get('selection_metric')
+    if reported and str(reported).lower() != 'rmsecv':
+        text = _metric_text(manifest)
+        return f"{text}; fit {', '.join(parts)}" if parts else text
+    if parts:
+        return ', '.join(parts)
+    return _metric_text(manifest)
+
+
+def _plsr(path: Path, files: dict, n_features: int) -> RegressionModel:
+    """A pickled ``sklearn.cross_decomposition.PLSRegression`` with one response (alone, or as
+    ``model_`` of an ``hsi_lab_core`` wrapper), read as attributes and folded into one linear
+    response. ``coef_`` is checked against its rotations and loadings, as for a PLS-DA."""
+    if 'model.joblib' not in files:
+        raise ValueError(f"{path.name}: model.joblib is missing")
+    what = f"{path.name}/model.joblib"
+    holder = _load_joblib(files['model.joblib'], what)
+    kind = (type(holder).__module__, type(holder).__name__)
+    pls = holder if kind in _PLS_HOLDERS else getattr(holder, 'model_', None)
+    if pls is None or (type(pls).__module__, type(pls).__name__) not in _PLS_HOLDERS:
+        raise ValueError(f"{what}: holds a {'.'.join(kind)}; a PLSR package must hold an sklearn PLSRegression")
+    n_in = getattr(pls, 'n_features_in_', n_features)
+    if n_in != n_features:
+        raise ValueError(f"{what}: the PLSRegression takes {n_in} features, the package's chain gives {n_features}")
+    coef = _array(pls, 'coef_', what)
+    if coef.size != n_features or coef.ndim not in (1, 2) or (coef.ndim == 2 and 1 not in coef.shape):
+        raise ValueError(f"{what}: coef_ has shape {coef.shape}: a PLSR of one response on {n_features} features "
+                         "is needed (a PLS with several responses is not a regression of one target)")
+    coef = coef.reshape(-1)
+    intercept = _array(pls, 'intercept_', what).reshape(-1)
+    x_mean = _array(pls, '_x_mean', what, (n_features,))
+    x_std = _array(pls, '_x_std', what, (n_features,))
+    y_mean = _array(pls, '_y_mean', what).reshape(-1)
+    y_std = _array(pls, '_y_std', what).reshape(-1)
+    if intercept.size != 1 or y_mean.size != 1 or y_std.size != 1:
+        raise ValueError(f"{what}: intercept_ / _y_mean of {intercept.size} responses: not one target")
+    rotations = _array(pls, 'x_rotations_', what)
+    if rotations.ndim != 2 or rotations.shape[0] != n_features or rotations.shape[1] < 1:
+        raise ValueError(f"{what}: x_rotations_ has shape {rotations.shape}, expected ({n_features}, n)")
+    components = rotations.shape[1]
+    loadings = _array(pls, 'y_loadings_', what).reshape(1, -1)
+    if loadings.shape[1] != components:
+        raise ValueError(f"{what}: y_loadings_ has {loadings.shape[1]} components, x_rotations_ {components}")
+    if np.any(x_std <= 0) or y_std[0] <= 0:
+        raise ValueError(f"{what}: a standard deviation of the PLS regression is <= 0")
+    if not np.allclose(intercept, y_mean, rtol=0, atol=1e-12 * max(1.0, abs(float(y_mean[0])))):
+        raise ValueError(f"{what}: intercept_ is not the response mean (a PLSRegression of another sklearn version)")
+    expected = (rotations @ loadings.T * y_std).reshape(-1) / x_std
+    error = float(np.abs(coef - expected).max() / max(np.abs(expected).max(), 1e-300))
+    if not error <= _PLS_TOLERANCE:
+        raise ValueError(f"{what}: coef_ is not the one its rotations and loadings give (relative difference "
+                         f"{error:.3g}): not the PLSRegression.predict implemented here")
+    recovered, evidence = _pls_training_targets(pls, what, loadings[0], float(y_mean[0]), float(y_std[0]))
+    return RegressionModel(coef=coef, intercept=float(intercept[0] - x_mean @ coef), kind='PLSR',
+                           components=components, recovered=recovered, evidence=evidence)
+
+
+def _pls_training_targets(pls, what: str, loadings: np.ndarray, y_mean: float, y_std: float) -> tuple:
+    """``(statistics, check text)`` of the training targets a one-response PLSRegression gives back
+    from its stored training scores (NIPALS, regression deflation, as for a PLS-DA).
+
+    With one response ``Y_i = Y_0 - sum_{j<i} t_j q_j`` and ``u_i = Y_i c_i / c_i^2``, so every
+    component gives ``Y_0 = (u_i c_i^2 + sum_{j<i} t_j q_j c_i) / c_i`` on its own: they must agree,
+    and the targets they give must have the regression's own mean and SD. Statistics: ``n``,
+    ``target_mean`` / ``_sd`` / ``_min`` / ``_max``, ``target_values`` (distinct), the fit's ``r2`` and
+    ``rmsec`` (the training rows predicted from their scores).
+    """
+    x_name = next((n for n in ('_x_scores', 'x_scores_') if getattr(pls, n, None) is not None), None)
+    y_name = next((n for n in ('_y_scores', 'y_scores_') if getattr(pls, n, None) is not None), None)
+    if not (x_name and y_name) or getattr(pls, 'y_weights_', None) is None \
+            or getattr(pls, 'deflation_mode', 'regression') != 'regression' or getattr(pls, '_norm_y_weights', False):
+        return {}, "PLS training targets NOT recovered (the regression stores no training scores)"
+    t, u = _array(pls, x_name, what), _array(pls, y_name, what)
+    weights = _array(pls, 'y_weights_', what).reshape(-1)
+    k = weights.size
+    if t.shape != u.shape or t.ndim != 2 or t.shape[1] != k or loadings.size != k or t.shape[0] < 2:
+        return {}, "PLS training targets NOT recovered (stored scores do not fit the components)"
+    usable = [i for i in range(k) if abs(weights[i]) > 1e-12]
+    if not usable:
+        return {}, "PLS training targets NOT recovered (zero y weights)"
+    estimates = np.array([(u[:, i] * weights[i] ** 2 + t[:, :i] @ (loadings[:i] * weights[i])) / weights[i]
+                          for i in usable])
+    scale = max(float(np.abs(estimates[0]).max()), 1e-12)
+    spread = float(np.abs(estimates - estimates[0]).max()) / scale
+    if not spread <= _PLS_TOLERANCE:
+        return {}, f"PLS training targets NOT recovered (components disagree by {spread:.2g})"
+    y = estimates[0] * y_std + y_mean
+    mean_error = abs(float(y.mean()) - y_mean) / max(y_std, 1e-300)
+    sd_error = abs(float(y.std(ddof=1)) / y_std - 1.0)
+    if not (mean_error <= _PLS_TOLERANCE and sd_error <= _PLS_TOLERANCE):
+        raise ValueError(f"{what}: the training targets its scores give back have mean / SD {mean_error:.3g} / "
+                         f"{sd_error:.3g} (relative) away from the regression's own: not the PLSRegression implemented "
+                         "here")
+    fitted = t @ loadings * y_std + y_mean
+    residual = fitted - y
+    total = float(((y - y.mean()) ** 2).sum())
+    stats = {'n': int(y.size), 'target_mean': float(y.mean()), 'target_sd': float(y.std(ddof=1)),
+             'target_min': float(y.min()), 'target_max': float(y.max()),
+             'target_values': int(np.unique(np.round(y, 6)).size),
+             'rmsec': float(np.sqrt(np.mean(residual ** 2))),
+             'r2': float(1.0 - (residual ** 2).sum() / total) if total > 0 else float('nan')}
+    return stats, (f"PLS training targets recovered from its stored scores: {y.size} rows, {stats['target_values']} "
+                   f"distinct values {stats['target_min']:.4g}-{stats['target_max']:.4g}, mean / SD = the "
+                   f"regression's own to {max(mean_error, sd_error):.1e}")
+
+
+def _linear_regression(path: Path, files: dict, n_features: int, algorithm: str) -> RegressionModel:
+    """A pickled ``sklearn.linear_model.Ridge`` / ``LinearRegression`` of one target (attributes only)."""
+    if 'model.joblib' not in files:
+        raise ValueError(f"{path.name}: model.joblib is missing")
+    what = f"{path.name}/model.joblib"
+    holder = _load_joblib(files['model.joblib'], what)
+    kind = (type(holder).__module__, type(holder).__name__)
+    model = holder if kind in _LINEAR_REGRESSION_HOLDERS else getattr(holder, 'model_', None)
+    if model is None or (type(model).__module__, type(model).__name__) not in _LINEAR_REGRESSION_HOLDERS:
+        raise ValueError(f"{what}: holds a {'.'.join(kind)}; a {algorithm} package must hold sklearn {algorithm}")
+    if type(model).__name__ != algorithm:
+        raise ValueError(f"{what}: holds a {type(model).__name__}, the manifest says {algorithm}")
+    n_in = getattr(model, 'n_features_in_', n_features)
+    if n_in != n_features:
+        raise ValueError(f"{what}: the {algorithm} takes {n_in} features, the package's chain gives {n_features}")
+    coef = _array(model, 'coef_', what)
+    if coef.size != n_features or (coef.ndim == 2 and 1 not in coef.shape) or coef.ndim > 2:
+        raise ValueError(f"{what}: coef_ has shape {coef.shape}: one target on {n_features} features is needed")
+    intercept = _array(model, 'intercept_', what).reshape(-1)
+    if intercept.size != 1:
+        raise ValueError(f"{what}: intercept_ of {intercept.size} targets: not one target")
+    return RegressionModel(coef=coef.reshape(-1), intercept=float(intercept[0]), kind=algorithm)
+
+
+def _regression_reference(blob: bytes | None) -> dict:
+    """``training_spectral_reference.json``'s ``regression`` part: ``{'stats': {...}, 'check':
+    {'spectra': (n, B), 'predictions': (n,)}}`` (empty when absent or unreadable)."""
+    if blob is None:
+        return {}
+    try:
+        part = json.loads(blob.decode('utf-8')).get('regression') or {}
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return {}
+    if not isinstance(part, dict):
+        return {}
+    out = {'stats': {k: float(v) for k, v in part.items()
+                     if isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v)}}
+    check = part.get('check')
+    if isinstance(check, dict):
+        try:
+            spectra = np.asarray(check['spectra'], np.float64)
+            predictions = np.asarray(check['predictions'], np.float64).reshape(-1)
+            if spectra.ndim == 2 and spectra.shape[0] == predictions.size and predictions.size:
+                out['check'] = {'spectra': spectra, 'predictions': predictions}
+        except (KeyError, TypeError, ValueError):
+            pass
+    return out
+
+
+def regression_features(package: HsiPackage, spectra: np.ndarray) -> np.ndarray:
+    """Scaled features of ``spectra`` (n, B) through the package's chain in float64 (reference
+    implementation for checks; ``inference_engine.HsiRegressor`` runs the folded equivalent)."""
+    x = np.asarray(spectra, np.float64)
+    if package.snv:
+        x = x - x.mean(axis=1, keepdims=True)
+        x = x / np.sqrt((x ** 2).mean(axis=1, keepdims=True))
+    if package.derivative is not None:
+        x = x @ package.derivative.T
+    f = x[:, package.selected]
+    if package.pca_components is not None:
+        f = (f - package.pca_mean) @ package.pca_components.T
+    return (f - package.scaler_mean) / package.scaler_scale
+
+
+def regression_predict(package: HsiPackage, spectra: np.ndarray) -> np.ndarray:
+    """``(n,)`` predictions of ``spectra`` (n, B) in float64 (reference implementation)."""
+    return regression_features(package, spectra) @ package.regression.coef + package.regression.intercept
+
+
+def _check_regression_reference(path: Path, package: HsiPackage, blob: bytes | None, reference: dict) -> str:
+    """Scaler / PCA / derivative against the reference's per-bin spectra (as for a classification
+    package, the target bins taking the place of the classes), then the package's own check
+    spectra predicted by this reader's chain must give the predictions the training software made."""
+    if blob is None:
+        logger.warning("%s has no training_spectral_reference.json: the processing chain is not verified", path.name)
+        return ("training reference: not in the package (preprocessing chain and predictions NOT verified against "
+                "the training software)")
+    parts = []
+    try:
+        domain = json.loads(blob.decode('utf-8'))['domains'][_REFERENCE_DOMAIN]
+        rows = {int(c['class_id']): (np.asarray(c['mean'], dtype=np.float64), np.asarray(c['sd'], dtype=np.float64))
+                for c in domain['classes']}
+        counts = {int(c['class_id']): c.get('n_spectra') for c in domain['classes']}
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, AttributeError):
+        rows = counts = None
+        parts.append(f"no {_REFERENCE_DOMAIN} spectra (scaler NOT verified)")
+    if rows:
+        ids = np.array(sorted(rows), dtype=np.int64)
+        n_bands = package.wavelengths.size
+        if any(rows[int(i)][0].shape != (n_bands,) for i in ids):
+            raise ValueError(f"{path.name}: the training reference's spectra do not have the {n_bands} bands")
+        if package.derivative is not None:
+            parts.append(_check_derivative(path, package, blob, rows, ids).lstrip('; ,'))
+        parts.append(_check_scaler(path, package, rows, counts, ids))
+    check = reference.get('check')
+    if check is None:
+        parts.append("predictions NOT verified (the reference has no check spectra)")
+    else:
+        spectra = check['spectra']
+        if spectra.shape[1] != package.wavelengths.size:
+            raise ValueError(f"{path.name}: the check spectra have {spectra.shape[1]} bands, the model "
+                             f"{package.wavelengths.size}")
+        ours = regression_predict(package, spectra)
+        scale = max(float(reference['stats'].get('target_sd', 0.0)), float(np.abs(check['predictions']).max()), 1e-12)
+        error = float(np.abs(ours - check['predictions']).max() / scale)
+        if not error <= _CHECK_TOLERANCE:
+            raise ValueError(f"{path.name}: this reader predicts the package's {spectra.shape[0]} check spectra "
+                             f"{error:.3g} (relative) away from the training software's predictions: the package's "
+                             "chain is not the one implemented here")
+        parts.append(f"{spectra.shape[0]} check spectra predicted to {error:.1e} (relative)")
+    return "training reference: " + ', '.join(p for p in parts if p)
 
 
 # -------------------------------------------------------------------------------- files ---
@@ -455,7 +865,8 @@ def _restricted_unpickler():
                 return type(name, (_Holder,), {'__module__': module})
             raise pickle.UnpicklingError(f"refused {module}.{name}: a model package may hold numpy arrays, "
                                          "hsi_lab_core objects and the sklearn SVC / SGDClassifier / "
-                                         "PLSRegression / PCA this reader runs only")
+                                         "PLSRegression / Ridge / LinearRegression / PCA / StandardScaler "
+                                         "this reader runs only")
 
     return RestrictedUnpickler
 
@@ -513,13 +924,13 @@ def _array(holder, name: str, what: str, shape: tuple | None = None) -> np.ndarr
 
 # ----------------------------------------------------------------------- manifest parts ---
 
-def savgol_derivative_matrix(n_bands: int, window: int, polyorder: int, delta: float) -> np.ndarray:
-    """``D`` (n_bands, n_bands) with ``D @ x`` = the Savitzky-Golay first derivative of ``x``.
+def savgol_matrix(n_bands: int, window: int, polyorder: int, deriv: int = 0, delta: float = 1.0) -> np.ndarray:
+    """``M`` (n_bands, n_bands) with ``M @ x`` = ``scipy.signal.savgol_filter(x, window, polyorder,
+    deriv, delta=delta, mode='interp')``, written without scipy.
 
-    Each band gets the slope (per ``delta``) of the least-squares polynomial of degree
-    ``polyorder`` over ``window`` bands centred on it; within half a window of either end the
-    window stays on the first (last) ``window`` bands. That is ``scipy.signal.savgol_filter(x,
-    window, polyorder, deriv=1, delta=delta, mode='interp')``, written without scipy.
+    Each band gets the value (``deriv`` 0) or the slope per ``delta`` (``deriv`` 1) of the
+    least-squares polynomial of degree ``polyorder`` over ``window`` bands centred on it; within
+    half a window of either end the window stays on the first (last) ``window`` bands.
     """
     half = window // 2
     matrix = np.zeros((n_bands, n_bands))
@@ -527,7 +938,26 @@ def savgol_derivative_matrix(n_bands: int, window: int, polyorder: int, delta: f
         start = min(max(band - half, 0), n_bands - window)
         offsets = np.arange(start, start + window, dtype=np.float64) - band
         vander = np.vander(offsets, polyorder + 1, increasing=True)        # columns u^0 .. u^polyorder
-        matrix[band, start:start + window] = np.linalg.pinv(vander)[1] / delta   # the u^1 coefficient
+        # the u^deriv coefficient, times deriv! per delta^deriv
+        matrix[band, start:start + window] = np.linalg.pinv(vander)[deriv] * math.factorial(deriv) / delta ** deriv
+    return matrix
+
+
+def savgol_derivative_matrix(n_bands: int, window: int, polyorder: int, delta: float) -> np.ndarray:
+    """``D`` (n_bands, n_bands) with ``D @ x`` = the Savitzky-Golay first derivative of ``x``
+    (``scipy.signal.savgol_filter(x, window, polyorder, deriv=1, delta=delta, mode='interp')``)."""
+    return savgol_matrix(n_bands, window, polyorder, 1, delta)
+
+
+def derivative_matrix(parameters: dict, n_bands: int) -> np.ndarray | None:
+    """The package's linear preprocessing as one matrix: the first derivative, after the
+    Savitzky-Golay smoothing when the chain has one (``parameters['smooth']``); ``None`` without."""
+    if not parameters:
+        return None
+    matrix = savgol_derivative_matrix(n_bands, parameters['window'], parameters['polyorder'], parameters['delta'])
+    smooth = parameters.get('smooth')
+    if smooth:
+        matrix = matrix @ savgol_matrix(n_bands, smooth['window'], smooth['polyorder'])
     return matrix
 
 
@@ -539,8 +969,39 @@ def _whole(value) -> int | None:
     return int(value)
 
 
-def _derivative_parameters(path: Path, step: dict, n_bands: int) -> dict:
-    """``{window, polyorder, delta}`` of the ``first_derivative`` step, checked."""
+def _grid_delta(path: Path, axis: dict, wavelengths: np.ndarray) -> float:
+    """Band spacing (nm) for a derivative step that does not state its ``delta`` (HSI MLOps
+    schema 2.0: ``pipeline_audit.spectral_axis``, per nm on a uniform grid)."""
+    if axis.get('derivative_units', 'per_nm') != 'per_nm':
+        raise ValueError(f"{path.name}: derivative units {axis.get('derivative_units')!r} are not supported (per_nm is)")
+    steps = np.diff(wavelengths)
+    spacing = axis.get('median_spacing_nm')
+    if not isinstance(spacing, (int, float)) or isinstance(spacing, bool):
+        spacing = float(np.median(steps))
+    spacing = float(spacing)
+    if not spacing > 0 or np.abs(steps - spacing).max() > 1e-6 * spacing:
+        raise ValueError(f"{path.name}: the first derivative states no delta and the wavelengths are not a uniform "
+                         f"grid (spacing {steps.min():.6g}-{steps.max():.6g} nm)")
+    return spacing
+
+
+def _smoothing_parameters(path: Path, step: dict, n_bands: int) -> dict:
+    """``{window, polyorder}`` of a ``savitzky_golay`` smoothing step, checked."""
+    parameters = step.get('parameters') or {}
+    if not isinstance(parameters, dict) or parameters.get('deriv', 0) != 0 \
+            or parameters.get('mode', 'interp') != 'interp':
+        raise ValueError(f"{path.name}: savitzky_golay {parameters!r} is not supported (smoothing, mode 'interp' is)")
+    window, polyorder = _whole(parameters.get('window')), _whole(parameters.get('polyorder'))
+    if window is None or polyorder is None or window % 2 == 0 or not 3 <= window <= n_bands \
+            or not 0 <= polyorder < window:
+        raise ValueError(f"{path.name}: savitzky_golay window {window} / polyorder {polyorder} is not an odd window "
+                         f"of at most {n_bands} bands with polyorder < window")
+    return {'window': window, 'polyorder': polyorder}
+
+
+def _derivative_parameters(path: Path, step: dict, n_bands: int, default_delta=None) -> dict:
+    """``{window, polyorder, delta}`` of the ``first_derivative`` step, checked; ``default_delta()``
+    gives the delta of a step that does not state one."""
     implementation = step.get('implementation')
     if implementation not in (None, _DERIVATIVE_IMPLEMENTATION):
         raise ValueError(f"{path.name}: first_derivative by {implementation!r} is not supported "
@@ -553,6 +1014,8 @@ def _derivative_parameters(path: Path, step: dict, n_bands: int) -> dict:
                          f"{parameters.get('mode')!r} is not supported (deriv 1, mode 'interp' is)")
     window, polyorder = _whole(parameters.get('window')), _whole(parameters.get('polyorder'))
     delta = parameters.get('delta')
+    if delta is None and default_delta is not None:
+        delta = default_delta()
     units = parameters.get('units', 'per_nm')
     if units != 'per_nm':
         raise ValueError(f"{path.name}: first_derivative in units {units!r} is not supported (per_nm is)")
@@ -612,7 +1075,12 @@ def _feature_chain(path: Path, manifest: dict) -> tuple:
             raise ValueError(f"{path.name}: the selected band indices and selected_wavelengths_nm disagree")
     derivative = {}
     if 'first_derivative' in steps:
-        derivative = _derivative_parameters(path, step_list[steps.index('first_derivative')], wavelengths.size)
+        grid = audit.get('spectral_axis') if isinstance(audit.get('spectral_axis'), dict) else axis
+        derivative = _derivative_parameters(path, step_list[steps.index('first_derivative')], wavelengths.size,
+                                            lambda: _grid_delta(path, grid, wavelengths))
+        if 'savitzky_golay' in steps:
+            derivative['smooth'] = _smoothing_parameters(path, step_list[steps.index('savitzky_golay')],
+                                                         wavelengths.size)
     return wavelengths, 'snv' in steps, derivative, selected
 
 
@@ -979,7 +1447,7 @@ def _check_pls_counts(path: Path, package: HsiPackage, counts: dict) -> str:
             f"{linear.fit_accuracy:.4f} of its training rows")
 
 
-def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str:
+def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict, ids=None) -> str:
     """The scaler's mean and variance, and an SVM's gamma, from the reference's per-class count,
     mean and SD (sample SD) of the preprocessed training spectra.
 
@@ -987,20 +1455,21 @@ def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> 
     those rows (on the selected bands) are what the StandardScaler stored. A gamma of 'scale' is
     ``1 / (features x variance of all scaled training values)`` (sklearn), which follows from them.
     """
+    ids = package.classes if ids is None else ids
     if package.pca_components is not None:
-        return _check_pca(path, package, rows, counts)
+        return _check_pca(path, package, rows, counts, ids)
     unverified = "scaler NOT verified" + (" (nor the SVM)" if package.svm is not None else "")
     if package.scaler_var is None or package.scaler_samples is None:
         return f"{unverified}: the scaler stores no variance / sample count"
     try:
-        n = np.array([float(counts[int(cid)]) for cid in package.classes])
+        n = np.array([float(counts[int(cid)]) for cid in ids])
     except (KeyError, TypeError, ValueError):
         return f"{unverified}: the reference has no spectrum count per class"
     if not np.all(np.isfinite(n)) or np.any(n < 2) or abs(n.sum() - package.scaler_samples) > 0.5:
         return (f"{unverified}: the reference counts {n.sum():g} spectra, the scaler was fitted on "
                 f"{package.scaler_samples:g}")
-    means = np.array([rows[int(cid)][0][package.selected] for cid in package.classes])
-    sds = np.array([rows[int(cid)][1][package.selected] for cid in package.classes])
+    means = np.array([rows[int(cid)][0][package.selected] for cid in ids])
+    sds = np.array([rows[int(cid)][1][package.selected] for cid in ids])
     if sds.shape != means.shape or not np.isfinite(sds).all():
         return f"{unverified}: the reference has no SD per band"
     total = n.sum()
@@ -1037,7 +1506,7 @@ def _check_scaler(path: Path, package: HsiPackage, rows: dict, counts: dict) -> 
     return text + f", SVM gamma {svm.gamma_setting!r} = {svm.gamma:.6g} reproduced to {error:.1e}"
 
 
-def _check_pca(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str:
+def _check_pca(path: Path, package: HsiPackage, rows: dict, counts: dict, ids=None) -> str:
     """The PCA's mean, and the scaler's mean of the PCA scores, from the reference's per-class
     count and mean (both were fitted on the rows the reference covers).
 
@@ -1046,13 +1515,14 @@ def _check_pca(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str
     on the same rows holds it times ``(n - 1) / n``.
     """
     unverified = "PCA and scaler NOT verified"
+    ids = package.classes if ids is None else ids
     try:
-        n = np.array([float(counts[int(cid)]) for cid in package.classes])
+        n = np.array([float(counts[int(cid)]) for cid in ids])
     except (KeyError, TypeError, ValueError):
         return f"{unverified}: the reference has no spectrum count per class"
     if not np.all(np.isfinite(n)) or np.any(n < 1):
         return f"{unverified}: the reference has no spectrum count per class"
-    means = np.array([rows[int(cid)][0][package.selected] for cid in package.classes])
+    means = np.array([rows[int(cid)][0][package.selected] for cid in ids])
     pooled = (n[:, None] * means).sum(axis=0) / n.sum()
     pca_error = float(np.abs(pooled - package.pca_mean).max() / max(np.abs(package.pca_mean).max(), 1e-300))
     projected = (pooled - package.pca_mean) @ package.pca_components.T
@@ -1077,7 +1547,7 @@ def _check_pca(path: Path, package: HsiPackage, rows: dict, counts: dict) -> str
     return text + f", scaler variance = PCA variance to {var_error:.1e}"
 
 
-def _check_derivative(path: Path, package: HsiPackage, blob: bytes, preprocessed: dict) -> str:
+def _check_derivative(path: Path, package: HsiPackage, blob: bytes, preprocessed: dict, ids=None) -> str:
     """The first derivative of the raw training class means must be the preprocessed class means.
 
     The derivative is linear, so the mean of the derived spectra is the derivative of their mean:
@@ -1092,7 +1562,7 @@ def _check_derivative(path: Path, package: HsiPackage, blob: bytes, preprocessed
         return f"; first derivative NOT verified (no {_RAW_DOMAIN} spectra)"
     n_bands = package.wavelengths.size
     worst = 0.0
-    for cid in package.classes:
+    for cid in (package.classes if ids is None else ids):
         mean = raw.get(int(cid))
         if mean is None or mean.shape != (n_bands,) or not np.isfinite(mean).all():
             raise ValueError(f"{path.name}: the training reference has no raw {n_bands}-band spectrum of class {cid}")
@@ -1128,8 +1598,10 @@ def _training_spectra(package: HsiPackage, blob: bytes | None) -> dict:
                 if mean.shape != (n_bands,) or sd.shape != (n_bands,):
                     raise ValueError('band count')
                 cid = int(c['class_id'])
+                target = c.get('target_mean')
                 rows.append(TrainingClass(cid, package.labels.get(cid, str(c.get('label', cid))),
-                                          int(c.get('n_spectra') or 0), mean, sd))
+                                          int(c.get('n_spectra') or 0), mean, sd,
+                                          float(target) if isinstance(target, (int, float)) else None))
             out[key] = rows
         except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
             logger.info("%s: no %s training spectra to display (%s)", Path(package.path).name, name,
